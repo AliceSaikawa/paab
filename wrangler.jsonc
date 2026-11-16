@@ -1,0 +1,19 @@
+{
+	"$schema": "node_modules/wrangler/config-schema.json",
+	"name": "paab",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-11-16",
+	"observability": {
+		"enabled": true
+	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "paab-db",
+			"database_id": "00000000-0000-0000-0000-000000000000"
+		}
+	],
+	"triggers": {
+		"crons": ["0 * * * *"]
+	}
+}
