@@ -64,7 +64,24 @@ paab（Personal SI Agent Bridge）の設計は [docs/design.md](docs/design.md) 
 - 取り込みはスカッシュマージで行う。`main` の履歴は「1タスク＝1コミット」の一直線にする。スカッシュ後のコミットメッセージも Conventional Commits に従い、英語で書く。
 - PR を作る場合、タイトルは英語で、コミットの要約と同じ Conventional Commits の形式で書く。例：`feat(inbox): expire unanswered questions after 7 days`。スカッシュマージでは、このタイトルをそのままコミットの要約に使う。
 - PR の本文は日本語で書く。変更内容、実行した検証と結果、残課題を書く。
-- スカッシュ後のコミットの本文に、日本語の PR 本文を貼らない。本文は空にするか、英語で書く。
+- スカッシュ後のコミットの本文には、そのブランチに含まれる各コミットのメッセージを、古い順に `* ` 始まりの箇条書きで並べる。各コミットに本文があれば、要約の下に空行を挟んで続ける。日本語の PR 本文は貼らない。
+
+  ```
+  feat(inbox): expire unanswered questions after 7 days (#12)
+
+  * feat(inbox): add expiry timestamp to questions
+
+  Questions now record when they expire so that the sweep can select
+  them without recomputing the deadline.
+
+  * feat(inbox): sweep expired questions on a schedule
+
+  * test(inbox): cover expiry at the 7 day boundary
+  ```
+
+  - GitHub の画面からスカッシュマージすると、要約の末尾に PR 番号 `(#12)` が付き、本文にこの形の一覧が入る。そのまま使う。
+  - PR を作らずローカルで `git merge --squash` する場合も、同じ形の本文を書く。PR 番号は付けない。
+  - 本文がそのまま `main` に残るため、ブランチ内の各コミットも上の「コミット」の規約どおりに書く。`wip` や `fix typo` のようなコミットは、引き渡し前にまとめる。
 - 取り込み後、そのブランチと worktree は統合担当が削除する。
 - `main` の履歴を書き換えない。強制プッシュをしない。
 - リモートへのプッシュ、PRの作成、デプロイは、利用者の明示的な許可がある場合だけ行う。
