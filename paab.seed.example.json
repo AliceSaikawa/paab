@@ -1,0 +1,29 @@
+{
+	"ownerId": "me",
+	"agents": [
+		{
+			"name": "muse",
+			"description": "日々の予定と連絡先を管理しているエージェント。",
+			"dailyQuestionLimit": 20
+		},
+		{
+			"name": "grok",
+			"description": "仕事の調べものと好みの記録を担当するエージェント。",
+			"dailyQuestionLimit": 20
+		}
+	],
+	"categories": [
+		"予定",
+		"連絡先",
+		"好み・習慣",
+		"仕事",
+		"健康",
+		"金融",
+		"位置情報",
+		"その他"
+	],
+	"allowRules": [
+		{ "from": "muse", "to": "grok", "categories": ["仕事", "好み・習慣"] },
+		{ "from": "grok", "to": "muse", "categories": ["予定", "連絡先"] }
+	]
+}
