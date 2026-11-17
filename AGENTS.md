@@ -96,4 +96,15 @@ paab（Personal SI Agent Bridge）の設計は [docs/design.md](docs/design.md) 
 
 ## 検証
 
-検証コマンドは、プロジェクトの雛形を作った時点でここに追記する。
+ローカルでは次を実行する。依存のインストールからまとめて通すには `npm ci && npm run check` を使う。
+
+- **Node** は `>=22.12.0`（`wrangler` の要求に合わせる）。
+- **npm** は `>=11.12.1`。npm 10 や 11.11 未満では依存解決が失敗する。Node 24 付属の npm 11.19 系で通る。
+
+`typecheck` は先に `wrangler types` を実行し、git 管理外の `worker-configuration.d.ts` を生成してから `tsc` する。
+
+- `npm run check` — TypeScript の型チェック、Biome の lint、Vitest のテストを順に実行する。
+- `npm run dev` — Wrangler でローカル起動する。`GET /health` が 200 を返すことを確認する。
+- 個別に実行する場合: `npm run typecheck`、`npm run lint`、`npm run test`、`npm run format`（整形のみ）。
+
+CI では `main` への push と Pull Request で `npm run check` が走る（`.github/workflows/ci.yml`）。
