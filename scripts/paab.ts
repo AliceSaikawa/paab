@@ -2,8 +2,9 @@
 // reading arguments and files, running wrangler, and printing. The commands
 // themselves live in `scripts/lib`, where the tests run them against D1.
 //
-// The project has no Node type definitions, so this file is outside `tsc`.
-// `npm run seed` and the others bundle it with esbuild before running it.
+// This file is type-checked with the Node definitions through
+// tsconfig.scripts.json. `npm run seed` and the others bundle it with
+// esbuild before running it.
 
 import { execFile } from "node:child_process";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
