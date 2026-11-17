@@ -13,6 +13,10 @@
 			"database_id": "00000000-0000-0000-0000-000000000000"
 		}
 	],
+	"vars": {
+		"AUDIT_RECORD_BODIES": "false",
+		"AUDIT_BODY_RETENTION_DAYS": "30"
+	},
 	"triggers": {
 		"crons": ["0 * * * *"]
 	}
