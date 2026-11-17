@@ -1,5 +1,9 @@
 import { z } from "zod";
-import { type AuditBodyConfig, recordAuditEvent } from "../audit";
+import {
+	type AuditBodyConfig,
+	recordAuditEvent,
+	recordAuditEvents,
+} from "../audit";
 import {
 	type AnswerFailureReason,
 	type AnswerQuestionInput,
@@ -206,18 +210,22 @@ const checkInbox = defineTool({
 			),
 		]);
 
-		for (const item of items) {
-			if (item.kind === "question") {
-				await recordAuditEvent(ctx.db, ctx.audit, {
-					eventType: "question_delivered",
+		// One batched write for every delivery, not one statement per
+		// question: D1 caps the statements a Worker invocation may run.
+		await recordAuditEvents(
+			ctx.db,
+			ctx.audit,
+			items
+				.filter((item) => item.kind === "question")
+				.map((item) => ({
+					eventType: "question_delivered" as const,
 					occurredAt: ctx.now,
 					fromAgentId: item.fromAgentId,
 					toAgentId: ctx.agent.id,
 					categoryId: item.categoryId,
 					messageId: item.id,
-				});
-			}
-		}
+				})),
+		);
 
 		if (items.length === 0) {
 			return ok("no new messages");
