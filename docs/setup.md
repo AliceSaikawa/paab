@@ -143,6 +143,72 @@ curl -s http://localhost:8787/mcp \
 
 トークンが正しければ `initialize` の結果が返り、誤っていれば401が返る。
 
+## 2つのクライアントで質問応答を試す
+
+質問して回答を得る1往復を、手元で2つのクライアントから試す手順。上の「ローカルでの確認手順」で初期値を投入し、`npm run dev` を起動してあるものとする。同じ筋書きは `test/e2e/` のテストが `npm run test` で確かめている。
+
+見本の初期値では、`muse` は `grok` に「仕事」と「好み・習慣」を質問できる。ここでは `muse` を質問側、`grok` を回答側にする。
+
+1. 別の端末で、2体分のトークンを発行する。再発行すると古いトークンは無効になるので、`muse` のトークンも発行し直した値を使う。
+
+   ```sh
+   MUSE_TOKEN=$(npm run -s token -- --local muse)
+   GROK_TOKEN=$(npm run -s token -- --local grok)
+   ```
+
+2. ツールを呼ぶシェル関数を用意する。引数はトークン、ツール名、ツールの引数（JSON。省略すると `{}`）である。
+
+   ```sh
+   tool() {
+   	curl -s http://localhost:8787/mcp \
+   		-H "Authorization: Bearer $1" \
+   		-H "Content-Type: application/json" \
+   		-H "Accept: application/json, text/event-stream" \
+   		-d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"$2\",\"arguments\":${3:-{\}}}}"
+   	echo
+   }
+   ```
+
+   結果は `data:` で始まる行のJSONで返る。ツールの出力は `result.content[0].text` に入っている。
+
+3. `muse` が、質問できる相手とカテゴリを確かめる。`grok` と「仕事, 好み・習慣」が返る。
+
+   ```sh
+   tool "$MUSE_TOKEN" list_agents
+   ```
+
+4. `muse` が `grok` に質問する。返ってきた `question_id` を控える。
+
+   ```sh
+   tool "$MUSE_TOKEN" ask '{"to":"grok","category":"仕事","question":"今週の締め切りは？"}'
+   ```
+
+5. `grok` が質問を受け取り、控えた `question_id` を指定して回答する。
+
+   ```sh
+   tool "$GROK_TOKEN" check_inbox
+   tool "$GROK_TOKEN" answer '{"question_id":"<question_id>","action":"answer","text":"金曜日です。"}'
+   ```
+
+6. `muse` が回答を受け取る。`kind: answer` のメッセージが返る。メッセージは一度しか渡されないので、もう一度呼ぶと `no new messages` になる。
+
+   ```sh
+   tool "$MUSE_TOKEN" check_inbox
+   ```
+
+7. 監査ログを見る。`question_accepted`、`question_delivered`、`question_answered` が並び、`--body` を付けても本文の列は `-` のままである。
+
+   ```sh
+   npm run -s audit-log -- --local --body
+   ```
+
+拒否も同じ関数で試せる。
+
+- **許可のないカテゴリ**: 手順4の `category` を `その他` にする。`ask` の返事は許可された質問と同じ形だが、`grok` の `check_inbox` には何も届かず、`muse` の `check_inbox` に `kind: rejection` が届く。監査ログには `question_blocked` と理由 `no_allow_rule` が残る。
+- **回答側の拒否**: 手順5の `answer` の引数を `{"question_id":"<question_id>","action":"decline"}` にする。`muse` に届く `kind: rejection` は、上の場合と同じ形である。
+- **他人宛の質問への回答**: 手順5の `answer` を `$MUSE_TOKEN` で呼ぶ。エラーになり、質問は開いたまま残る。
+- **期限切れ**: 7日を過ぎた質問は回答できない。期限切れの処理は1時間ごとの定期実行が行う。ローカルでは定期実行が自動で動かないので、`curl "http://localhost:8787/cdn-cgi/local/scheduled"` で起動する。7日待たずに確かめるには `test/e2e/` のテストを使う。
+
 ## 補足
 
 - コマンドは `scripts/paab.ts` を esbuild でまとめてから Node で実行する。まとめた結果は `.wrangler/tmp/paab-cli.mjs` に置かれる。
