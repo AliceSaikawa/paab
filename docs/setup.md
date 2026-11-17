@@ -211,5 +211,6 @@ curl -s http://localhost:8787/mcp \
 
 ## 補足
 
+- 対応プラン: Workers Free で動く。1回の `/mcp` 呼び出しと1回の定期実行が使うD1のクエリ数は、受け取るメッセージや期限切れにする質問の件数に依らず一定である（監査ログへの書き込みは `db.batch` でまとめる）。Workers Free の1呼び出しあたり50クエリの上限に、件数が増えても達しない。
 - コマンドは `scripts/paab.ts` を esbuild でまとめてから Node で実行する。まとめた結果は `.wrangler/tmp/paab-cli.mjs` に置かれる。
 - ローカルのD1の保存先を変えるには `--persist-to <ディレクトリ>` を付ける（`--local` のときだけ）。`wrangler dev` にも同じ値を渡す。
