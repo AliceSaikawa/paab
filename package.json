@@ -15,7 +15,11 @@
 		"format": "biome check --write .",
 		"test": "vitest run",
 		"check": "npm run typecheck && npm run lint && npm run test",
-		"cf-typegen": "wrangler types"
+		"cf-typegen": "wrangler types",
+		"cli:build": "esbuild scripts/paab.ts --bundle --platform=node --format=esm --packages=external --log-level=warning --outfile=.wrangler/tmp/paab-cli.mjs",
+		"seed": "npm run -s cli:build && node .wrangler/tmp/paab-cli.mjs seed",
+		"token": "npm run -s cli:build && node .wrangler/tmp/paab-cli.mjs token",
+		"audit-log": "npm run -s cli:build && node .wrangler/tmp/paab-cli.mjs audit-log"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "2.6.8",

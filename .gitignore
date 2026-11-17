@@ -9,3 +9,6 @@ dist/
 !.env.example
 *.log
 .DS_Store
+
+# Real seed file; paab.seed.example.json is the tracked sample.
+paab.seed.json
