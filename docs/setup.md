@@ -110,11 +110,15 @@ npm run -s audit-log -- --remote --since 2026-11-01 --from muse --outcome denied
 | `--to <名前>` | 宛先のエージェント |
 | `--category <名前>` | カテゴリ |
 | `--outcome <結果>` | `ok`、`denied`、`expired` のいずれか |
-| `--limit <件数>` | 最大件数。既定は100、上限は1000。古い順に返す |
+| `--limit <件数>` | 最大件数。既定は100、上限は1000。新しい順に返す |
 | `--body` | 本文の列を付ける。本文は監査ログへの本文記録（`AUDIT_RECORD_BODIES`）が有効なときだけ残る |
+| `--oldest` | 新しい順の代わりに、古い順に返す |
+| `--after-id <ID>` | このIDより後の記録だけを返す |
+| `--before-id <ID>` | このIDより前の記録だけを返す |
 
 - 日時は `2026-11-01`（実行したマシンのタイムゾーンでのその日の0時）か、`2026-11-01T09:00+09:00` のようにオフセット付きで書く。オフセットのない時刻は受け付けない。
-- 出力はタブ区切りで、1行目が見出しである。日時は実行したマシンのタイムゾーンで表示する。
+- 既定では新しい順に最大100件を表示する。件数が上限に達したときは、続きを読むための指定（`--before-id`、古い順では `--after-id`）を標準エラー出力に出す。
+- 出力はタブ区切りで、1行目が見出しである。先頭の `id` 列は `--after-id` と `--before-id` に渡す値である。日時は実行したマシンのタイムゾーンで表示する。
 - 送信元や宛先は名前で表示する。削除されたエージェントやカテゴリはIDで表示する。
 - 理由（`reason_code`）は監査ログにだけ残る内部の理由で、質問したエージェントには返されない（設計書 3.4 節）。
 
@@ -196,7 +200,7 @@ curl -s http://localhost:8787/mcp \
    tool "$MUSE_TOKEN" check_inbox
    ```
 
-7. 監査ログを見る。`question_accepted`、`question_delivered`、`question_answered` が並び、`--body` を付けても本文の列は `-` のままである。
+7. 監査ログを見る。新しい順に `question_answered`、`question_delivered`、`question_accepted` が並び、`--body` を付けても本文の列は `-` のままである。
 
    ```sh
    npm run -s audit-log -- --local --body
