@@ -483,6 +483,91 @@ describe("audit_log", () => {
 	});
 });
 
+describe("deletion", () => {
+	let a: Agent;
+	let b: Agent;
+	let categoryId: string;
+
+	beforeEach(async () => {
+		a = await seedAgent(db, { name: "a" });
+		b = await seedAgent(db, { name: "b" });
+		categoryId = (await seedCategory(db, { name: "schedule" })).id;
+	});
+
+	async function messageCount(): Promise<number> {
+		const row = await db
+			.prepare("SELECT COUNT(*) AS n FROM messages")
+			.first<{ n: number }>();
+		return row?.n ?? -1;
+	}
+
+	it("deletes an agent that has messages, taking their messages and replies", async () => {
+		const asked = question(a, b, categoryId);
+		const answer = reply(asked);
+		const received = question(b, a, categoryId);
+		await db.batch([asked, answer, received].map((m) => insertMessage(db, m)));
+		await insertAuditLogEntry(db, {
+			occurredAt: T0,
+			eventType: "question_accepted",
+			fromAgentId: a.id,
+			toAgentId: b.id,
+			categoryId,
+			outcome: "ok",
+			reasonCode: null,
+			messageId: asked.id,
+			body: null,
+		}).run();
+		expect(await messageCount()).toBe(3);
+
+		await db.prepare("DELETE FROM agents WHERE id = ?").bind(a.id).run();
+
+		expect(await messageCount()).toBe(0);
+		// The audit log survives, by design without foreign keys.
+		const audit = await db
+			.prepare("SELECT COUNT(*) AS n FROM audit_log")
+			.first<{ n: number }>();
+		expect(audit?.n).toBe(1);
+		// The other agent is untouched.
+		const survivors = await db
+			.prepare("SELECT COUNT(*) AS n FROM agents")
+			.first<{ n: number }>();
+		expect(survivors?.n).toBe(1);
+	});
+
+	it("removes a bridge rejection with the question it refers to", async () => {
+		const asked = question(b, a, categoryId);
+		const rejection = reply(asked, {
+			kind: "rejection",
+			fromAgentId: null,
+			body: null,
+		});
+		await db.batch([asked, rejection].map((m) => insertMessage(db, m)));
+
+		// The rejection names neither the deleted agent nor its category;
+		// only in_reply_to ties it to the deleted question.
+		await db.prepare("DELETE FROM agents WHERE id = ?").bind(a.id).run();
+
+		expect(await messageCount()).toBe(0);
+	});
+
+	it("deletes a category that has messages", async () => {
+		const asked = question(a, b, categoryId);
+		const expired = question(a, b, categoryId, { status: "expired" });
+		await db.batch([asked, expired].map((m) => insertMessage(db, m)));
+
+		await db
+			.prepare("DELETE FROM categories WHERE id = ?")
+			.bind(categoryId)
+			.run();
+
+		expect(await messageCount()).toBe(0);
+		const agents = await db
+			.prepare("SELECT COUNT(*) AS n FROM agents")
+			.first<{ n: number }>();
+		expect(agents?.n).toBe(2);
+	});
+});
+
 describe("row conversion", () => {
 	it("throws on a stored value outside the known set", async () => {
 		await db
