@@ -11,11 +11,17 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # engines の下限（22）と現行（24）の両方で確かめる。
+        node-version: ["22", "24"]
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      # Actions はコミットで固定する（#48）。Dependabot が更新 PR を出す。
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: "24"
+          node-version: ${{ matrix.node-version }}
           cache: npm
       - run: npm ci
+      - run: npm audit --audit-level=high
       - run: npm run check
