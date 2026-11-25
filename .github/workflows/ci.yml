@@ -13,8 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        # engines の下限（22）と現行（24）の両方で確かめる。
-        node-version: ["22", "24"]
+        # engines の下限（22.12.0）と現行（24）の両方で確かめる。
+        node-version: ["22.12.0", "24"]
     steps:
       # Actions はコミットで固定する（#48）。Dependabot が更新 PR を出す。
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -22,6 +22,10 @@ jobs:
         with:
           node-version: ${{ matrix.node-version }}
           cache: npm
+      - name: Install supported npm on Node 22
+        if: matrix.node-version == '22.12.0'
+        run: npm install -g "npm@^11.12.1"
       - run: npm ci
-      - run: npm audit --audit-level=high
+      - if: matrix.node-version == '24'
+        run: npm audit --omit=dev --audit-level=high
       - run: npm run check

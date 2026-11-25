@@ -212,7 +212,7 @@ curl -s http://localhost:8787/mcp \
 ## 依存と Actions の更新
 
 - npm の依存と GitHub Actions の更新は Dependabot が週1回 PR にする。Actions はコミットで固定しているため、更新 PR が新しいコミットを指す。
-- CI は `npm audit --audit-level=high` を含む。high 以上の脆弱性が見つかると CI が落ちるので、更新 PR で直す。
+- CI は `npm audit --omit=dev --audit-level=high` を含む。本番依存に high 以上の脆弱性が見つかると CI が落ちるので、更新 PR で直す。
 - `wrangler.jsonc` の `compatibility_date` は、wrangler を更新するときに一緒に進める。進める前に `npm run check` と `npm run dev` での起動を確かめ、変更は単独のコミットにする。
 
 ## 補足
