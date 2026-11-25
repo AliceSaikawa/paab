@@ -190,6 +190,41 @@ describe("queryAuditLog", () => {
 		expect(await ids({ outcome: "expired" })).toEqual(["q3"]);
 	});
 
+	it("filters by messageId", async () => {
+		await record({
+			occurredAt: T0 + 30 * 60_000,
+			eventType: "question_delivered",
+			fromAgentId: alice.id,
+			toAgentId: bob.id,
+			categoryId: schedule.id,
+			messageId: "q1",
+		});
+
+		const entries = await queryAuditLog(db, { messageId: "q1" });
+		expect(entries.map((entry) => entry.eventType)).toEqual([
+			"question_accepted",
+			"question_delivered",
+		]);
+		expect(await ids({ messageId: "nonexistent" })).toEqual([]);
+	});
+
+	it("excludes eventTypes when excludeEventTypes is specified", async () => {
+		expect(await ids({ excludeEventTypes: ["auth_failed"] })).toEqual([
+			"q1",
+			"q2",
+			"q3",
+		]);
+		expect(
+			await ids({ excludeEventTypes: ["auth_failed", "question_expired"] }),
+		).toEqual(["q1", "q2"]);
+		expect(await ids({ excludeEventTypes: [] })).toEqual([
+			"q1",
+			"q2",
+			"q3",
+			"q4",
+		]);
+	});
+
 	it("combines conditions with AND", async () => {
 		expect(
 			await ids({ fromAgentName: "alice", categoryName: "health" }),
@@ -273,11 +308,13 @@ describe("buildAuditLogQuery", () => {
 			toAgentId: "id-b",
 			categoryName: "schedule",
 			outcome: "denied",
+			messageId: "msg-1",
+			excludeEventTypes: ["auth_failed", "question_expired"],
 			limit: 5,
 		});
 
 		expect(query.sql).toContain(
-			"WHERE l.occurred_at >= ? AND l.occurred_at < ? AND fa.name = ? AND l.to_agent_id = ? AND c.name = ? AND l.outcome = ?",
+			"WHERE l.occurred_at >= ? AND l.occurred_at < ? AND fa.name = ? AND l.to_agent_id = ? AND c.name = ? AND l.outcome = ? AND l.message_id = ? AND l.event_type NOT IN (?, ?)",
 		);
 		expect(query.sql).toMatch(/ORDER BY l\.id LIMIT \?$/);
 		expect(query.params).toEqual([
@@ -287,8 +324,17 @@ describe("buildAuditLogQuery", () => {
 			"id-b",
 			"schedule",
 			"denied",
+			"msg-1",
+			"auth_failed",
+			"question_expired",
 			5,
 		]);
+	});
+
+	it("omits event type exclusion when excludeEventTypes is empty", () => {
+		const query = buildAuditLogQuery({ excludeEventTypes: [] });
+		expect(query.sql).not.toContain("NOT IN");
+		expect(query.params).toEqual([DEFAULT_AUDIT_QUERY_LIMIT]);
 	});
 
 	it("applies the default limit and caps a large one", () => {
@@ -311,6 +357,16 @@ describe("buildAuditLogQuery", () => {
 		["a time that is not an integer", { occurredFrom: Number.NaN }],
 		["an unknown outcome", { outcome: "maybe" }],
 		["an empty name", { fromAgentName: "" }],
+		["an empty messageId", { messageId: "" }],
+		["an unknown excludeEventTypes item", { excludeEventTypes: ["bogus"] }],
+		[
+			"a mixed excludeEventTypes array",
+			{ excludeEventTypes: ["auth_failed", "bogus"] },
+		],
+		[
+			"a non-array excludeEventTypes",
+			{ excludeEventTypes: "auth_failed" as unknown as string[] },
+		],
 		["a fractional afterId", { afterId: 1.5 }],
 		["a negative beforeId", { beforeId: -1 }],
 	])("throws on %s", (_name, filter) => {
@@ -336,11 +392,20 @@ describe("inlineAuditLogQuery", () => {
 		};
 		expect(await run(filter)).toEqual(await ids(filter));
 		expect(await run(filter)).toEqual(["q3"]);
+
+		const excludedFilter: AuditLogFilter = {
+			excludeEventTypes: ["auth_failed"],
+			messageId: "q2",
+			limit: 10,
+		};
+		expect(await run(excludedFilter)).toEqual(await ids(excludedFilter));
+		expect(await run(excludedFilter)).toEqual(["q2"]);
 	});
 
 	it("escapes quotes in text values", async () => {
 		expect(await run({ toAgentName: "carol's bot" })).toEqual(["q3"]);
 		expect(await run({ fromAgentName: "x' OR '1'='1" })).toEqual([]);
+		expect(await run({ messageId: "q' OR '1'='1" })).toEqual([]);
 		expect(await ids({})).toHaveLength(4);
 	});
 
