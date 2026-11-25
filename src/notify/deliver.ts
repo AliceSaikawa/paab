@@ -362,7 +362,8 @@ async function executeAttempt(
 				"X-Paab-Signature": signature,
 			},
 			body: WEBHOOK_BODY,
-			redirect: "error",
+			// workerd rejects redirect: "error" at runtime; manual mode blocks SSRF redirects cleanly.
+			redirect: "manual",
 			signal: AbortSignal.timeout(WEBHOOK_FETCH_TIMEOUT_MS),
 		});
 		try {
@@ -373,12 +374,11 @@ async function executeAttempt(
 		if (response.ok) {
 			return markDelivered(db, row, options);
 		}
-		return markFailed(
-			db,
-			row,
-			formatHttpError(response.status, response.statusText),
-			options,
-		);
+		const failureReason =
+			response.status >= 300 && response.status < 400
+				? `redirect rejected (${formatHttpError(response.status, response.statusText)})`
+				: formatHttpError(response.status, response.statusText);
+		return markFailed(db, row, failureReason, options);
 	} catch (error) {
 		return markFailed(db, row, formatError(error), options);
 	}

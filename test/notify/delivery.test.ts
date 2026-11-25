@@ -63,7 +63,9 @@ function mockFetcher(
 ): { fetcher: WebhookFetcher; calls: CapturedCall[] } {
 	const calls: CapturedCall[] = [];
 	const fetcher: WebhookFetcher = async (input, init) => {
-		const url = typeof input === "string" ? input : input.toString();
+		// Validate RequestInit options against workerd Request semantics.
+		const validated = new Request(input, init);
+		const url = validated.url;
 		const call: CapturedCall = {
 			url,
 			method: init?.method ?? "GET",
@@ -146,7 +148,7 @@ describe("webhook delivery & HMAC signing", () => {
 
 		expect(calls[0]?.url).toBe("https://bob.example/wake");
 		expect(calls[0]?.method).toBe("POST");
-		expect(calls[0]?.redirect).toBe("error");
+		expect(calls[0]?.redirect).toBe("manual");
 		expect(calls[0]?.hasSignal).toBe(true);
 		expect(calls[0]?.body).toBe(WEBHOOK_BODY);
 		expect(calls[0]?.body).not.toContain(secretQuestion);
@@ -598,6 +600,36 @@ describe("webhook delivery & HMAC signing", () => {
 				status: "pending",
 				attempts: 1,
 				last_error: "redirect encountered",
+			},
+		]);
+	});
+
+	it("rejects 3xx redirect responses without following them and schedules a retry", async () => {
+		await configureAgentWebhook(world.db, {
+			agentId: world.bob.agent.id,
+			url: "https://bob.example/wake",
+			actor: OWNER,
+			now: T0,
+		});
+		const { fetcher, calls } = mockFetcher(
+			() =>
+				new Response(null, {
+					status: 302,
+					headers: { Location: "http://127.0.0.1/admin" },
+				}),
+		);
+		const alice = await connect(world.alice.token, {
+			env: mcpEnv(fetcher),
+			now: T0 + 10,
+		});
+		await askBob(alice, "Redirect check");
+		expect(calls).toHaveLength(1);
+		expect(calls[0]?.redirect).toBe("manual");
+		expect(await deliveriesFor(world.bob.agent.id)).toMatchObject([
+			{
+				status: "pending",
+				attempts: 1,
+				last_error: "redirect rejected (HTTP 302)",
 			},
 		]);
 	});
