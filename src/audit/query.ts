@@ -25,8 +25,8 @@ export interface AuditLogFilter {
 	/** Entries with an ID below this one, for reading the next page. */
 	beforeId?: number;
 	/**
-	 * Read newest first (`"desc"`) instead of oldest first (`"asc"`, the
-	 * default).
+	 * Read newest first (`"desc"`) by insertion ID instead of oldest first
+	 * (`"asc"`, the default; the CLI defaults to `"desc"`).
 	 */
 	order?: "asc" | "desc";
 	/** Entries strictly before this time. */
@@ -102,9 +102,9 @@ function requireText(value: string, name: string): string {
  * Builds the SELECT for a filter without touching a database. Throws a
  * `RangeError` on a malformed filter.
  *
- * Results are ordered by `occurred_at, id`, in the direction `order`
- * selects. The columns are those of `AuditLogViewRow`; convert rows with
- * `auditLogViewFromRow`.
+ * Results are ordered by `id` (insertion order, matching `afterId` and
+ * `beforeId`) in the direction `order` selects. The columns are those of
+ * `AuditLogViewRow`; convert rows with `auditLogViewFromRow`.
  */
 export function buildAuditLogQuery(filter: AuditLogFilter = {}): AuditLogQuery {
 	const where: string[] = [];
@@ -172,9 +172,7 @@ export function buildAuditLogQuery(filter: AuditLogFilter = {}): AuditLogQuery {
 		"LEFT JOIN agents AS ta ON ta.id = l.to_agent_id",
 		"LEFT JOIN categories AS c ON c.id = l.category_id",
 		...(where.length > 0 ? [`WHERE ${where.join(" AND ")}`] : []),
-		filter.order === "desc"
-			? "ORDER BY l.occurred_at DESC, l.id DESC"
-			: "ORDER BY l.occurred_at, l.id",
+		filter.order === "desc" ? "ORDER BY l.id DESC" : "ORDER BY l.id",
 		"LIMIT ?",
 	].join(" ");
 	return { sql, params };
@@ -220,8 +218,8 @@ export function auditLogViewFromRow(row: AuditLogViewRow): AuditLogView {
 }
 
 /**
- * Reads audit log entries that match the filter, ordered by time and then by
- * ID. Rejects on a malformed filter or a database failure.
+ * Reads audit log entries that match the filter, ordered by insertion ID.
+ * Rejects on a malformed filter or a database failure.
  */
 export async function queryAuditLog(
 	db: D1Database,
