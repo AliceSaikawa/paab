@@ -1,6 +1,8 @@
 import { type AuditLogRow, auditLogEntryFromRow } from "../db";
 import {
+	AUDIT_EVENT_TYPES,
 	AUDIT_OUTCOMES,
+	type AuditEventType,
 	type AuditLogEntry,
 	type AuditOutcome,
 	type UnixMillis,
@@ -42,6 +44,10 @@ export interface AuditLogFilter {
 	categoryId?: string;
 	categoryName?: string;
 	outcome?: AuditOutcome;
+	/** Exact question/message ID to trace. */
+	messageId?: string;
+	/** Event types to omit from results. */
+	excludeEventTypes?: readonly AuditEventType[];
 	/**
 	 * Maximum number of entries, in the order `order` selects. Defaults to
 	 * `DEFAULT_AUDIT_QUERY_LIMIT`; at most `MAX_AUDIT_QUERY_LIMIT`.
@@ -154,6 +160,26 @@ export function buildAuditLogQuery(filter: AuditLogFilter = {}): AuditLogQuery {
 			);
 		}
 		add("l.outcome = ?", filter.outcome);
+	}
+	if (filter.messageId !== undefined) {
+		add("l.message_id = ?", requireText(filter.messageId, "messageId"));
+	}
+	if (filter.excludeEventTypes !== undefined) {
+		if (!Array.isArray(filter.excludeEventTypes)) {
+			throw new RangeError("excludeEventTypes must be an array");
+		}
+		for (const eventType of filter.excludeEventTypes) {
+			if (!(AUDIT_EVENT_TYPES as readonly string[]).includes(eventType)) {
+				throw new RangeError(
+					`excludeEventTypes must contain only: ${AUDIT_EVENT_TYPES.join(", ")}`,
+				);
+			}
+		}
+		if (filter.excludeEventTypes.length > 0) {
+			const placeholders = filter.excludeEventTypes.map(() => "?").join(", ");
+			where.push(`l.event_type NOT IN (${placeholders})`);
+			params.push(...filter.excludeEventTypes);
+		}
 	}
 
 	const limit = filter.limit ?? DEFAULT_AUDIT_QUERY_LIMIT;
