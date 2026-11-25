@@ -29,7 +29,7 @@ import type {
 	NewAuditLogEntry,
 	Token,
 } from "../../src/types";
-import { createTestDb } from "../helpers/db";
+import { createTestDb, migrationByName } from "../helpers/db";
 import { DAY_MS, seedAgent, seedCategory, T0 } from "../helpers/fixtures";
 
 let db: D1Database;
@@ -587,39 +587,9 @@ describe("row conversion", () => {
 });
 
 describe("migration 0002 on populated data", () => {
-	function splitSql(sql: string): string[] {
-		return sql
-			.split("\n")
-			.filter((line) => !line.trimStart().startsWith("--"))
-			.join("\n")
-			.split(";")
-			.map((statement) => statement.trim())
-			.filter((statement) => statement.length > 0);
-	}
-
 	it("preserves existing answers and rejections when upgrading from 0001", async () => {
-		const rawMigrations = import.meta.glob<string>("../../migrations/*.sql", {
-			query: "?raw",
-			import: "default",
-			eager: true,
-		});
-		const findSql = (name: string): string[] => {
-			const entry = Object.entries(rawMigrations).find(([path]) =>
-				path.endsWith(`/${name}`),
-			);
-			if (entry === undefined) {
-				throw new Error(`Missing migration ${name}`);
-			}
-			return splitSql(entry[1]);
-		};
-		const m0001 = {
-			name: "0001_initial_schema.sql",
-			queries: findSql("0001_initial_schema.sql"),
-		};
-		const m0002 = {
-			name: "0002_cascade_message_references.sql",
-			queries: findSql("0002_cascade_message_references.sql"),
-		};
+		const m0001 = migrationByName("0001_initial_schema.sql");
+		const m0002 = migrationByName("0002_cascade_message_references.sql");
 
 		for (const table of [
 			"audit_log",
