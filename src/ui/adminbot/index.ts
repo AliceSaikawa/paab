@@ -11,9 +11,13 @@ import {
 	clearAdminBot,
 	designateAdminBot,
 	getAdminBotConfig,
+	isSuperadminActive,
 	issueAdminBotToken,
 	revokeAdminBotToken,
+	SUPERADMIN_MODES,
+	type SuperadminMode,
 	setAdminBotReadBodies,
+	setAdminBotSuperadmin,
 } from "../../adminbot";
 import { isBodyRecordingEnabled } from "../../audit";
 import { auditBodyConfig } from "../../mcp/config";
@@ -25,6 +29,7 @@ import {
 	renderAdminBotPageBody,
 	renderIssuedAdminTokenBody,
 	renderReadBodiesConfirmBody,
+	renderSuperadminConfirmBody,
 } from "./render";
 
 const ADMIN_BOT_PATH = "/admin/adminbot";
@@ -227,6 +232,14 @@ async function resolveTargetAdminAgentId(
 	return { ok: true, agentId: config.agentId };
 }
 
+async function loadAgentName(db: D1Database, agentId: string): Promise<string> {
+	const row = await db
+		.prepare("SELECT name FROM agents WHERE id = ?")
+		.bind(agentId)
+		.first<{ name: string }>();
+	return row?.name ?? agentId;
+}
+
 async function handleIssueAdminBotToken(
 	ctx: AdminPostContext,
 ): Promise<Response> {
@@ -245,10 +258,7 @@ async function handleIssueAdminBotToken(
 		});
 	}
 
-	const row = await ctx.env.DB.prepare("SELECT name FROM agents WHERE id = ?")
-		.bind(target.agentId)
-		.first<{ name: string }>();
-	const agentName = row?.name ?? target.agentId;
+	const agentName = await loadAgentName(ctx.env.DB, target.agentId);
 
 	return adminPageResponse({
 		title: "管理者トークン発行",
@@ -354,6 +364,21 @@ function parseReadBodiesEnabled(raw: string | null): boolean | null {
 	}
 }
 
+function parseSuperadminMode(raw: string | null): SuperadminMode | null {
+	if (raw === null) return null;
+	const trimmed = raw.trim();
+	return (SUPERADMIN_MODES as readonly string[]).includes(trimmed)
+		? (trimmed as SuperadminMode)
+		: null;
+}
+
+const SUPERADMIN_MODE_LABELS: Record<Exclude<SuperadminMode, "off">, string> = {
+	"1d": "1日",
+	"7d": "7日",
+	"30d": "30日",
+	unlimited: "無期限",
+};
+
 async function handleSetReadBodies(ctx: AdminPostContext): Promise<Response> {
 	const enabled = parseReadBodiesEnabled(ctx.form.get("enabled"));
 	if (enabled === null) {
@@ -374,18 +399,13 @@ async function handleSetReadBodies(ctx: AdminPostContext): Promise<Response> {
 			!config.readBodies &&
 			superadminUntil !== null
 		) {
-			const row = await ctx.env.DB.prepare(
-				"SELECT name FROM agents WHERE id = ?",
-			)
-				.bind(config.agentId)
-				.first<{ name: string }>();
 			return adminPageResponse({
 				title: "本文閲覧の有効化確認",
 				currentPath: ADMIN_BOT_PATH,
 				user: ctx.user,
 				devMode: ctx.devMode,
 				body: renderReadBodiesConfirmBody({
-					agentName: row?.name ?? config.agentId,
+					agentName: await loadAgentName(ctx.env.DB, config.agentId),
 					csrfToken: ctx.csrfToken,
 					superadminUntil,
 					bodyRecordingEnabled: isBodyRecordingEnabled(
@@ -429,6 +449,77 @@ async function handleSetReadBodies(ctx: AdminPostContext): Promise<Response> {
 	});
 }
 
+async function handleSetSuperadmin(ctx: AdminPostContext): Promise<Response> {
+	const mode = parseSuperadminMode(ctx.form.get("mode"));
+	if (mode === null) {
+		return renderAdminBotScreen(ctx, {
+			status: 400,
+			flash: {
+				kind: "error",
+				message: "最高管理者権限スイッチの指定が不正です",
+			},
+		});
+	}
+
+	if (mode !== "off" && ctx.form.get("confirm") !== "1") {
+		const config = await getAdminBotConfig(ctx.env.DB);
+		if (
+			config.agentId !== null &&
+			config.readBodies &&
+			!isSuperadminActive(config, ctx.now)
+		) {
+			return adminPageResponse({
+				title: "最高管理者権限の有効化確認",
+				currentPath: ADMIN_BOT_PATH,
+				user: ctx.user,
+				devMode: ctx.devMode,
+				body: renderSuperadminConfirmBody({
+					agentName: await loadAgentName(ctx.env.DB, config.agentId),
+					csrfToken: ctx.csrfToken,
+					mode,
+					bodyRecordingEnabled: isBodyRecordingEnabled(
+						auditBodyConfig(ctx.env),
+					),
+				}),
+			});
+		}
+	}
+
+	const result = await setAdminBotSuperadmin(ctx.env.DB, {
+		mode,
+		actor: ownerActor(ctx),
+		now: ctx.now,
+	});
+	if (!result.ok) {
+		return renderAdminBotScreen(ctx, {
+			status: statusForError(result.code),
+			flash: { kind: "error", message: result.message },
+		});
+	}
+
+	if (!result.data.changed) {
+		return renderAdminBotScreen(ctx, {
+			flash: {
+				kind: "info",
+				message:
+					mode === "off"
+						? "最高管理者権限はすでにオフです"
+						: "最高管理者権限はすでにこの設定で有効です",
+			},
+		});
+	}
+
+	return renderAdminBotScreen(ctx, {
+		flash: {
+			kind: "success",
+			message:
+				mode === "off"
+					? "管理者ボットの最高管理者権限をオフにしました"
+					: `管理者ボットの最高管理者権限をオンにしました（${SUPERADMIN_MODE_LABELS[mode]}）`,
+		},
+	});
+}
+
 /** Admin UI routes for designating the admin bot and managing its `/mcp/admin` token. */
 export function adminBotRoutes(): AdminRoute[] {
 	return [
@@ -445,5 +536,6 @@ export function adminBotRoutes(): AdminRoute[] {
 			post: handleRevertAdminBotChange,
 		},
 		{ pattern: "/admin/adminbot/read-bodies", post: handleSetReadBodies },
+		{ pattern: "/admin/adminbot/superadmin", post: handleSetSuperadmin },
 	];
 }

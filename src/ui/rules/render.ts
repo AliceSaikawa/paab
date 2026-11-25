@@ -294,8 +294,15 @@ function describeSnapshot(
 			if (record.readBodies === true) {
 				extras.push("本文閲覧=ON");
 			}
-			if (typeof record.superadminUntil === "number") {
-				extras.push("最高管理者=有効");
+			if (record.superadminUntil === -1) {
+				extras.push("最高管理者=無期限");
+			} else if (
+				typeof record.superadminUntil === "number" &&
+				Number.isSafeInteger(record.superadminUntil)
+			) {
+				extras.push(
+					`最高管理者=有効（期限: ${new Date(record.superadminUntil).toISOString()}）`,
+				);
 			}
 			return extras.length > 0 ? `${name}（${extras.join("・")}）` : name;
 		}

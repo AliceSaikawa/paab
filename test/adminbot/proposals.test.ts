@@ -14,6 +14,7 @@ import {
 	listCategoriesWithUsage,
 	queryChangeLog,
 	resumeAgent,
+	revertAdminBotChange,
 	suspendAgent,
 	updateAgent,
 } from "../../src/admin";
@@ -29,15 +30,17 @@ import {
 	MAX_PENDING_PROPOSALS,
 	PROPOSAL_TTL_MS,
 	rejectProposal,
+	setAdminBotSuperadmin,
 } from "../../src/adminbot";
 import { queryAuditLog, recordAuditEvent } from "../../src/audit";
+import { issueToken } from "../../src/auth";
 import { insertMessage, newId } from "../../src/db";
-import { runScheduledMaintenance } from "../../src/mcp";
+import { handleMcpRequest, runScheduledMaintenance } from "../../src/mcp";
 import type { McpEnv } from "../../src/mcp/config";
 import type { Agent, Category } from "../../src/types";
 import { createTestDb } from "../helpers/db";
 import { DAY_MS, seedAgent, seedCategory, T0 } from "../helpers/fixtures";
-import { call } from "../mcp/support";
+import { call, connect, withoutFooter } from "../mcp/support";
 
 const ADMIN_MCP_URL = "https://paab.test/mcp/admin";
 const OWNER: ChangeActor = { actorType: "owner", actorId: "owner@example.com" };
@@ -687,5 +690,342 @@ describe("proposal approval, rejection, preconditions, and 14-day expiry", () =>
 
 		const auditRows = await queryAuditLog(db, { includeBody: true });
 		expect(auditRows.find((r) => r.messageId === "old-audit")?.body).toBeNull();
+	});
+});
+
+describe("superadmin direct execution, expiry boundary, and 1-click undo", () => {
+	it("executes all 4 loosening tools immediately when superadmin is active, propagates to /mcp, logs approver_id=NULL, and supports 1-click undo", async () => {
+		const alice2 = await seedAgent(db, {
+			name: "alice-super",
+			dailyQuestionLimit: 1,
+		});
+		const bob2 = await seedAgent(db, {
+			name: "bob-super",
+			status: "suspended",
+			dailyQuestionLimit: 10,
+		});
+		const aliceTok = (
+			await issueToken(db, {
+				agentId: alice2.id,
+				purpose: "participant",
+				now: T0,
+			})
+		).token;
+		const bobTok = (
+			await issueToken(db, {
+				agentId: bob2.id,
+				purpose: "participant",
+				now: T0,
+			})
+		).token;
+
+		await grantAllowRule(db, {
+			fromAgentId: alice2.id,
+			toAgentId: bob.id,
+			categoryId: schedule.id,
+			actor: OWNER,
+			now: T0,
+		});
+		const aliceClient = await connect(aliceTok, { now: T0 + 1 });
+		await call(aliceClient, "ask", {
+			to: "bob",
+			category: "予定",
+			question: "daily cap hit",
+		});
+
+		// Fill up pending proposal cap (20) to verify direct superadmin execution is unaffected by proposal quota.
+		for (let i = 0; i < MAX_PENDING_PROPOSALS; i += 1) {
+			const res = await createProposal(db, {
+				botAgentId: bot.id,
+				request: { kind: "create_category", name: `queued-${i}` },
+				reason: `queued ${i}`,
+				now: T0 + 2 + i,
+			});
+			expect(res.ok).toBe(true);
+		}
+
+		await setAdminBotSuperadmin(db, {
+			mode: "7d",
+			actor: OWNER,
+			now: T0 + 30,
+		});
+
+		const adminClient = await connectAdmin(adminToken, { now: T0 + 40 });
+
+		const catExec = await call(adminClient, "propose_category", {
+			name: "旅行",
+			reason: "superadmin direct category",
+		});
+		expect(catExec.isError).toBe(false);
+		expect(catExec.text).toContain("status: executed");
+		expect(catExec.text).toContain("change_id:");
+		expect(catExec.text).not.toContain("proposal_id:");
+
+		const ruleExec = await call(adminClient, "propose_allow_rule", {
+			from: "alice-super",
+			to: "bob-super",
+			category: "旅行",
+			reason: "superadmin direct rule",
+		});
+		expect(ruleExec.isError).toBe(false);
+		expect(ruleExec.text).toContain("status: executed");
+		expect(ruleExec.text).toContain("change_id:");
+
+		const limitExec = await call(adminClient, "propose_daily_limit_raise", {
+			agent: "alice-super",
+			new_limit: 5,
+			reason: "superadmin direct raise",
+		});
+		expect(limitExec.isError).toBe(false);
+		expect(limitExec.text).toContain("status: executed");
+		expect(limitExec.text).toContain("change_id:");
+
+		const resumeExec = await call(adminClient, "propose_resume_agent", {
+			agent: "bob-super",
+			reason: "superadmin direct resume",
+		});
+		expect(resumeExec.isError).toBe(false);
+		expect(resumeExec.text).toContain("status: executed");
+		expect(resumeExec.text).toContain("change_id:");
+
+		// Still only the 20 seeded pending proposals; direct execution created no proposals.
+		expect(await listProposals(db, { status: "pending" })).toHaveLength(
+			MAX_PENDING_PROPOSALS,
+		);
+
+		// Effects take place immediately on participant /mcp.
+		const bobClient = await connect(bobTok, { now: T0 + 41 });
+		const aliceList = withoutFooter(
+			(await call(aliceClient, "list_agents")).text,
+		);
+		expect(aliceList).toContain("name: bob-super");
+		expect(aliceList).toContain("categories: 旅行");
+
+		const askAfterRaise = await call(aliceClient, "ask", {
+			to: "bob-super",
+			category: "旅行",
+			question: "Can we plan the trip?",
+		});
+		expect(askAfterRaise.isError).toBe(false);
+
+		const bobInbox = withoutFooter((await call(bobClient, "check_inbox")).text);
+		expect(bobInbox).toContain("Can we plan the trip?");
+
+		const botChanges = await queryChangeLog(db, { actorType: "admin_bot" });
+		expect(botChanges).toHaveLength(4);
+		expect(botChanges.map((entry) => entry.action)).toEqual([
+			"agent_resumed",
+			"agent_updated",
+			"allow_rule_granted",
+			"category_created",
+		]);
+		for (const entry of botChanges) {
+			expect(entry.actorType).toBe("admin_bot");
+			expect(entry.actorId).toBe(bot.id);
+			expect(entry.approverId).toBeNull();
+			expect(entry.revertedAt).toBeNull();
+		}
+
+		const calledAudits = (await queryAuditLog(db)).filter(
+			(entry) => entry.eventType === "admin_tool_called",
+		);
+		expect(calledAudits).toHaveLength(4);
+
+		// Revert all 4 direct changes via 1-click undo (allow_rule before category).
+		const [resumeChange, limitChange, ruleChange, catChange] = botChanges;
+		if (!resumeChange || !limitChange || !ruleChange || !catChange) {
+			throw new Error("Expected 4 change entries");
+		}
+		expect(
+			(
+				await revertAdminBotChange(db, {
+					changeId: resumeChange.id,
+					actor: OWNER,
+					now: T0 + 50,
+				})
+			).ok,
+		).toBe(true);
+		expect(
+			(
+				await revertAdminBotChange(db, {
+					changeId: limitChange.id,
+					actor: OWNER,
+					now: T0 + 51,
+				})
+			).ok,
+		).toBe(true);
+		expect(
+			(
+				await revertAdminBotChange(db, {
+					changeId: ruleChange.id,
+					actor: OWNER,
+					now: T0 + 52,
+				})
+			).ok,
+		).toBe(true);
+		expect(
+			(
+				await revertAdminBotChange(db, {
+					changeId: catChange.id,
+					actor: OWNER,
+					now: T0 + 53,
+				})
+			).ok,
+		).toBe(true);
+
+		const bobPostUndo = await handleMcpRequest(
+			new Request("https://paab.test/mcp", {
+				method: "POST",
+				headers: {
+					Authorization: `Bearer ${bobTok}`,
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+			}),
+			env,
+			T0 + 54,
+		);
+		expect(bobPostUndo.status).toBe(403);
+		expect(
+			(await listCategoriesWithUsage(db)).map((c) => c.category.name),
+		).toEqual(["予定"]);
+	});
+
+	it("enforces same preconditions under superadmin and logs permission_denied when propose_daily_limit_raise does not strictly raise", async () => {
+		await setAdminBotSuperadmin(db, {
+			mode: "7d",
+			actor: OWNER,
+			now: T0 + 1,
+		});
+
+		const adminClient = await connectAdmin(adminToken, { now: T0 + 10 });
+
+		const sameLimit = await call(adminClient, "propose_daily_limit_raise", {
+			agent: "alice",
+			new_limit: 10,
+			reason: "same",
+		});
+		expect(sameLimit.isError).toBe(true);
+
+		const lowerLimit = await call(adminClient, "propose_daily_limit_raise", {
+			agent: "alice",
+			new_limit: 4,
+			reason: "lower",
+		});
+		expect(lowerLimit.isError).toBe(true);
+
+		const zeroLimit = await call(adminClient, "propose_daily_limit_raise", {
+			agent: "alice",
+			new_limit: 0,
+			reason: "zero",
+		});
+		expect(zeroLimit.isError).toBe(true);
+
+		const selfRule = await call(adminClient, "propose_allow_rule", {
+			from: "alice",
+			to: "alice",
+			category: "予定",
+			reason: "self",
+		});
+		expect(selfRule.isError).toBe(true);
+
+		const dupCat = await call(adminClient, "propose_category", {
+			name: "予定",
+			reason: "dup",
+		});
+		expect(dupCat.isError).toBe(true);
+
+		const activeResume = await call(adminClient, "propose_resume_agent", {
+			agent: "alice",
+			reason: "already active",
+		});
+		expect(activeResume.isError).toBe(true);
+
+		expect(await queryChangeLog(db, { actorType: "admin_bot" })).toHaveLength(
+			0,
+		);
+
+		const deniedAudits = (await queryAuditLog(db)).filter(
+			(entry) => entry.eventType === "admin_tool_denied",
+		);
+		expect(deniedAudits).toHaveLength(3);
+		for (const entry of deniedAudits) {
+			expect(entry).toMatchObject({
+				eventType: "admin_tool_denied",
+				fromAgentId: bot.id,
+				toAgentId: alice.id,
+				outcome: "denied",
+				reasonCode: "permission_denied",
+			});
+		}
+	});
+
+	it("expires at exact superadminUntil boundary without cron and falls back to pending proposals; unlimited (-1) persists until disabled", async () => {
+		const enabled = await setAdminBotSuperadmin(db, {
+			mode: "1d",
+			actor: OWNER,
+			now: T0,
+		});
+		expect(enabled.ok).toBe(true);
+		const until = T0 + DAY_MS;
+
+		const justBeforeClient = await connectAdmin(adminToken, {
+			now: until - 1,
+		});
+		const beforeRes = await call(justBeforeClient, "propose_category", {
+			name: "境界前",
+			reason: "still active at until - 1",
+		});
+		expect(beforeRes.isError).toBe(false);
+		expect(beforeRes.text).toContain("status: executed");
+		expect(
+			(await listCategoriesWithUsage(db)).map((c) => c.category.name),
+		).toContain("境界前");
+
+		// Exactly at `until` with zero cron calls: automatically falls back to proposal mode.
+		const atBoundaryClient = await connectAdmin(adminToken, { now: until });
+		const atBoundaryRes = await call(atBoundaryClient, "propose_category", {
+			name: "境界後",
+			reason: "expired at until",
+		});
+		expect(atBoundaryRes.isError).toBe(false);
+		expect(atBoundaryRes.text).toContain("status: pending");
+		expect(atBoundaryRes.text).toContain("proposal_id:");
+		expect(atBoundaryRes.text).not.toContain("status: executed");
+		expect(
+			(await listCategoriesWithUsage(db)).map((c) => c.category.name),
+		).not.toContain("境界後");
+		expect(await listProposals(db, { status: "pending" })).toHaveLength(1);
+
+		// Unlimited (-1) stays active even 10 years later until turned off manually.
+		await setAdminBotSuperadmin(db, {
+			mode: "unlimited",
+			actor: OWNER,
+			now: until + 10,
+		});
+		const farFutureClient = await connectAdmin(adminToken, {
+			now: T0 + 3650 * DAY_MS,
+		});
+		const farFutureRes = await call(farFutureClient, "propose_category", {
+			name: "無期限カテゴリ",
+			reason: "unlimited active",
+		});
+		expect(farFutureRes.isError).toBe(false);
+		expect(farFutureRes.text).toContain("status: executed");
+
+		await setAdminBotSuperadmin(db, {
+			mode: "off",
+			actor: OWNER,
+			now: T0 + 3650 * DAY_MS + 1,
+		});
+		const afterOffClient = await connectAdmin(adminToken, {
+			now: T0 + 3650 * DAY_MS + 2,
+		});
+		const afterOffRes = await call(afterOffClient, "propose_category", {
+			name: "解除後カテゴリ",
+			reason: "manual disable",
+		});
+		expect(afterOffRes.isError).toBe(false);
+		expect(afterOffRes.text).toContain("status: pending");
 	});
 });

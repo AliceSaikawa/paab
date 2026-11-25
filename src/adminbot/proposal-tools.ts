@@ -1,9 +1,11 @@
 import { z } from "zod";
 import { renderFramed } from "../mcp/frame";
 import { PROPOSAL_STATUSES } from "../types";
+import { isSuperadminActive } from "./config";
 import {
 	createProposal,
 	describeProposalEffect,
+	executeAdminBotLoosening,
 	listProposals,
 	type ProposalRequest,
 	type ProposalView,
@@ -17,19 +19,48 @@ import {
 	defineAdminTool,
 } from "./tools";
 
-async function submitProposal(
+async function runLooseningTool(
 	ctx: AdminMcpContext,
 	request: ProposalRequest,
 	reason: string,
 ): Promise<AdminToolOutput> {
-	const result = await createProposal(ctx.db, {
+	const input = {
 		botAgentId: ctx.agent.id,
 		request,
 		reason,
 		now: ctx.now,
-	});
+	};
+
+	if (isSuperadminActive(ctx.config, ctx.now)) {
+		const result = await executeAdminBotLoosening(ctx.db, input);
+		if (!result.ok) {
+			return result.code === "invalid_limit" &&
+				result.targetAgentId !== undefined
+				? adminToolFail(result.message, {
+						toAgentId: result.targetAgentId,
+						deniedReason: "permission_denied",
+					})
+				: adminToolFail(result.message);
+		}
+		return adminToolOk(
+			[
+				`change_id: ${result.data.changeId}`,
+				`kind: ${result.data.kind}`,
+				"status: executed",
+				`effect: ${result.data.effect}`,
+			].join("\n"),
+			result.data.audit,
+		);
+	}
+
+	const result = await createProposal(ctx.db, input);
 	if (!result.ok) {
-		return adminToolFail(result.message);
+		return result.code === "invalid_limit" && result.targetAgentId !== undefined
+			? adminToolFail(result.message, {
+					toAgentId: result.targetAgentId,
+					deniedReason: "permission_denied",
+				})
+			: adminToolFail(result.message);
 	}
 	const { proposal } = result.data;
 	return adminToolOk(
@@ -47,7 +78,7 @@ async function submitProposal(
 const proposeAllowRule = defineAdminTool({
 	name: "propose_allow_rule",
 	description:
-		"Propose granting a directional allow rule (from -> to for a category). Does not take effect until the human owner approves it in /admin/proposals.",
+		"Grant a directional allow rule (from -> to for a category). Creates a pending proposal (status: pending, proposal_id) awaiting owner approval in /admin/proposals, or executes immediately (status: executed, change_id) while superadmin is active.",
 	inputSchema: z.object({
 		from: z.string().describe("Asking agent name."),
 		to: z.string().describe("Recipient agent name."),
@@ -55,7 +86,7 @@ const proposeAllowRule = defineAdminTool({
 		reason: z.string().describe("Why this allow rule is needed."),
 	}),
 	async run(ctx, args) {
-		return submitProposal(
+		return runLooseningTool(
 			ctx,
 			{
 				kind: "grant_allow_rule",
@@ -71,13 +102,13 @@ const proposeAllowRule = defineAdminTool({
 const proposeCategory = defineAdminTool({
 	name: "propose_category",
 	description:
-		"Propose adding a new question category. Does not take effect until the human owner approves it in /admin/proposals.",
+		"Add a new question category. Creates a pending proposal (status: pending, proposal_id) awaiting owner approval in /admin/proposals, or executes immediately (status: executed, change_id) while superadmin is active.",
 	inputSchema: z.object({
 		name: z.string().describe("New category name (1-64 characters)."),
 		reason: z.string().describe("Why this category is needed."),
 	}),
 	async run(ctx, args) {
-		return submitProposal(
+		return runLooseningTool(
 			ctx,
 			{
 				kind: "create_category",
@@ -91,7 +122,7 @@ const proposeCategory = defineAdminTool({
 const proposeDailyLimitRaise = defineAdminTool({
 	name: "propose_daily_limit_raise",
 	description:
-		"Propose raising an agent's daily question limit above its current value. Does not take effect until the human owner approves it in /admin/proposals.",
+		"Raise an agent's daily question limit strictly above its current value. Creates a pending proposal (status: pending, proposal_id) awaiting owner approval in /admin/proposals, or executes immediately (status: executed, change_id) while superadmin is active.",
 	inputSchema: z.object({
 		agent: z.string().describe("Target agent name."),
 		new_limit: z
@@ -101,7 +132,7 @@ const proposeDailyLimitRaise = defineAdminTool({
 		reason: z.string().describe("Why the limit increase is needed."),
 	}),
 	async run(ctx, args) {
-		return submitProposal(
+		return runLooseningTool(
 			ctx,
 			{
 				kind: "raise_daily_limit",
@@ -116,13 +147,13 @@ const proposeDailyLimitRaise = defineAdminTool({
 const proposeResumeAgent = defineAdminTool({
 	name: "propose_resume_agent",
 	description:
-		"Propose resuming a currently suspended agent. Does not take effect until the human owner approves it in /admin/proposals.",
+		"Resume a currently suspended agent. Creates a pending proposal (status: pending, proposal_id) awaiting owner approval in /admin/proposals, or executes immediately (status: executed, change_id) while superadmin is active.",
 	inputSchema: z.object({
 		agent: z.string().describe("Suspended agent name."),
 		reason: z.string().describe("Why the agent should be resumed."),
 	}),
 	async run(ctx, args) {
-		return submitProposal(
+		return runLooseningTool(
 			ctx,
 			{
 				kind: "resume_agent",
