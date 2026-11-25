@@ -11,7 +11,10 @@ import {
 import { type AuditBodyConfig, isBodyRecordingEnabled } from "./config";
 
 /** Event types that record a denial by the bridge and so carry a reason. */
-export type DeniedByBridgeEventType = "question_blocked" | "auth_failed";
+export type DeniedByBridgeEventType =
+	| "question_blocked"
+	| "auth_failed"
+	| "admin_tool_denied";
 
 interface AuditEventBase {
 	/** When the event happened. The caller passes the time in. */
@@ -57,6 +60,8 @@ const OUTCOMES: Record<AuditEventType, AuditOutcome> = {
 	question_declined: "denied",
 	question_expired: "expired",
 	auth_failed: "denied",
+	admin_tool_called: "ok",
+	admin_tool_denied: "denied",
 };
 
 /** The outcome an event type is recorded with. */

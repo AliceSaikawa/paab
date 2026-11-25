@@ -106,6 +106,25 @@ describe("recordAuditEvent", () => {
 				outcome: "denied",
 				reason: "token_unknown",
 			},
+			{
+				event: {
+					occurredAt: T0 + 7,
+					eventType: "admin_tool_called",
+					fromAgentId: "admin-bot",
+				},
+				outcome: "ok",
+				reason: null,
+			},
+			{
+				event: {
+					occurredAt: T0 + 8,
+					eventType: "admin_tool_denied",
+					fromAgentId: "admin-bot",
+					reasonCode: "permission_denied",
+				},
+				outcome: "denied",
+				reason: "permission_denied",
+			},
 		];
 
 	it("has a case for every event type", () => {

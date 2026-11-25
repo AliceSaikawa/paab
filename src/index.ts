@@ -1,3 +1,4 @@
+import { handleAdminMcpRequest } from "./adminbot";
 import { handleMcpRequest, runScheduledMaintenance } from "./mcp";
 import { handleAdminRequest } from "./ui";
 
@@ -13,6 +14,9 @@ export default {
 		}
 		if (url.pathname === "/mcp") {
 			return handleMcpRequest(request, env, Date.now());
+		}
+		if (url.pathname === "/mcp/admin") {
+			return handleAdminMcpRequest(request, env, Date.now());
 		}
 		if (url.pathname === "/admin" || url.pathname.startsWith("/admin/")) {
 			return handleAdminRequest(request, env, Date.now());
