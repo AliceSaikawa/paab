@@ -1,4 +1,11 @@
-import { type ChangeActor, listAgentsWithStatus } from "../../admin";
+import {
+	type ChangeActor,
+	listAdminBotChanges,
+	listAgentsWithStatus,
+	listCategoriesWithUsage,
+	revertAdminBotChange,
+	type UndoErrorCode,
+} from "../../admin";
 import {
 	type AdminBotErrorCode,
 	clearAdminBot,
@@ -9,6 +16,7 @@ import {
 } from "../../adminbot";
 import { adminPageResponse, type FlashMessage } from "../layout";
 import type { AdminGetContext, AdminPostContext, AdminRoute } from "../router";
+import { CHANGE_ACTION_LABELS } from "../rules/render";
 import { renderAdminBotPageBody, renderIssuedAdminTokenBody } from "./render";
 
 const ADMIN_BOT_PATH = "/admin/adminbot";
@@ -37,13 +45,36 @@ function statusForError(code: AdminBotErrorCode): 400 | 404 | 409 {
 	}
 }
 
+function statusForUndoError(code: UndoErrorCode): 400 | 404 | 409 {
+	switch (code) {
+		case "not_found":
+			return 404;
+		case "already_reverted":
+		case "conflict_newer_change":
+		case "duplicate_name":
+		case "duplicate_rule":
+			return 409;
+		case "invalid_name":
+		case "invalid_description":
+		case "invalid_limit":
+		case "invalid_input":
+		case "already_suspended":
+		case "already_active":
+		case "self_addressed":
+		case "not_undoable":
+			return 400;
+	}
+}
+
 async function renderAdminBotScreen(
 	ctx: AdminGetContext,
 	options: { status?: number; flash?: FlashMessage } = {},
 ): Promise<Response> {
-	const [config, agents] = await Promise.all([
+	const [config, agents, categories, changes] = await Promise.all([
 		getAdminBotConfig(ctx.env.DB),
 		listAgentsWithStatus(ctx.env.DB, ctx.now),
+		listCategoriesWithUsage(ctx.env.DB),
+		listAdminBotChanges(ctx.env.DB),
 	]);
 	const designated =
 		config.agentId !== null
@@ -61,6 +92,8 @@ async function renderAdminBotScreen(
 				config,
 				designated,
 				agents,
+				categories,
+				changes,
 				csrfToken: ctx.csrfToken,
 				adminMcpUrl: `${ctx.url.origin}/mcp/admin`,
 			}),
@@ -257,6 +290,44 @@ async function handleRevokeAdminBotToken(
 	});
 }
 
+async function handleRevertAdminBotChange(
+	ctx: AdminPostContext,
+): Promise<Response> {
+	const rawId = ctx.params.id ?? "";
+	if (!/^\d+$/.test(rawId)) {
+		return renderAdminBotScreen(ctx, {
+			status: 400,
+			flash: { kind: "error", message: "変更IDが不正です" },
+		});
+	}
+	const changeId = Number(rawId);
+	if (!Number.isSafeInteger(changeId) || changeId <= 0) {
+		return renderAdminBotScreen(ctx, {
+			status: 400,
+			flash: { kind: "error", message: "変更IDが不正です" },
+		});
+	}
+
+	const result = await revertAdminBotChange(ctx.env.DB, {
+		changeId,
+		actor: ownerActor(ctx),
+		now: ctx.now,
+	});
+	if (!result.ok) {
+		return renderAdminBotScreen(ctx, {
+			status: statusForUndoError(result.code),
+			flash: { kind: "error", message: result.message },
+		});
+	}
+
+	return renderAdminBotScreen(ctx, {
+		flash: {
+			kind: "success",
+			message: `変更 #${result.data.revertedChangeId}（${CHANGE_ACTION_LABELS[result.data.action]}）を元に戻しました`,
+		},
+	});
+}
+
 /** Admin UI routes for designating the admin bot and managing its `/mcp/admin` token. */
 export function adminBotRoutes(): AdminRoute[] {
 	return [
@@ -267,6 +338,10 @@ export function adminBotRoutes(): AdminRoute[] {
 		{
 			pattern: "/admin/adminbot/token/revoke",
 			post: handleRevokeAdminBotToken,
+		},
+		{
+			pattern: "/admin/adminbot/changes/:id/revert",
+			post: handleRevertAdminBotChange,
 		},
 	];
 }

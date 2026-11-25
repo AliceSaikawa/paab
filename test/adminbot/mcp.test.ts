@@ -82,11 +82,16 @@ async function connectAdmin(
 }
 
 describe("/mcp/admin connection and instructions", () => {
-	it("exposes only view_audit_log and includes fixed safety instructions", async () => {
+	it("exposes view_audit_log and tightening tools and includes fixed safety instructions", async () => {
 		const client = await connectAdmin(adminToken);
 
 		const { tools } = await client.listTools();
-		expect(tools.map((tool) => tool.name)).toEqual(["view_audit_log"]);
+		expect(tools.map((tool) => tool.name)).toEqual([
+			"view_audit_log",
+			"suspend_agent",
+			"revoke_allow_rule",
+			"lower_daily_limit",
+		]);
 
 		const instructions = client.getInstructions() ?? "";
 		expect(instructions).toMatch(/prompt injection/i);
@@ -275,7 +280,12 @@ describe("/mcp/admin authentication and authorization", () => {
 			now: T0 + 13,
 		});
 		const list = await grokClient.listTools();
-		expect(list.tools.map((tool) => tool.name)).toEqual(["view_audit_log"]);
+		expect(list.tools.map((tool) => tool.name)).toEqual([
+			"view_audit_log",
+			"suspend_agent",
+			"revoke_allow_rule",
+			"lower_daily_limit",
+		]);
 	});
 });
 

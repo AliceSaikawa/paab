@@ -1,13 +1,26 @@
-import type { AgentWithStatus } from "../../admin";
+import {
+	type AgentWithStatus,
+	type CategoryWithUsage,
+	isUndoableChangeAction,
+} from "../../admin";
 import type { AdminBotConfig } from "../../adminbot";
+import type { ChangeLogEntry } from "../../types";
 import { csrfInput } from "../csrf";
 import { html, rawHtml, type SafeHtml } from "../html";
 import { formatTimestamp } from "../layout";
+import {
+	CHANGE_ACTION_LABELS,
+	collectEntityNames,
+	describeChangeBeforeAfter,
+	describeChangeTarget,
+} from "../rules/render";
 
 export interface AdminBotPageView {
 	config: AdminBotConfig;
 	designated: AgentWithStatus | null;
 	agents: readonly AgentWithStatus[];
+	categories: readonly CategoryWithUsage[];
+	changes: readonly ChangeLogEntry[];
 	csrfToken: string;
 	adminMcpUrl: string;
 }
@@ -194,6 +207,75 @@ function renderDesignateSection(view: AdminBotPageView): SafeHtml {
 	`;
 }
 
+function renderAdminBotChangesSection(view: AdminBotPageView): SafeHtml {
+	const names = collectEntityNames(view.agents, view.categories, view.changes);
+
+	return html`
+		<section class="card stack">
+			<div>
+				<h2>管理者ボットによる変更履歴</h2>
+				<p class="muted">
+					管理者ボットが実行した変更を新しい順に表示します。最新の変更から 1 操作で元に戻せます。
+				</p>
+			</div>
+			${
+				view.changes.length === 0
+					? html`<p class="muted">管理者ボットによる変更履歴はまだありません。</p>`
+					: html`
+						<div class="table-wrap">
+							<table>
+								<thead>
+									<tr>
+										<th>ID</th>
+										<th>日時</th>
+										<th>操作</th>
+										<th>対象</th>
+										<th>変更内容</th>
+										<th>取消</th>
+									</tr>
+								</thead>
+								<tbody>
+									${view.changes.map(
+										(entry) => html`
+											<tr>
+												<td>#${entry.id}</td>
+												<td>${formatTimestamp(entry.occurredAt)}</td>
+												<td>${CHANGE_ACTION_LABELS[entry.action]}</td>
+												<td>${describeChangeTarget(entry, names)}</td>
+												<td>${describeChangeBeforeAfter(entry, names)}</td>
+												<td>
+													${
+														entry.revertedAt !== null
+															? html`
+																<span class="badge">元に戻しました</span>
+																<span class="muted">（${formatTimestamp(entry.revertedAt)}）</span>
+															`
+															: isUndoableChangeAction(entry.action)
+																? html`
+																	<form
+																		class="inline-form"
+																		method="POST"
+																		action="/admin/adminbot/changes/${entry.id}/revert"
+																	>
+																		${csrfInput(view.csrfToken)}
+																		<button type="submit" class="btn btn-danger">元に戻す</button>
+																	</form>
+																`
+																: html`<span class="badge">取消不可</span>`
+													}
+												</td>
+											</tr>
+										`,
+									)}
+								</tbody>
+							</table>
+						</div>
+					`
+			}
+		</section>
+	`;
+}
+
 /** Renders the `/admin/adminbot` management screen. */
 export function renderAdminBotPageBody(view: AdminBotPageView): SafeHtml {
 	return html`
@@ -206,6 +288,7 @@ export function renderAdminBotPageBody(view: AdminBotPageView): SafeHtml {
 			</div>
 			${renderCurrentSection(view)}
 			${renderDesignateSection(view)}
+			${renderAdminBotChangesSection(view)}
 		</div>
 	`;
 }
