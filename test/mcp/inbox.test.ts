@@ -259,6 +259,7 @@ describe("check_inbox", () => {
 			},
 		);
 
+		const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
 		const prepare = world.db.prepare.bind(world.db);
 		vi.spyOn(world.db, "prepare").mockImplementation((query: string) => {
 			if (query.includes("FROM messages")) {
@@ -275,6 +276,59 @@ describe("check_inbox", () => {
 		);
 		expect(err).toBeInstanceOf(AggregateError);
 		expect((err as AggregateError).errors).toHaveLength(2);
+		expect(errorLog).toHaveBeenCalledTimes(2);
+		expect(errorLog.mock.calls.map((c) => c[1])).toMatchObject([
+			{ step: "inbox", error: "expiry failed" },
+			{ step: "audit_purge", error: "purge failed" },
+		]);
+	});
+
+	it("purges expired audit bodies even when inbox maintenance fails", async () => {
+		const auditConfig = { recordBodies: true, bodyRetentionDays: 30 };
+		await recordAuditEvent(world.db, auditConfig, {
+			occurredAt: T0,
+			eventType: "question_accepted",
+			fromAgentId: world.alice.agent.id,
+			toAgentId: world.bob.agent.id,
+			categoryId: world.schedule.id,
+			messageId: "expired-audit-body",
+			body: "old secret",
+		});
+		await recordAuditEvent(world.db, auditConfig, {
+			occurredAt: T0 + 5 * DAY_MS,
+			eventType: "question_accepted",
+			fromAgentId: world.alice.agent.id,
+			toAgentId: world.bob.agent.id,
+			categoryId: world.schedule.id,
+			messageId: "fresh-audit-body",
+			body: "recent secret",
+		});
+
+		vi.spyOn(console, "error").mockImplementation(() => {});
+		const prepare = world.db.prepare.bind(world.db);
+		vi.spyOn(world.db, "prepare").mockImplementation((query: string) => {
+			if (query.includes("FROM messages")) {
+				throw new Error("expiry failed");
+			}
+			return prepare(query);
+		});
+
+		await expect(
+			runScheduledMaintenance(
+				{
+					...env,
+					AUDIT_RECORD_BODIES: "true",
+					AUDIT_BODY_RETENTION_DAYS: "30",
+				},
+				T0 + 30 * DAY_MS,
+			),
+		).rejects.toThrow("expiry failed");
+
+		const rows = await queryAuditLog(world.db, { includeBody: true });
+		expect(rows.map((row) => [row.messageId, row.body])).toEqual([
+			["expired-audit-body", null],
+			["fresh-audit-body", "recent secret"],
+		]);
 	});
 });
 

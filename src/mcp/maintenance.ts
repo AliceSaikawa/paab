@@ -3,6 +3,20 @@ import { runInboxMaintenance } from "../inbox";
 import type { UnixMillis } from "../types";
 import { auditBodyConfig, type McpEnv } from "./config";
 
+function reportMaintenanceFailure(
+	step: "inbox" | "audit_purge",
+	error: unknown,
+): void {
+	try {
+		console.error("scheduled maintenance step failed", {
+			step,
+			error: error instanceof Error ? error.message : String(error),
+		});
+	} catch {
+		// Logging failures must not hide the underlying step error.
+	}
+}
+
 /**
  * The scheduled job: expires overdue questions, records them in the audit
  * log with one batched write per chunk, then removes audit log bodies past
@@ -33,12 +47,14 @@ export async function runScheduledMaintenance(
 			})),
 		);
 	} catch (error) {
+		reportMaintenanceFailure("inbox", error);
 		errors.push(error);
 	}
 
 	try {
 		await purgeExpiredAuditBodies(db, audit, now);
 	} catch (error) {
+		reportMaintenanceFailure("audit_purge", error);
 		errors.push(error);
 	}
 
