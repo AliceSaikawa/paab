@@ -1,8 +1,29 @@
 import { z } from "zod";
+import {
+	descriptionProblem,
+	nameProblem,
+	normalizeDescription,
+	normalizeName,
+} from "../../src/policy";
 import type { UnixMillis } from "../../src/types";
 import { CliError, type D1Client, sql } from "./sql";
 
-const name = z.string().trim().min(1);
+// Names and descriptions are normalized and validated with the shared
+// rules in src/policy/naming.ts, so that the admin operations (#29)
+// enforce exactly what the seed loader enforces.
+const name = z
+	.string()
+	.transform(normalizeName)
+	.refine((value) => nameProblem(value) === null, {
+		error: (issue) => nameProblem(String(issue.input)) ?? "",
+	});
+
+const description = z
+	.string()
+	.transform(normalizeDescription)
+	.refine((value) => descriptionProblem(value) === null, {
+		error: (issue) => descriptionProblem(String(issue.input)) ?? "",
+	});
 
 const seedSchema = z.strictObject({
 	ownerId: name,
@@ -10,7 +31,7 @@ const seedSchema = z.strictObject({
 		.array(
 			z.strictObject({
 				name,
-				description: z.string(),
+				description,
 				dailyQuestionLimit: z.int().min(0),
 			}),
 		)
