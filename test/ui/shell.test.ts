@@ -16,6 +16,7 @@ import {
 	type JwkKey,
 	type JwksFetcher,
 	normalizeTeamDomain,
+	placeholderRoute,
 	rawHtml,
 	type UiEnv,
 	verifyAccessRequest,
@@ -754,11 +755,23 @@ describe("CSRF protection, routing, and security headers", () => {
 		expect(timeHtml.html).toContain("<time datetime=");
 	});
 
-	it("returns 501 for unimplemented nav tabs and 404 for unknown admin paths", async () => {
+	it("implements all nav tabs, renders 501 for placeholder routes, and 404 for unknown paths", async () => {
+		await createTestDb();
+
+		for (const tab of ADMIN_NAV_TABS) {
+			const liveRes = await handleAdminRequest(
+				adminGet(`https://paab.test${tab.href}`),
+				devEnv(),
+				NOW_MS,
+			);
+			expect(liveRes.status).toBe(200);
+		}
+
 		const tabRes = await handleAdminRequest(
 			adminGet("https://paab.test/admin/descriptions"),
 			devEnv(),
 			NOW_MS,
+			{ routes: [placeholderRoute("/admin/descriptions", "説明文審査")] },
 		);
 		expect(tabRes.status).toBe(501);
 		const tabHtml = await tabRes.text();

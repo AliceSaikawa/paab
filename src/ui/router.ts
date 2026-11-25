@@ -9,6 +9,7 @@ import { adminBotRoutes } from "./adminbot";
 import { agentRoutes } from "./agents";
 import { auditRoutes } from "./audit";
 import { prepareCsrfGet, verifyCsrfPost } from "./csrf";
+import { descriptionRoutes } from "./descriptions";
 import { html } from "./html";
 import { ADMIN_NAV_TABS, adminPageResponse } from "./layout";
 import { proposalRoutes } from "./proposals";
@@ -78,7 +79,7 @@ function renderOverviewPage(ctx: AdminGetContext): Response {
 	});
 }
 
-function placeholderRoute(pattern: string, title: string): AdminRoute {
+export function placeholderRoute(pattern: string, title: string): AdminRoute {
 	return {
 		pattern,
 		get: (ctx) =>
@@ -108,6 +109,7 @@ const IMPLEMENTED_ROUTES: readonly AdminRoute[] = [
 	...auditRoutes(),
 	...proposalRoutes(),
 	...adminBotRoutes(),
+	...descriptionRoutes(),
 ];
 const IMPLEMENTED_PATTERNS = new Set(
 	IMPLEMENTED_ROUTES.map((route) => route.pattern),

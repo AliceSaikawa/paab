@@ -53,4 +53,5 @@ export {
 	type AdminRoute,
 	DEFAULT_ADMIN_ROUTES,
 	handleAdminRequest,
+	placeholderRoute,
 } from "./router";
