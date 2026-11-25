@@ -86,11 +86,11 @@ beforeEach(async () => {
 });
 
 describe("queryAuditLog", () => {
-	it("returns everything in time order without a filter", async () => {
+	it("returns everything in insertion order without a filter", async () => {
 		expect(await ids({})).toEqual(["q1", "q2", "q3", "q4"]);
 	});
 
-	it("orders by time first and by ID within the same time", async () => {
+	it("orders by insertion ID so ID cursors match result order", async () => {
 		await record({
 			occurredAt: T0 - 1,
 			eventType: "question_delivered",
@@ -102,7 +102,52 @@ describe("queryAuditLog", () => {
 			messageId: "tie",
 		});
 
-		expect(await ids({})).toEqual(["early", "q1", "tie", "q2", "q3", "q4"]);
+		expect(await ids({})).toEqual(["q1", "q2", "q3", "q4", "early", "tie"]);
+	});
+
+	it("pages without dropping rows when occurred_at and insertion ID differ", async () => {
+		await db.prepare("DELETE FROM audit_log").run();
+		const outOfOrder = [
+			{ messageId: "a", occurredAt: T0 + 2 },
+			{ messageId: "b", occurredAt: T0 + 1 },
+			{ messageId: "c", occurredAt: T0 + 3 },
+			{ messageId: "d", occurredAt: T0 },
+		];
+		for (const item of outOfOrder) {
+			await record({
+				occurredAt: item.occurredAt,
+				eventType: "question_accepted",
+				messageId: item.messageId,
+			});
+		}
+
+		const descSeen: (string | null)[] = [];
+		let beforeId: number | undefined;
+		while (true) {
+			const page = await queryAuditLog(db, {
+				order: "desc",
+				beforeId,
+				limit: 1,
+			});
+			if (page.length === 0) {
+				break;
+			}
+			descSeen.push(...page.map((entry) => entry.messageId));
+			beforeId = page[page.length - 1]?.id;
+		}
+		expect(descSeen).toEqual(["d", "c", "b", "a"]);
+
+		const ascSeen: (string | null)[] = [];
+		let afterId: number | undefined;
+		while (true) {
+			const page = await queryAuditLog(db, { order: "asc", afterId, limit: 1 });
+			if (page.length === 0) {
+				break;
+			}
+			ascSeen.push(...page.map((entry) => entry.messageId));
+			afterId = page[page.length - 1]?.id;
+		}
+		expect(ascSeen).toEqual(["a", "b", "c", "d"]);
 	});
 
 	it("filters by period: start inclusive, end exclusive", async () => {
@@ -271,7 +316,7 @@ describe("buildAuditLogQuery", () => {
 		expect(query.sql).toContain(
 			"WHERE l.occurred_at >= ? AND l.occurred_at < ? AND fa.name = ? AND l.to_agent_id = ? AND c.name = ? AND l.outcome = ? AND l.message_id = ? AND l.event_type NOT IN (?, ?)",
 		);
-		expect(query.sql).toMatch(/ORDER BY l\.occurred_at, l\.id LIMIT \?$/);
+		expect(query.sql).toMatch(/ORDER BY l\.id LIMIT \?$/);
 		expect(query.params).toEqual([
 			T0,
 			T0 + DAY_MS,
@@ -302,9 +347,7 @@ describe("buildAuditLogQuery", () => {
 	it("builds a descending query with a cursor", () => {
 		const query = buildAuditLogQuery({ order: "desc", beforeId: 42 });
 		expect(query.sql).toContain("WHERE l.id < ?");
-		expect(query.sql).toMatch(
-			/ORDER BY l\.occurred_at DESC, l\.id DESC LIMIT \?$/,
-		);
+		expect(query.sql).toMatch(/ORDER BY l\.id DESC LIMIT \?$/);
 		expect(query.params).toEqual([42, DEFAULT_AUDIT_QUERY_LIMIT]);
 	});
 

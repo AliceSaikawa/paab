@@ -9,11 +9,11 @@
 // loader (scripts/lib/seed.ts) and the admin operations (#29).
 //
 // Decisions:
-//   * Names are stored NFC-normalized and trimmed, so names that differ
-//     only in Unicode normalization or case-folded width are the same
-//     name as far as the loader's duplicate check is concerned.
-//   * Names are 1 to 64 characters and forbid control characters and
-//     "," (the list separator).
+//   * Names are stored NFC-normalized and trimmed, so canonically
+//     equivalent Unicode sequences (such as "が" and "か" + U+3099) are
+//     the same name, while case and halfwidth/fullwidth forms remain distinct.
+//   * Names are 1 to 64 characters and forbid control/format/line-separator
+//     characters and "," (the list separator).
 //   * Descriptions are NFC-normalized, up to 1000 characters, and forbid
 //     control characters other than newline and tab. The value is new
 //     here; the description submission flow (#37) takes the same limit
@@ -28,8 +28,10 @@ export const NAME_MAX_LENGTH = 64;
 /** Maximum length of a description, in UTF-16 code units. */
 export const DESCRIPTION_MAX_LENGTH = 1000;
 
-// \p{Cc} is \x00-\x1F and \x7F-\x9F. Names forbid all of them plus ",".
-const NAME_FORBIDDEN = /[\p{Cc},]/u;
+// \p{Cc} is C0/C1 control chars, \p{Cf} is format/bidi controls (such as
+// U+202E), and \p{Zl}/\p{Zp} are Unicode line/paragraph separators
+// (U+2028/U+2029). Names forbid all of them plus ",".
+const NAME_FORBIDDEN = /[\p{Cc}\p{Cf}\p{Zl}\p{Zp},]/u;
 // Descriptions are free text: newline and tab stay, the rest
 // of the C0/C1 control characters goes.
 function hasForbiddenDescriptionChar(text: string): boolean {

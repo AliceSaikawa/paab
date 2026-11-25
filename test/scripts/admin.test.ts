@@ -4,6 +4,7 @@ import { CliError } from "../../scripts/lib/sql";
 import { issueParticipantToken } from "../../scripts/lib/token";
 import { authenticate } from "../../src/auth";
 import { type ChangeLogRow, changeLogEntryFromRow } from "../../src/db";
+import { handleMcpRequest } from "../../src/mcp";
 import type { Agent } from "../../src/types";
 import { createTestDb } from "../helpers/db";
 import { seedAgent, T0 } from "../helpers/fixtures";
@@ -86,6 +87,37 @@ describe("setAgentStatus", () => {
 		).rejects.toBeInstanceOf(CliError);
 		expect(await snapshot(db)).toEqual(before);
 		expect(await changeLogs()).toHaveLength(0);
+	});
+
+	it("causes /mcp requests to return 403 while suspended and succeed once resumed", async () => {
+		const { token } = await issueParticipantToken(d1Client(db), "muse", T0);
+		const mcpEnv = {
+			DB: db,
+			AUDIT_RECORD_BODIES: "false",
+			AUDIT_BODY_RETENTION_DAYS: "30",
+		};
+		const post = () =>
+			new Request("https://paab.test/mcp", {
+				method: "POST",
+				headers: {
+					Authorization: `Bearer ${token}`,
+					"Content-Type": "application/json",
+					Accept: "application/json, text/event-stream",
+				},
+				body: JSON.stringify({
+					jsonrpc: "2.0",
+					id: 1,
+					method: "tools/list",
+				}),
+			});
+
+		await setAgentStatus(d1Client(db), "muse", "suspended", T0 + 1);
+		const suspendedRes = await handleMcpRequest(post(), mcpEnv, T0 + 2);
+		expect(suspendedRes.status).toBe(403);
+
+		await setAgentStatus(d1Client(db), "muse", "active", T0 + 3);
+		const resumedRes = await handleMcpRequest(post(), mcpEnv, T0 + 4);
+		expect(resumedRes.status).toBe(200);
 	});
 });
 
