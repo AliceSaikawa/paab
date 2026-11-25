@@ -82,21 +82,25 @@ async function connectAdmin(
 }
 
 describe("/mcp/admin connection and instructions", () => {
-	it("exposes view_audit_log, tightening, and proposal tools and includes fixed safety instructions", async () => {
+	it("exposes view_audit_log, tightening, proposal, and description tools and includes fixed safety instructions", async () => {
 		const client = await connectAdmin(adminToken);
 
 		const { tools } = await client.listTools();
-		expect(tools.map((tool) => tool.name)).toEqual([
-			"view_audit_log",
-			"suspend_agent",
-			"revoke_allow_rule",
-			"lower_daily_limit",
-			"propose_allow_rule",
-			"propose_category",
-			"propose_daily_limit_raise",
-			"propose_resume_agent",
-			"list_proposals",
-		]);
+		expect(tools.map((tool) => tool.name).sort()).toEqual(
+			[
+				"view_audit_log",
+				"suspend_agent",
+				"revoke_allow_rule",
+				"lower_daily_limit",
+				"propose_allow_rule",
+				"propose_category",
+				"propose_daily_limit_raise",
+				"propose_resume_agent",
+				"list_proposals",
+				"list_pending_descriptions",
+				"review_description",
+			].sort(),
+		);
 
 		const instructions = client.getInstructions() ?? "";
 		expect(instructions).toMatch(/prompt injection/i);
@@ -108,6 +112,9 @@ describe("/mcp/admin connection and instructions", () => {
 			/cannot be performed.*registering or deleting agents.*issuing or reissuing tokens/is,
 		);
 		expect(instructions).toMatch(/read_bodies.*superadmin/i);
+		expect(instructions).toMatch(
+			/list_pending_descriptions.*review_description/i,
+		);
 	});
 
 	it("routes /mcp/admin through the worker", async () => {
@@ -285,17 +292,21 @@ describe("/mcp/admin authentication and authorization", () => {
 			now: T0 + 13,
 		});
 		const list = await grokClient.listTools();
-		expect(list.tools.map((tool) => tool.name)).toEqual([
-			"view_audit_log",
-			"suspend_agent",
-			"revoke_allow_rule",
-			"lower_daily_limit",
-			"propose_allow_rule",
-			"propose_category",
-			"propose_daily_limit_raise",
-			"propose_resume_agent",
-			"list_proposals",
-		]);
+		expect(list.tools.map((tool) => tool.name).sort()).toEqual(
+			[
+				"view_audit_log",
+				"suspend_agent",
+				"revoke_allow_rule",
+				"lower_daily_limit",
+				"propose_allow_rule",
+				"propose_category",
+				"propose_daily_limit_raise",
+				"propose_resume_agent",
+				"list_proposals",
+				"list_pending_descriptions",
+				"review_description",
+			].sort(),
+		);
 	});
 });
 

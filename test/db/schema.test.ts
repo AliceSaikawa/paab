@@ -37,7 +37,7 @@ import type {
 	NewChangeLogEntry,
 	Token,
 } from "../../src/types";
-import { createTestDb, migrationByName } from "../helpers/db";
+import { createTestDb, migrationByName, migrationsBefore } from "../helpers/db";
 import { DAY_MS, seedAgent, seedCategory, T0 } from "../helpers/fixtures";
 
 let db: D1Database;
@@ -111,6 +111,7 @@ describe("test database helper", () => {
 			"categories",
 			"change_log",
 			"messages",
+			"pending_descriptions",
 			"proposals",
 			"tokens",
 		]);
@@ -674,19 +675,42 @@ describe("deletion", () => {
 describe("migrations", () => {
 	const migration = migrationByName;
 
+	async function dropAllTables(): Promise<void> {
+		const { results } = await db
+			.prepare(
+				"SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%'",
+			)
+			.all<{ name: string }>();
+		const knownOrder = [
+			"pending_descriptions",
+			"proposals",
+			"admin_bot_config",
+			"change_log",
+			"audit_log",
+			"messages",
+			"allow_rules",
+			"tokens",
+			"categories",
+			"agents",
+			"d1_migrations",
+		];
+		const existing = new Set(results.map((row) => row.name));
+		const unknownTables = [...existing].filter(
+			(name) => !knownOrder.includes(name),
+		);
+		const ordered = [
+			...unknownTables,
+			...knownOrder.filter((name) => existing.has(name)),
+		];
+		if (ordered.length > 0) {
+			await db.batch(
+				ordered.map((name) => db.prepare(`DROP TABLE IF EXISTS ${name}`)),
+			);
+		}
+	}
+
 	it("preserves all existing tables when migrating a populated database from 0002 to 0003 and enforces change_log constraints", async () => {
-		await db.batch([
-			db.prepare("DROP TABLE IF EXISTS proposals"),
-			db.prepare("DROP TABLE IF EXISTS admin_bot_config"),
-			db.prepare("DROP TABLE IF EXISTS change_log"),
-			db.prepare("DROP TABLE IF EXISTS audit_log"),
-			db.prepare("DROP TABLE IF EXISTS messages"),
-			db.prepare("DROP TABLE IF EXISTS allow_rules"),
-			db.prepare("DROP TABLE IF EXISTS tokens"),
-			db.prepare("DROP TABLE IF EXISTS categories"),
-			db.prepare("DROP TABLE IF EXISTS agents"),
-			db.prepare("DROP TABLE IF EXISTS d1_migrations"),
-		]);
+		await dropAllTables();
 
 		const m1 = migration("0001_initial_schema.sql");
 		const m2 = migration("0002_cascade_message_references.sql");
@@ -829,18 +853,7 @@ describe("migrations", () => {
 	});
 
 	it("preserves all existing tables when migrating a populated database from 0003 to 0004 and enforces admin_bot_config constraints", async () => {
-		await db.batch([
-			db.prepare("DROP TABLE IF EXISTS proposals"),
-			db.prepare("DROP TABLE IF EXISTS admin_bot_config"),
-			db.prepare("DROP TABLE IF EXISTS change_log"),
-			db.prepare("DROP TABLE IF EXISTS audit_log"),
-			db.prepare("DROP TABLE IF EXISTS messages"),
-			db.prepare("DROP TABLE IF EXISTS allow_rules"),
-			db.prepare("DROP TABLE IF EXISTS tokens"),
-			db.prepare("DROP TABLE IF EXISTS categories"),
-			db.prepare("DROP TABLE IF EXISTS agents"),
-			db.prepare("DROP TABLE IF EXISTS d1_migrations"),
-		]);
+		await dropAllTables();
 
 		const m1 = migration("0001_initial_schema.sql");
 		const m2 = migration("0002_cascade_message_references.sql");
@@ -1000,18 +1013,7 @@ describe("migrations", () => {
 	});
 
 	it("preserves all existing tables when migrating a populated database from 0004 to 0005 and enforces proposals constraints", async () => {
-		await db.batch([
-			db.prepare("DROP TABLE IF EXISTS proposals"),
-			db.prepare("DROP TABLE IF EXISTS admin_bot_config"),
-			db.prepare("DROP TABLE IF EXISTS change_log"),
-			db.prepare("DROP TABLE IF EXISTS audit_log"),
-			db.prepare("DROP TABLE IF EXISTS messages"),
-			db.prepare("DROP TABLE IF EXISTS allow_rules"),
-			db.prepare("DROP TABLE IF EXISTS tokens"),
-			db.prepare("DROP TABLE IF EXISTS categories"),
-			db.prepare("DROP TABLE IF EXISTS agents"),
-			db.prepare("DROP TABLE IF EXISTS d1_migrations"),
-		]);
+		await dropAllTables();
 
 		const m1 = migration("0001_initial_schema.sql");
 		const m2 = migration("0002_cascade_message_references.sql");
@@ -1200,6 +1202,116 @@ describe("migrations", () => {
 			.first<{ n: number }>();
 		expect(remainingProposals?.n).toBe(0);
 	});
+
+	it("preserves all existing tables when migrating to 0006 and enforces pending_descriptions constraints and cascade delete", async () => {
+		await dropAllTables();
+
+		const prior = migrationsBefore("0006_");
+		const m6 = migration("0006_pending_descriptions.sql");
+		await applyD1Migrations(db, prior);
+
+		const a = await seedAgent(db, { name: "a", description: "initial a" });
+		const b = await seedAgent(db, { name: "b", description: "initial b" });
+		const category = await seedCategory(db, { name: "schedule" });
+		const rule: AllowRule = {
+			fromAgentId: a.id,
+			toAgentId: b.id,
+			categoryId: category.id,
+			createdAt: T0,
+		};
+		await insertAllowRule(db, rule).run();
+
+		await applyD1Migrations(db, [...prior, m6]);
+
+		const fkViolations = await db.prepare("PRAGMA foreign_key_check").all();
+		expect(fkViolations.results).toEqual([]);
+		expect(
+			(
+				await db.prepare("SELECT * FROM agents ORDER BY name").all<AgentRow>()
+			).results.map(agentFromRow),
+		).toEqual([a, b]);
+		expect(
+			(
+				await db.prepare("SELECT * FROM allow_rules").all<AllowRuleRow>()
+			).results.map(allowRuleFromRow),
+		).toEqual([rule]);
+
+		await db
+			.prepare(
+				`INSERT INTO pending_descriptions (agent_id, description, submitted_at)
+				VALUES (?, ?, ?)`,
+			)
+			.bind(a.id, "draft a", T0 + 10)
+			.run();
+		await db
+			.prepare(
+				`INSERT INTO pending_descriptions (agent_id, description, submitted_at)
+				VALUES (?, ?, ?)`,
+			)
+			.bind(b.id, "draft b", T0 + 20)
+			.run();
+
+		await expect(
+			db
+				.prepare(
+					`INSERT INTO pending_descriptions (agent_id, description, submitted_at)
+					VALUES (?, ?, ?)`,
+				)
+				.bind(a.id, "duplicate", T0 + 30)
+				.run(),
+		).rejects.toThrow(/UNIQUE|PRIMARY KEY/);
+
+		await db
+			.prepare(
+				`INSERT INTO pending_descriptions (agent_id, description, submitted_at)
+				VALUES (?, ?, ?)
+				ON CONFLICT(agent_id) DO UPDATE SET
+					description = excluded.description,
+					submitted_at = excluded.submitted_at`,
+			)
+			.bind(a.id, "updated draft a", T0 + 40)
+			.run();
+
+		const rowA = await db
+			.prepare("SELECT * FROM pending_descriptions WHERE agent_id = ?")
+			.bind(a.id)
+			.first<{
+				agent_id: string;
+				description: string;
+				submitted_at: number;
+			}>();
+		expect(rowA).toEqual({
+			agent_id: a.id,
+			description: "updated draft a",
+			submitted_at: T0 + 40,
+		});
+
+		await expect(
+			db
+				.prepare(
+					`INSERT INTO pending_descriptions (agent_id, description, submitted_at)
+					VALUES (?, ?, ?)`,
+				)
+				.bind(newId(), "ghost", T0)
+				.run(),
+		).rejects.toThrow(/FOREIGN KEY/);
+
+		await expect(
+			db
+				.prepare(
+					`INSERT INTO pending_descriptions (agent_id, description, submitted_at)
+					VALUES (?, 'draft', 'not-an-int')`,
+				)
+				.bind(a.id)
+				.run(),
+		).rejects.toThrow(/STRICT|datatype/i);
+
+		await db.prepare("DELETE FROM agents WHERE id = ?").bind(a.id).run();
+		const remaining = await db
+			.prepare("SELECT agent_id FROM pending_descriptions")
+			.all<{ agent_id: string }>();
+		expect(remaining.results.map((r) => r.agent_id)).toEqual([b.id]);
+	});
 });
 
 describe("row conversion", () => {
@@ -1286,6 +1398,7 @@ describe("migration 0002 on populated data", () => {
 		const m0002 = migrationByName("0002_cascade_message_references.sql");
 
 		for (const table of [
+			"pending_descriptions",
 			"proposals",
 			"admin_bot_config",
 			"change_log",

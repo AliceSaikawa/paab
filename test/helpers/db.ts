@@ -41,8 +41,14 @@ export function migrationByName(name: string): D1Migration {
 	return migration;
 }
 
+/** Returns every migration whose filename sorts strictly before `prefix`. */
+export function migrationsBefore(prefix: string): D1Migration[] {
+	return migrations.filter((item) => item.name < prefix);
+}
+
 // Children before parents, so that foreign keys hold while emptying.
 const TABLES = [
+	"pending_descriptions",
 	"proposals",
 	"admin_bot_config",
 	"change_log",
