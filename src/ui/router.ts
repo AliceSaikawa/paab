@@ -5,6 +5,7 @@ import {
 	type UiEnv,
 	verifyAccessRequest,
 } from "./access";
+import { agentRoutes } from "./agents";
 import { prepareCsrfGet, verifyCsrfPost } from "./csrf";
 import { html } from "./html";
 import { ADMIN_NAV_TABS, adminPageResponse } from "./layout";
@@ -98,7 +99,10 @@ function placeholderRoute(pattern: string, title: string): AdminRoute {
 
 export const DEFAULT_ADMIN_ROUTES: readonly AdminRoute[] = [
 	{ pattern: "/admin", get: renderOverviewPage },
-	...ADMIN_NAV_TABS.map((tab) => placeholderRoute(tab.href, tab.label)),
+	...agentRoutes(),
+	...ADMIN_NAV_TABS.filter((tab) => tab.href !== "/admin/agents").map((tab) =>
+		placeholderRoute(tab.href, tab.label),
+	),
 ];
 
 function normalizeAdminPath(pathname: string): string {
