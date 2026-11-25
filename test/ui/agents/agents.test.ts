@@ -1,13 +1,21 @@
 import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+	configureAgentWebhook,
+	deleteAgentWebhook,
 	grantAllowRule,
 	issueAgentToken,
 	queryChangeLog,
 } from "../../../src/admin";
+import { designateAdminBot, issueAdminBotToken } from "../../../src/adminbot";
 import { authenticate, hashToken } from "../../../src/auth";
 import { insertMessage, newId } from "../../../src/db";
 import { handleMcpRequest } from "../../../src/mcp";
+import {
+	signWebhookPayload,
+	WEBHOOK_BODY,
+	type WebhookFetcher,
+} from "../../../src/notify";
 import {
 	handleAdminRequest,
 	type JwkKey,
@@ -1021,4 +1029,272 @@ describe("/admin/agents UI", () => {
 			}
 		}
 	});
+
+	it("configures, rotates, and deletes agent webhooks in the human UI only without leaking signing_secret", async () => {
+		const { session } = await openAdminSession(ADMIN_EMAIL, T0);
+		await adminPost(
+			session,
+			"/admin/agents",
+			{ name: "muse", description: "a", daily_question_limit: "10" },
+			T0 + 1,
+		);
+		await adminPost(
+			session,
+			"/admin/agents",
+			{ name: "grok", description: "b", daily_question_limit: "10" },
+			T0 + 2,
+		);
+		const museId = await findAgentIdByName("muse");
+		const grokId = await findAgentIdByName("grok");
+
+		// Invalid/SSRF URLs are rejected with 400 and leave DB and change_log clean.
+		for (const badUrl of [
+			"http://agent.example/wake",
+			"https://localhost/wake",
+			"https://127.0.0.1/wake",
+			"https://169.254.169.254/latest",
+			"https://user:pass@agent.example/wake",
+		]) {
+			const invalid = await adminPost(
+				session,
+				`/admin/agents/${museId}/webhook`,
+				{ url: badUrl },
+				T0 + 3,
+			);
+			expect(invalid.response.status).toBe(400);
+		}
+		expect(
+			await db
+				.prepare("SELECT COUNT(*) AS n FROM agent_webhooks")
+				.first<{ n: number }>(),
+		).toEqual({ n: 0 });
+
+		// Valid HTTPS URL returns one-time signing_secret with Cache-Control: no-store and no extra <script>.
+		const configured = await adminPost(
+			session,
+			`/admin/agents/${grokId}/webhook`,
+			{ url: "https://grok.example/wake" },
+			T0 + 10,
+		);
+		expect(configured.response.status).toBe(200);
+		expect(configured.response.headers.get("Cache-Control")).toBe("no-store");
+		expect(configured.html.match(/<script>/g)).toHaveLength(1);
+		expect(configured.html).toContain("https://grok.example/wake");
+		expect(configured.html).toContain("X-Paab-Signature");
+		expect(configured.html).toContain("X-Paab-Timestamp");
+		const secret1 = extractIssuedToken(configured.html);
+		expect(secret1).toMatch(/^paab_whsec_[A-Za-z0-9_-]{43}$/);
+
+		// Subsequent GET /admin/agents shows configured state, URL, timestamp, and NEVER exposes signing_secret.
+		const afterConfigGet = await adminGet(session, "/admin/agents", T0 + 11);
+		expect(afterConfigGet.response.status).toBe(200);
+		expect(afterConfigGet.html).toContain("設定済み");
+		expect(afterConfigGet.html).toContain("https://grok.example/wake");
+		expect(afterConfigGet.html).not.toContain(secret1);
+
+		// change_log stores { url } only, never signing_secret.
+		const logsAfterConfig = await queryChangeLog(db);
+		expect(logsAfterConfig[0]).toMatchObject({
+			action: "webhook_configured",
+			targetType: "agent",
+			targetId: grokId,
+			beforeJson: null,
+			afterJson: JSON.stringify({ url: "https://grok.example/wake" }),
+		});
+		expect(JSON.stringify(logsAfterConfig)).not.toContain(secret1);
+
+		// /admin/rules change_log table renders Webhook設定 cleanly without leaking secret.
+		const rulesView = await adminGet(session, "/admin/rules", T0 + 12);
+		expect(rulesView.html).toContain("Webhook設定");
+		expect(rulesView.html).toContain("URL=https://grok.example/wake");
+		expect(rulesView.html).not.toContain(secret1);
+
+		// Update URL & rotate signing_secret.
+		const rotated = await adminPost(
+			session,
+			`/admin/agents/${grokId}/webhook`,
+			{ url: "https://grok-v2.example/wake" },
+			T0 + 20,
+		);
+		expect(rotated.response.status).toBe(200);
+		expect(rotated.response.headers.get("Cache-Control")).toBe("no-store");
+		expect(rotated.html).toContain("以前の署名鍵は即座に無効になりました");
+		const secret2 = extractIssuedToken(rotated.html);
+		expect(secret2).toMatch(/^paab_whsec_[A-Za-z0-9_-]{43}$/);
+		expect(secret2).not.toBe(secret1);
+
+		// End-to-end: UI-configured webhook fires with secret2 when muse asks grok over /mcp.
+		const cat = await seedCategory(db, { name: "予定" });
+		await grantAllowRule(db, {
+			fromAgentId: museId,
+			toAgentId: grokId,
+			categoryId: cat.id,
+			actor: { actorType: "owner", actorId: ADMIN_EMAIL },
+			now: T0 + 21,
+		});
+		const museIssue = await adminPost(
+			session,
+			`/admin/agents/${museId}/token`,
+			{},
+			T0 + 22,
+		);
+		const museToken = extractIssuedToken(museIssue.html);
+		const captured: {
+			url: string;
+			ts: string | null;
+			sig: string | null;
+			body: string;
+		}[] = [];
+		const webhookFetcher: WebhookFetcher = async (input, init) => {
+			const h = new Headers(init?.headers);
+			captured.push({
+				url: String(input),
+				ts: h.get("X-Paab-Timestamp"),
+				sig: h.get("X-Paab-Signature"),
+				body: String(init?.body ?? ""),
+			});
+			return new Response("ok", { status: 200 });
+		};
+		const museClient = await connect(museToken, {
+			env: { ...accessEnv(), webhookFetcher },
+			now: T0 + 25,
+		});
+		await call(museClient, "ask", {
+			to: "grok",
+			category: "予定",
+			question: "確認です",
+		});
+		expect(captured).toHaveLength(1);
+		expect(captured[0]?.url).toBe("https://grok-v2.example/wake");
+		expect(captured[0]?.body).toBe(WEBHOOK_BODY);
+		expect(captured[0]?.sig).toBe(
+			await signWebhookPayload(secret2, captured[0]?.ts ?? "", WEBHOOK_BODY),
+		);
+
+		// Delete webhook via UI.
+		const deleted = await adminPost(
+			session,
+			`/admin/agents/${grokId}/webhook/delete`,
+			{},
+			T0 + 30,
+		);
+		expect(deleted.response.status).toBe(200);
+		expect(deleted.html).toContain("Webhook を削除しました");
+		expect(deleted.html).not.toContain(secret2);
+
+		// Repeating delete is a clean no-op without adding a change_log row.
+		const logsBeforeRepeat = await queryChangeLog(db);
+		const deletedAgain = await adminPost(
+			session,
+			`/admin/agents/${grokId}/webhook/delete`,
+			{},
+			T0 + 31,
+		);
+		expect(deletedAgain.response.status).toBe(200);
+		expect(deletedAgain.html).toContain("Webhook は設定されていませんでした");
+		expect(await queryChangeLog(db)).toHaveLength(logsBeforeRepeat.length);
+
+		// Missing agent returns 404; missing CSRF returns 403.
+		const missingWebhookId = newId();
+		expect(
+			(
+				await adminPost(
+					session,
+					`/admin/agents/${missingWebhookId}/webhook`,
+					{ url: "https://ok.example/wake" },
+					T0 + 32,
+				)
+			).response.status,
+		).toBe(404);
+		expect(
+			(
+				await adminPost(
+					session,
+					`/admin/agents/${missingWebhookId}/webhook/delete`,
+					{},
+					T0 + 32,
+				)
+			).response.status,
+		).toBe(404);
+		const noCsrfWebhook = await handleAdminRequest(
+			new Request(`https://paab.test/admin/agents/${grokId}/webhook`, {
+				method: "POST",
+				headers: {
+					Cookie: session.cookie,
+					Origin: "https://paab.test",
+					"Cf-Access-Jwt-Assertion": session.jwt,
+				},
+				body: new URLSearchParams({ url: "https://ok.example/wake" }),
+			}),
+			accessEnv(),
+			T0 + 33,
+			{ fetchJwks: session.fetcher },
+		);
+		expect(noCsrfWebhook.status).toBe(403);
+
+		// Admin bot cannot call configureAgentWebhook or deleteAgentWebhook, and neither /mcp nor /mcp/admin exposes webhook tools.
+		expect(
+			await configureAgentWebhook(db, {
+				agentId: grokId,
+				url: "https://ok.example/wake",
+				actor: { actorType: "admin_bot", actorId: museId },
+				now: T0 + 34,
+			}),
+		).toMatchObject({ ok: false, code: "invalid_input" });
+		expect(
+			await deleteAgentWebhook(db, {
+				agentId: grokId,
+				actor: { actorType: "admin_bot", actorId: museId },
+				now: T0 + 34,
+			}),
+		).toMatchObject({ ok: false, code: "invalid_input" });
+
+		const participantTools = (await museClient.listTools()).tools.map(
+			(t) => t.name,
+		);
+		for (const name of participantTools) {
+			expect(name).not.toMatch(/webhook|secret/i);
+		}
+		await designateAdminBot(db, {
+			agentId: museId,
+			actor: { actorType: "owner", actorId: ADMIN_EMAIL },
+			now: T0 + 35,
+		});
+		const adminTok = await issueAdminBotToken(db, {
+			agentId: museId,
+			actor: { actorType: "owner", actorId: ADMIN_EMAIL },
+			now: T0 + 36,
+		});
+		expect(adminTok.ok).toBe(true);
+		if (!adminTok.ok) return;
+		const adminTools = await listAdminMcpTools(adminTok.data.token, T0 + 37);
+		expect(adminTools).toContain("view_audit_log");
+		for (const name of adminTools) {
+			expect(name).not.toMatch(/webhook|secret/i);
+		}
+	});
 });
+
+async function listAdminMcpTools(
+	token: string,
+	now: number,
+): Promise<string[]> {
+	const { Client, StreamableHTTPClientTransport } = await import(
+		"@modelcontextprotocol/client"
+	);
+	const { handleAdminMcpRequest } = await import("../../../src/adminbot");
+	const client = new Client({ name: "paab-admin-test", version: "0.0.0" });
+	const transport = new StreamableHTTPClientTransport(
+		new URL("https://paab.test/mcp/admin"),
+		{
+			fetch: (input, init) =>
+				handleAdminMcpRequest(new Request(input, init), accessEnv(), now),
+			requestInit: {
+				headers: { Authorization: `Bearer ${token}` },
+			},
+		},
+	);
+	await client.connect(transport);
+	const { tools } = await client.listTools();
+	return tools.map((tool) => tool.name);
+}

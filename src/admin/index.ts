@@ -34,8 +34,12 @@ export type {
 	CategoryWithUsage,
 	ChangeActor,
 	ChangeLogFilter,
+	ConfigureAgentWebhookInput,
+	ConfiguredAgentWebhook,
 	CreateCategoryInput,
 	DeleteAgentInput,
+	DeleteAgentWebhookInput,
+	DeleteAgentWebhookResult,
 	DeleteCategoryInput,
 	DeletedAgentSummary,
 	DeletedCategorySummary,
@@ -60,3 +64,8 @@ export {
 	type UndoFailure,
 	type UndoResult,
 } from "./undo";
+export {
+	configureAgentWebhook,
+	deleteAgentWebhook,
+	listAgentWebhooks,
+} from "./webhooks";

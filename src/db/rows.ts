@@ -2,6 +2,7 @@ import {
 	type AdminBotConfig,
 	AGENT_STATUSES,
 	type Agent,
+	type AgentWebhook,
 	type AllowRule,
 	AUDIT_EVENT_TYPES,
 	AUDIT_OUTCOMES,
@@ -20,6 +21,8 @@ import {
 	REASON_CODES,
 	TOKEN_PURPOSES,
 	type Token,
+	WEBHOOK_DELIVERY_STATUSES,
+	type WebhookDelivery,
 } from "../types";
 
 /*
@@ -124,6 +127,25 @@ export interface ProposalRow {
 	expires_at: number;
 	resolved_at: number | null;
 	resolved_by: string | null;
+}
+
+export interface AgentWebhookRow {
+	agent_id: string;
+	url: string;
+	signing_secret: string;
+	created_at: number;
+	updated_at: number;
+}
+
+export interface WebhookDeliveryRow {
+	id: string;
+	agent_id: string;
+	status: string;
+	attempts: number;
+	next_attempt_at: number;
+	last_error: string | null;
+	created_at: number;
+	updated_at: number;
 }
 
 /** Narrows a stored string to one of the known values, or throws. */
@@ -267,5 +289,34 @@ export function proposalFromRow(row: ProposalRow): Proposal {
 		expiresAt: row.expires_at,
 		resolvedAt: row.resolved_at,
 		resolvedBy: row.resolved_by,
+	};
+}
+
+export function agentWebhookFromRow(row: AgentWebhookRow): AgentWebhook {
+	return {
+		agentId: row.agent_id,
+		url: row.url,
+		signingSecret: row.signing_secret,
+		createdAt: row.created_at,
+		updatedAt: row.updated_at,
+	};
+}
+
+export function webhookDeliveryFromRow(
+	row: WebhookDeliveryRow,
+): WebhookDelivery {
+	return {
+		id: row.id,
+		agentId: row.agent_id,
+		status: oneOf(
+			WEBHOOK_DELIVERY_STATUSES,
+			row.status,
+			"webhook_deliveries.status",
+		),
+		attempts: row.attempts,
+		nextAttemptAt: row.next_attempt_at,
+		lastError: row.last_error,
+		createdAt: row.created_at,
+		updatedAt: row.updated_at,
 	};
 }
