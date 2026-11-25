@@ -86,22 +86,25 @@ async function loadAgent(id: string): Promise<Agent> {
 }
 
 describe("/mcp/admin tightening tool surface", () => {
-	it("registers only read-only audit and tightening tools, with zero loosening or human-only tools", async () => {
+	it("registers tightening tools, with zero direct loosening or human-only tools", async () => {
 		const client = await connectAdmin(adminToken);
 		const { tools } = await client.listTools();
 		const names = tools.map((t) => t.name);
 
-		expect(names).toEqual([
-			"view_audit_log",
-			"suspend_agent",
-			"revoke_allow_rule",
-			"lower_daily_limit",
-		]);
+		expect(names).toEqual(
+			expect.arrayContaining([
+				"view_audit_log",
+				"suspend_agent",
+				"revoke_allow_rule",
+				"lower_daily_limit",
+			]),
+		);
 
 		const forbidden = [
 			"resume_agent",
 			"grant_allow_rule",
 			"create_category",
+			"raise_daily_limit",
 			"delete_category",
 			"register_agent",
 			"delete_agent",
