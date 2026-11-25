@@ -9,6 +9,7 @@ import {
 import {
 	fail as adminFail,
 	runWithChangeLog,
+	type ValidatedContext,
 	validateContext,
 	validateId,
 } from "../admin/validate";
@@ -21,6 +22,43 @@ import {
 import type { AdminBotConfig, Agent, UnixMillis } from "../types";
 
 export type { AdminBotConfig };
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+export const SUPERADMIN_UNLIMITED = -1;
+
+export const SUPERADMIN_DURATION_MODES = [
+	"1d",
+	"7d",
+	"30d",
+	"unlimited",
+] as const;
+export type SuperadminDurationMode = (typeof SUPERADMIN_DURATION_MODES)[number];
+
+export const SUPERADMIN_MODES = ["off", ...SUPERADMIN_DURATION_MODES] as const;
+export type SuperadminMode = (typeof SUPERADMIN_MODES)[number];
+
+export const DEFAULT_SUPERADMIN_MODE: SuperadminDurationMode = "7d";
+
+export const SUPERADMIN_DURATION_MS: Record<
+	Exclude<SuperadminDurationMode, "unlimited">,
+	number
+> = {
+	"1d": 1 * DAY_MS,
+	"7d": 7 * DAY_MS,
+	"30d": 30 * DAY_MS,
+};
+
+/** Returns whether superadmin permission is active at `now` (`-1` means unlimited). */
+export function isSuperadminActive(
+	config: Pick<AdminBotConfig, "superadminUntil">,
+	now: UnixMillis,
+): boolean {
+	return (
+		config.superadminUntil === SUPERADMIN_UNLIMITED ||
+		(config.superadminUntil !== null && config.superadminUntil > now)
+	);
+}
 
 export type AdminBotErrorCode = AdminErrorCode | "not_admin_bot";
 
@@ -113,6 +151,14 @@ export type SetAdminBotReadBodiesResult =
 			changeId: null;
 	  }
 	| AdminBotFailure;
+
+export interface SetAdminBotSuperadminInput {
+	mode: SuperadminMode;
+	actor: ChangeActor;
+	now: UnixMillis;
+}
+
+export type SetAdminBotSuperadminResult = SetAdminBotReadBodiesResult;
 
 export type RevokeAdminBotTokenResult =
 	| RevokeAgentTokensResult
@@ -396,6 +442,39 @@ export async function revokeAdminBotToken(
 	});
 }
 
+async function applyAdminBotSwitchChange(
+	db: D1Database,
+	agentId: string,
+	current: AdminBotConfig,
+	next: AdminBotConfig,
+	ctx: ValidatedContext,
+): Promise<number> {
+	return runWithChangeLog(
+		db,
+		[
+			db
+				.prepare(
+					`UPDATE admin_bot_config
+					SET read_bodies = ?, superadmin_until = ?, updated_at = ?
+					WHERE id = 1`,
+				)
+				.bind(next.readBodies ? 1 : 0, next.superadminUntil, ctx.now),
+		],
+		{
+			occurredAt: ctx.now,
+			actorType: ctx.actorType,
+			actorId: ctx.actorId,
+			approverId: ctx.approverId,
+			action: "admin_bot_switches_updated",
+			targetType: "admin_bot",
+			targetId: agentId,
+			beforeJson: JSON.stringify(current),
+			afterJson: JSON.stringify(next),
+			revertedAt: null,
+		},
+	);
+}
+
 /**
  * Enables or disables `read_bodies` for the currently designated administrator
  * bot, updating `admin_bot_config` and logging `admin_bot_switches_updated`
@@ -435,29 +514,80 @@ export async function setAdminBotReadBodies(
 		updatedAt: ctx.value.now,
 	};
 
-	const changeId = await runWithChangeLog(
+	const changeId = await applyAdminBotSwitchChange(
 		db,
-		[
-			db
-				.prepare(
-					`UPDATE admin_bot_config
-					SET read_bodies = ?, updated_at = ?
-					WHERE id = 1`,
-				)
-				.bind(input.enabled ? 1 : 0, ctx.value.now),
-		],
-		{
-			occurredAt: ctx.value.now,
-			actorType: ctx.value.actorType,
-			actorId: ctx.value.actorId,
-			approverId: ctx.value.approverId,
-			action: "admin_bot_switches_updated",
-			targetType: "admin_bot",
-			targetId: current.agentId,
-			beforeJson: JSON.stringify(current),
-			afterJson: JSON.stringify(next),
-			revertedAt: null,
-		},
+		current.agentId,
+		current,
+		next,
+		ctx.value,
+	);
+
+	return {
+		ok: true,
+		data: { config: next, changed: true },
+		changeId,
+	};
+}
+
+function resolveSuperadminUntil(
+	mode: SuperadminMode,
+	now: UnixMillis,
+): UnixMillis | null {
+	switch (mode) {
+		case "off":
+			return null;
+		case "unlimited":
+			return SUPERADMIN_UNLIMITED;
+		case "1d":
+		case "7d":
+		case "30d":
+			return now + SUPERADMIN_DURATION_MS[mode];
+	}
+}
+
+/**
+ * Updates `superadmin_until` for the currently designated administrator bot and
+ * logs `admin_bot_switches_updated` in one `db.batch`. No-op if the stored
+ * expiry already equals the target value.
+ */
+export async function setAdminBotSuperadmin(
+	db: D1Database,
+	input: SetAdminBotSuperadminInput,
+): Promise<SetAdminBotSuperadminResult> {
+	const ctx = validateContext(input.actor, input.now);
+	if (!ctx.ok) return ctx;
+
+	if (!(SUPERADMIN_MODES as readonly string[]).includes(input.mode)) {
+		return adminFail("invalid_input", "最高管理者権限の設定値が不正です");
+	}
+
+	const current = await getAdminBotConfig(db);
+	if (current.agentId === null) {
+		return fail("not_admin_bot", "管理者ボットが指名されていません");
+	}
+
+	const nextUntil = resolveSuperadminUntil(input.mode, ctx.value.now);
+	if (current.superadminUntil === nextUntil) {
+		return {
+			ok: true,
+			data: { config: current, changed: false },
+			changeId: null,
+		};
+	}
+
+	const next: AdminBotConfig = {
+		agentId: current.agentId,
+		readBodies: current.readBodies,
+		superadminUntil: nextUntil,
+		updatedAt: ctx.value.now,
+	};
+
+	const changeId = await applyAdminBotSwitchChange(
+		db,
+		current.agentId,
+		current,
+		next,
+		ctx.value,
 	);
 
 	return {

@@ -11,6 +11,7 @@ import {
 	handleAdminMcpRequest,
 	issueAdminBotToken,
 	setAdminBotReadBodies,
+	setAdminBotSuperadmin,
 } from "../../src/adminbot";
 import {
 	AUDIT_WRITE_CHUNK,
@@ -23,7 +24,7 @@ import type { McpEnv } from "../../src/mcp/config";
 import type { Agent, Category } from "../../src/types";
 import { createTestDb } from "../helpers/db";
 import { HOUR_MS, seedAgent, seedCategory, T0 } from "../helpers/fixtures";
-import { call, MCP_URL } from "../mcp/support";
+import { call, connect, MCP_URL } from "../mcp/support";
 
 const ADMIN_MCP_URL = "https://paab.test/mcp/admin";
 const OWNER: ChangeActor = { actorType: "owner", actorId: "owner@example.com" };
@@ -120,6 +121,20 @@ describe("/mcp/admin connection and instructions", () => {
 		expect(instructions).toMatch(
 			/list_pending_descriptions.*review_description/i,
 		);
+		expect(instructions).toMatch(/status: executed.*change_id/i);
+		expect(instructions).toMatch(/status: pending.*proposal_id/i);
+		expect(instructions).toMatch(/disabling or deleting the audit log/i);
+
+		for (const toolName of [
+			"propose_allow_rule",
+			"propose_category",
+			"propose_daily_limit_raise",
+			"propose_resume_agent",
+		]) {
+			const def = tools.find((tool) => tool.name === toolName);
+			expect(def?.description).toMatch(/superadmin/i);
+			expect(def?.description).toMatch(/executes immediately/i);
+		}
 	});
 
 	it("routes /mcp/admin through the worker", async () => {
@@ -716,6 +731,83 @@ describe("view_audit_log tool", () => {
 		expect(names).toContain("view_audit_log");
 		for (const name of names) {
 			expect(name).not.toMatch(/read_bodies|body_access|set_admin|switch/i);
+		}
+	});
+
+	it("keeps human-only ops, switch toggling, self-description approval, read_bodies, and audit tampering blocked while superadmin is active", async () => {
+		await setAdminBotSuperadmin(db, {
+			mode: "unlimited",
+			actor: OWNER,
+			now: T0 + 1,
+		});
+
+		const musePartToken = (
+			await issueToken(db, {
+				agentId: muse.id,
+				purpose: "participant",
+				now: T0 + 2,
+			})
+		).token;
+		const museParticipant = await connect(musePartToken, { now: T0 + 3 });
+		await call(museParticipant, "submit_description", {
+			description: "self-approve attempt under superadmin",
+		});
+
+		const client = await connectAdmin(adminToken, {
+			env: recordingEnv,
+			now: T0 + 10,
+		});
+		const { tools } = await client.listTools();
+		const names = tools.map((tool) => tool.name);
+
+		for (const forbidden of [
+			"register_agent",
+			"delete_agent",
+			"delete_category",
+			"issue_token",
+			"reissue_token",
+			"revoke_token",
+			"designate_admin_bot",
+			"clear_admin_bot",
+			"set_superadmin",
+			"extend_superadmin",
+			"update_switches",
+			"set_read_bodies",
+			"disable_audit_log",
+			"delete_audit_log",
+		]) {
+			expect(names).not.toContain(forbidden);
+		}
+
+		// Superadmin does not grant read_bodies.
+		await recordAuditEvent(db, recordingConfig, {
+			eventType: "question_accepted",
+			occurredAt: T0 + 5,
+			fromAgentId: grok.id,
+			toAgentId: muse.id,
+			categoryId: schedule.id,
+			messageId: "blocked-body-under-superadmin",
+			body: "SECRET_BODY",
+		});
+		const bodyDenied = await call(client, "view_audit_log", {
+			include_body: true,
+		});
+		expect(bodyDenied.isError).toBe(true);
+		expect(bodyDenied.text).not.toContain("SECRET_BODY");
+
+		// Superadmin cannot approve or reject its own description.
+		const selfReview = await call(client, "review_description", {
+			agent: "muse",
+			action: "approve",
+		});
+		expect(selfReview.isError).toBe(true);
+
+		const deniedEvents = (await queryAuditLog(db)).filter(
+			(e) => e.eventType === "admin_tool_denied",
+		);
+		expect(deniedEvents).toHaveLength(2);
+		for (const event of deniedEvents) {
+			expect(event.reasonCode).toBe("permission_denied");
 		}
 	});
 });

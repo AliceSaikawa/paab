@@ -124,6 +124,7 @@ export interface ProposalFailure {
 	ok: false;
 	code: ProposalErrorCode;
 	message: string;
+	targetAgentId?: string;
 }
 
 export type ProposalResult<T> = { ok: true; data: T } | ProposalFailure;
@@ -131,6 +132,18 @@ export type ProposalResult<T> = { ok: true; data: T } | ProposalFailure;
 export interface ApproveProposalData {
 	proposal: Proposal;
 	changeId: number;
+}
+
+export interface ExecuteLooseningAudit {
+	toAgentId?: string;
+	categoryId?: string;
+}
+
+export interface ExecuteLooseningData {
+	kind: ProposalKind;
+	changeId: number;
+	effect: string;
+	audit: ExecuteLooseningAudit;
 }
 
 const grantAllowRulePayloadSchema = z.object({
@@ -286,10 +299,417 @@ export function describeProposalEffect(
 	}
 }
 
-async function resolveProposalRequest(
+type ValidationMode = "request" | "approve";
+
+interface ApprovalGuard {
+	proposalId: string;
+	approverEmail: string;
+}
+
+interface MutationActor {
+	actorId: string;
+	approverId: string | null;
+	now: UnixMillis;
+}
+
+interface PreparedMutationPlan {
+	parsed: ParsedProposal;
+	preconditionSql: string;
+	preconditionBinds: (string | number)[];
+	changeEntry: NewChangeLogEntry;
+	mutationStatement: D1PreparedStatement;
+	audit: ExecuteLooseningAudit;
+}
+
+function buildGrantAllowRulePlan(
+	db: D1Database,
+	rows: {
+		fromRow: AgentRow | null;
+		toRow: AgentRow | null;
+		catRow: CategoryRow | null;
+		ruleExists: boolean;
+	},
+	actor: MutationActor,
+	mode: ValidationMode,
+	approvalGuard?: ApprovalGuard,
+): { ok: true; plan: PreparedMutationPlan } | ProposalFailure {
+	if (rows.fromRow === null) {
+		return fail(
+			"not_found",
+			mode === "approve"
+				? "送信元エージェントが削除されているため承認できません"
+				: "送信元エージェントが見つかりません",
+		);
+	}
+	if (rows.toRow === null) {
+		return fail(
+			"not_found",
+			mode === "approve"
+				? "宛先エージェントが削除されているため承認できません"
+				: "宛先エージェントが見つかりません",
+		);
+	}
+	if (rows.catRow === null) {
+		return fail(
+			"not_found",
+			mode === "approve"
+				? "カテゴリが削除されているため承認できません"
+				: "カテゴリが見つかりません",
+		);
+	}
+	if (rows.fromRow.id === rows.toRow.id) {
+		return fail(
+			"self_addressed",
+			mode === "approve"
+				? "自分自身への質問を許可するルールは承認できません"
+				: "自分自身への質問を許可するルールは提案できません",
+		);
+	}
+	if (rows.ruleExists) {
+		return fail(
+			"duplicate_rule",
+			mode === "approve"
+				? "同じ許可ルールがすでに存在するため承認できません"
+				: "同じ許可ルールがすでに存在します",
+		);
+	}
+
+	const rule: AllowRule = {
+		fromAgentId: rows.fromRow.id,
+		toAgentId: rows.toRow.id,
+		categoryId: rows.catRow.id,
+		createdAt: actor.now,
+	};
+	const preconditionSql = [
+		"EXISTS (SELECT 1 FROM agents WHERE id = ?)",
+		"AND EXISTS (SELECT 1 FROM agents WHERE id = ?)",
+		"AND EXISTS (SELECT 1 FROM categories WHERE id = ?)",
+		"AND NOT EXISTS (SELECT 1 FROM allow_rules WHERE from_agent_id = ? AND to_agent_id = ? AND category_id = ?)",
+	].join(" ");
+	const preconditionBinds = [
+		rule.fromAgentId,
+		rule.toAgentId,
+		rule.categoryId,
+		rule.fromAgentId,
+		rule.toAgentId,
+		rule.categoryId,
+	];
+	const guardSql =
+		approvalGuard !== undefined
+			? `EXISTS (
+					SELECT 1 FROM proposals
+					WHERE id = ? AND status = 'approved' AND resolved_at = ? AND resolved_by = ?
+				) AND (${preconditionSql})`
+			: preconditionSql;
+	const guardBinds =
+		approvalGuard !== undefined
+			? [
+					approvalGuard.proposalId,
+					actor.now,
+					approvalGuard.approverEmail,
+					...preconditionBinds,
+				]
+			: preconditionBinds;
+
+	return {
+		ok: true,
+		plan: {
+			parsed: {
+				kind: "grant_allow_rule",
+				payload: {
+					fromAgentId: rows.fromRow.id,
+					fromAgentName: rows.fromRow.name,
+					toAgentId: rows.toRow.id,
+					toAgentName: rows.toRow.name,
+					categoryId: rows.catRow.id,
+					categoryName: rows.catRow.name,
+				},
+			},
+			preconditionSql,
+			preconditionBinds,
+			changeEntry: {
+				occurredAt: actor.now,
+				actorType: "admin_bot",
+				actorId: actor.actorId,
+				approverId: actor.approverId,
+				action: "allow_rule_granted",
+				targetType: "allow_rule",
+				targetId: `${rule.fromAgentId}:${rule.toAgentId}:${rule.categoryId}`,
+				beforeJson: null,
+				afterJson: JSON.stringify(rule),
+				revertedAt: null,
+			},
+			mutationStatement: db
+				.prepare(
+					`INSERT INTO allow_rules (from_agent_id, to_agent_id, category_id, created_at)
+					SELECT ?, ?, ?, ?
+					WHERE ${guardSql}`,
+				)
+				.bind(
+					rule.fromAgentId,
+					rule.toAgentId,
+					rule.categoryId,
+					rule.createdAt,
+					...guardBinds,
+				),
+			audit: {
+				toAgentId: rule.toAgentId,
+				categoryId: rule.categoryId,
+			},
+		},
+	};
+}
+
+function buildCreateCategoryPlan(
+	db: D1Database,
+	name: string,
+	existingCategoryId: string | null,
+	actor: MutationActor,
+	mode: ValidationMode,
+	approvalGuard?: ApprovalGuard,
+): { ok: true; plan: PreparedMutationPlan } | ProposalFailure {
+	if (existingCategoryId !== null) {
+		return fail(
+			"duplicate_name",
+			mode === "approve"
+				? `カテゴリ「${name}」はすでに存在するため承認できません`
+				: `カテゴリ「${name}」はすでに存在します`,
+		);
+	}
+
+	const category: Category = { id: newId(), name };
+	const preconditionSql =
+		"NOT EXISTS (SELECT 1 FROM categories WHERE name = ?)";
+	const preconditionBinds = [category.name];
+	const guardSql =
+		approvalGuard !== undefined
+			? `EXISTS (
+					SELECT 1 FROM proposals
+					WHERE id = ? AND status = 'approved' AND resolved_at = ? AND resolved_by = ?
+				) AND (${preconditionSql})`
+			: preconditionSql;
+	const guardBinds =
+		approvalGuard !== undefined
+			? [
+					approvalGuard.proposalId,
+					actor.now,
+					approvalGuard.approverEmail,
+					...preconditionBinds,
+				]
+			: preconditionBinds;
+
+	return {
+		ok: true,
+		plan: {
+			parsed: {
+				kind: "create_category",
+				payload: { name: category.name },
+			},
+			preconditionSql,
+			preconditionBinds,
+			changeEntry: {
+				occurredAt: actor.now,
+				actorType: "admin_bot",
+				actorId: actor.actorId,
+				approverId: actor.approverId,
+				action: "category_created",
+				targetType: "category",
+				targetId: category.id,
+				beforeJson: null,
+				afterJson: JSON.stringify(category),
+				revertedAt: null,
+			},
+			mutationStatement: db
+				.prepare(
+					`INSERT INTO categories (id, name)
+					SELECT ?, ?
+					WHERE ${guardSql}`,
+				)
+				.bind(category.id, category.name, ...guardBinds),
+			audit: { categoryId: category.id },
+		},
+	};
+}
+
+function buildRaiseDailyLimitPlan(
+	db: D1Database,
+	agentRow: AgentRow | null,
+	newLimit: number,
+	actor: MutationActor,
+	mode: ValidationMode,
+	approvalGuard?: ApprovalGuard,
+): { ok: true; plan: PreparedMutationPlan } | ProposalFailure {
+	if (agentRow === null) {
+		return fail(
+			"not_found",
+			mode === "approve"
+				? "対象エージェントが削除されているため承認できません"
+				: "指定されたエージェントが見つかりません",
+		);
+	}
+	const current = agentFromRow(agentRow);
+	if (!Number.isSafeInteger(newLimit) || newLimit < 1) {
+		return {
+			ok: false,
+			code: "invalid_limit",
+			message: "新しい1日あたりの質問数上限は1以上の整数で指定してください",
+			targetAgentId: current.id,
+		};
+	}
+	if (newLimit <= current.dailyQuestionLimit) {
+		return {
+			ok: false,
+			code: "invalid_limit",
+			message:
+				mode === "approve"
+					? `現在の上限（${current.dailyQuestionLimit}）が提案値（${newLimit}）以上のため承認できません`
+					: `新しい上限（${newLimit}）は現在の上限（${current.dailyQuestionLimit}）より大きい値にしてください`,
+			targetAgentId: current.id,
+		};
+	}
+
+	const updated: Agent = { ...current, dailyQuestionLimit: newLimit };
+	const preconditionSql =
+		"EXISTS (SELECT 1 FROM agents WHERE id = ? AND daily_question_limit = ? AND daily_question_limit < ?)";
+	const preconditionBinds = [current.id, current.dailyQuestionLimit, newLimit];
+	const approvalFilter =
+		approvalGuard !== undefined
+			? ` AND EXISTS (
+					SELECT 1 FROM proposals
+					WHERE id = ? AND status = 'approved' AND resolved_at = ? AND resolved_by = ?
+				)`
+			: "";
+	const approvalBinds =
+		approvalGuard !== undefined
+			? [approvalGuard.proposalId, actor.now, approvalGuard.approverEmail]
+			: [];
+
+	return {
+		ok: true,
+		plan: {
+			parsed: {
+				kind: "raise_daily_limit",
+				payload: {
+					agentId: current.id,
+					agentName: current.name,
+					previousLimit: current.dailyQuestionLimit,
+					newLimit,
+				},
+			},
+			preconditionSql,
+			preconditionBinds,
+			changeEntry: {
+				occurredAt: actor.now,
+				actorType: "admin_bot",
+				actorId: actor.actorId,
+				approverId: actor.approverId,
+				action: "agent_updated",
+				targetType: "agent",
+				targetId: current.id,
+				beforeJson: JSON.stringify(current),
+				afterJson: JSON.stringify(updated),
+				revertedAt: null,
+			},
+			mutationStatement: db
+				.prepare(
+					`UPDATE agents
+					SET daily_question_limit = ?
+					WHERE id = ? AND daily_question_limit = ? AND daily_question_limit < ?${approvalFilter}`,
+				)
+				.bind(
+					newLimit,
+					current.id,
+					current.dailyQuestionLimit,
+					newLimit,
+					...approvalBinds,
+				),
+			audit: { toAgentId: current.id },
+		},
+	};
+}
+
+function buildResumeAgentPlan(
+	db: D1Database,
+	agentRow: AgentRow | null,
+	actor: MutationActor,
+	mode: ValidationMode,
+	approvalGuard?: ApprovalGuard,
+): { ok: true; plan: PreparedMutationPlan } | ProposalFailure {
+	if (agentRow === null) {
+		return fail(
+			"not_found",
+			mode === "approve"
+				? "対象エージェントが削除されているため承認できません"
+				: "指定されたエージェントが見つかりません",
+		);
+	}
+	const current = agentFromRow(agentRow);
+	if (current.status !== "suspended") {
+		return fail(
+			"already_active",
+			mode === "approve"
+				? `エージェント「${current.name}」はすでに有効なため承認できません`
+				: `エージェント「${current.name}」は現在停止中ではありません`,
+		);
+	}
+
+	const updated: Agent = { ...current, status: "active" };
+	const preconditionSql =
+		"EXISTS (SELECT 1 FROM agents WHERE id = ? AND status = 'suspended')";
+	const preconditionBinds = [current.id];
+	const approvalFilter =
+		approvalGuard !== undefined
+			? ` AND EXISTS (
+					SELECT 1 FROM proposals
+					WHERE id = ? AND status = 'approved' AND resolved_at = ? AND resolved_by = ?
+				)`
+			: "";
+	const approvalBinds =
+		approvalGuard !== undefined
+			? [approvalGuard.proposalId, actor.now, approvalGuard.approverEmail]
+			: [];
+
+	return {
+		ok: true,
+		plan: {
+			parsed: {
+				kind: "resume_agent",
+				payload: {
+					agentId: current.id,
+					agentName: current.name,
+				},
+			},
+			preconditionSql,
+			preconditionBinds,
+			changeEntry: {
+				occurredAt: actor.now,
+				actorType: "admin_bot",
+				actorId: actor.actorId,
+				approverId: actor.approverId,
+				action: "agent_resumed",
+				targetType: "agent",
+				targetId: current.id,
+				beforeJson: JSON.stringify(current),
+				afterJson: JSON.stringify(updated),
+				revertedAt: null,
+			},
+			mutationStatement: db
+				.prepare(
+					`UPDATE agents
+					SET status = 'active'
+					WHERE id = ? AND status = 'suspended'${approvalFilter}`,
+				)
+				.bind(current.id, ...approvalBinds),
+			audit: { toAgentId: current.id },
+		},
+	};
+}
+
+async function prepareRequestPlan(
 	db: D1Database,
 	request: ProposalRequest,
-): Promise<{ ok: true; parsed: ParsedProposal } | ProposalFailure> {
+	actor: MutationActor,
+): Promise<{ ok: true; plan: PreparedMutationPlan } | ProposalFailure> {
 	switch (request.kind) {
 		case "grant_allow_rule": {
 			const fromName = validateLookupName(
@@ -313,48 +733,30 @@ async function resolveProposalRequest(
 					.bind(catName.value),
 			]);
 			const fromRow = (fromResult?.results[0] ?? null) as AgentRow | null;
-			if (fromRow === null) {
-				return fail("not_found", "送信元エージェントが見つかりません");
-			}
 			const toRow = (toResult?.results[0] ?? null) as AgentRow | null;
-			if (toRow === null) {
-				return fail("not_found", "宛先エージェントが見つかりません");
-			}
 			const catRow = (catResult?.results[0] ?? null) as CategoryRow | null;
-			if (catRow === null) {
-				return fail("not_found", "カテゴリが見つかりません");
-			}
-			if (fromRow.id === toRow.id) {
-				return fail(
-					"self_addressed",
-					"自分自身への質問を許可するルールは提案できません",
-				);
-			}
-			const existingRule = await db
-				.prepare(
-					`SELECT 1 AS found FROM allow_rules
-					WHERE from_agent_id = ? AND to_agent_id = ? AND category_id = ?`,
-				)
-				.bind(fromRow.id, toRow.id, catRow.id)
-				.first<{ found: number }>();
-			if (existingRule !== null) {
-				return fail("duplicate_rule", "同じ許可ルールがすでに存在します");
-			}
+			const existingRule =
+				fromRow !== null && toRow !== null && catRow !== null
+					? await db
+							.prepare(
+								`SELECT 1 AS found FROM allow_rules
+								WHERE from_agent_id = ? AND to_agent_id = ? AND category_id = ?`,
+							)
+							.bind(fromRow.id, toRow.id, catRow.id)
+							.first<{ found: number }>()
+					: null;
 
-			return {
-				ok: true,
-				parsed: {
-					kind: "grant_allow_rule",
-					payload: {
-						fromAgentId: fromRow.id,
-						fromAgentName: fromRow.name,
-						toAgentId: toRow.id,
-						toAgentName: toRow.name,
-						categoryId: catRow.id,
-						categoryName: catRow.name,
-					},
+			return buildGrantAllowRulePlan(
+				db,
+				{
+					fromRow,
+					toRow,
+					catRow,
+					ruleExists: existingRule !== null,
 				},
-			};
+				actor,
+				"request",
+			);
 		}
 
 		case "create_category": {
@@ -369,55 +771,29 @@ async function resolveProposalRequest(
 				.prepare("SELECT id FROM categories WHERE name = ?")
 				.bind(name.value)
 				.first<{ id: string }>();
-			if (existing !== null) {
-				return fail(
-					"duplicate_name",
-					`カテゴリ「${name.value}」はすでに存在します`,
-				);
-			}
-			return {
-				ok: true,
-				parsed: {
-					kind: "create_category",
-					payload: { name: name.value },
-				},
-			};
+			return buildCreateCategoryPlan(
+				db,
+				name.value,
+				existing?.id ?? null,
+				actor,
+				"request",
+			);
 		}
 
 		case "raise_daily_limit": {
 			const agentName = validateLookupName(request.agentName, "エージェント名");
 			if (!agentName.ok) return agentName;
-			if (!Number.isSafeInteger(request.newLimit) || request.newLimit < 1) {
-				return fail(
-					"invalid_limit",
-					"新しい1日あたりの質問数上限は1以上の整数で指定してください",
-				);
-			}
 			const row = await db
 				.prepare("SELECT * FROM agents WHERE name = ?")
 				.bind(agentName.value)
 				.first<AgentRow>();
-			if (row === null) {
-				return fail("not_found", "指定されたエージェントが見つかりません");
-			}
-			if (request.newLimit <= row.daily_question_limit) {
-				return fail(
-					"invalid_limit",
-					`新しい上限（${request.newLimit}）は現在の上限（${row.daily_question_limit}）より大きい値にしてください`,
-				);
-			}
-			return {
-				ok: true,
-				parsed: {
-					kind: "raise_daily_limit",
-					payload: {
-						agentId: row.id,
-						agentName: row.name,
-						previousLimit: row.daily_question_limit,
-						newLimit: request.newLimit,
-					},
-				},
-			};
+			return buildRaiseDailyLimitPlan(
+				db,
+				row,
+				request.newLimit,
+				actor,
+				"request",
+			);
 		}
 
 		case "resume_agent": {
@@ -427,27 +803,102 @@ async function resolveProposalRequest(
 				.prepare("SELECT * FROM agents WHERE name = ?")
 				.bind(agentName.value)
 				.first<AgentRow>();
-			if (row === null) {
-				return fail("not_found", "指定されたエージェントが見つかりません");
-			}
-			if (row.status !== "suspended") {
-				return fail(
-					"already_active",
-					`エージェント「${row.name}」は現在停止中ではありません`,
-				);
-			}
-			return {
-				ok: true,
-				parsed: {
-					kind: "resume_agent",
-					payload: {
-						agentId: row.id,
-						agentName: row.name,
-					},
-				},
-			};
+			return buildResumeAgentPlan(db, row, actor, "request");
 		}
 	}
+}
+
+async function prepareStoredProposalPlan(
+	db: D1Database,
+	parsed: ParsedProposal,
+	actor: MutationActor,
+	approvalGuard: ApprovalGuard,
+): Promise<{ ok: true; plan: PreparedMutationPlan } | ProposalFailure> {
+	switch (parsed.kind) {
+		case "grant_allow_rule": {
+			const { fromAgentId, toAgentId, categoryId } = parsed.payload;
+			const [fromResult, toResult, catResult, ruleResult] = await db.batch([
+				db.prepare("SELECT * FROM agents WHERE id = ?").bind(fromAgentId),
+				db.prepare("SELECT * FROM agents WHERE id = ?").bind(toAgentId),
+				db.prepare("SELECT * FROM categories WHERE id = ?").bind(categoryId),
+				db
+					.prepare(
+						`SELECT 1 AS found FROM allow_rules
+						WHERE from_agent_id = ? AND to_agent_id = ? AND category_id = ?`,
+					)
+					.bind(fromAgentId, toAgentId, categoryId),
+			]);
+			return buildGrantAllowRulePlan(
+				db,
+				{
+					fromRow: (fromResult?.results[0] ?? null) as AgentRow | null,
+					toRow: (toResult?.results[0] ?? null) as AgentRow | null,
+					catRow: (catResult?.results[0] ?? null) as CategoryRow | null,
+					ruleExists: (ruleResult?.results.length ?? 0) > 0,
+				},
+				actor,
+				"approve",
+				approvalGuard,
+			);
+		}
+
+		case "create_category": {
+			const nameCheck = validateName(parsed.payload.name);
+			if (!nameCheck.ok) {
+				return fail("invalid_payload", nameCheck.message);
+			}
+			const existing = await db
+				.prepare("SELECT id FROM categories WHERE name = ?")
+				.bind(nameCheck.value)
+				.first<{ id: string }>();
+			return buildCreateCategoryPlan(
+				db,
+				nameCheck.value,
+				existing?.id ?? null,
+				actor,
+				"approve",
+				approvalGuard,
+			);
+		}
+
+		case "raise_daily_limit": {
+			const row = await db
+				.prepare("SELECT * FROM agents WHERE id = ?")
+				.bind(parsed.payload.agentId)
+				.first<AgentRow>();
+			return buildRaiseDailyLimitPlan(
+				db,
+				row,
+				parsed.payload.newLimit,
+				actor,
+				"approve",
+				approvalGuard,
+			);
+		}
+
+		case "resume_agent": {
+			const row = await db
+				.prepare("SELECT * FROM agents WHERE id = ?")
+				.bind(parsed.payload.agentId)
+				.first<AgentRow>();
+			return buildResumeAgentPlan(db, row, actor, "approve", approvalGuard);
+		}
+	}
+}
+
+function validateProposalInput(
+	input: CreateProposalInput,
+): { ok: true; botAgentId: string; reason: string } | ProposalFailure {
+	if (!Number.isSafeInteger(input.now)) {
+		return fail("invalid_input", "時刻は整数で指定してください");
+	}
+	const botIdCheck = validateId(input.botAgentId, "管理者ボットID");
+	if (!botIdCheck.ok) {
+		return fail("invalid_input", botIdCheck.message);
+	}
+	const reasonCheck = validateReason(input.reason);
+	if (!reasonCheck.ok) return reasonCheck;
+	return { ok: true, botAgentId: botIdCheck.value, reason: reasonCheck.value };
 }
 
 /**
@@ -459,18 +910,11 @@ export async function createProposal(
 	db: D1Database,
 	input: CreateProposalInput,
 ): Promise<ProposalResult<{ proposal: Proposal }>> {
-	if (!Number.isSafeInteger(input.now)) {
-		return fail("invalid_input", "時刻は整数で指定してください");
-	}
-	const botIdCheck = validateId(input.botAgentId, "管理者ボットID");
-	if (!botIdCheck.ok) {
-		return fail("invalid_input", botIdCheck.message);
-	}
-	const reasonCheck = validateReason(input.reason);
-	if (!reasonCheck.ok) return reasonCheck;
+	const validated = validateProposalInput(input);
+	if (!validated.ok) return validated;
 
 	const [botRowResult, countResult] = await db.batch([
-		db.prepare("SELECT id FROM agents WHERE id = ?").bind(botIdCheck.value),
+		db.prepare("SELECT id FROM agents WHERE id = ?").bind(validated.botAgentId),
 		db
 			.prepare(
 				`SELECT COUNT(*) AS count
@@ -492,15 +936,19 @@ export async function createProposal(
 		);
 	}
 
-	const resolved = await resolveProposalRequest(db, input.request);
-	if (!resolved.ok) return resolved;
+	const prepared = await prepareRequestPlan(db, input.request, {
+		actorId: validated.botAgentId,
+		approverId: null,
+		now: input.now,
+	});
+	if (!prepared.ok) return prepared;
 
 	const proposal: Proposal = {
 		id: newId(),
-		botAgentId: botIdCheck.value,
-		kind: resolved.parsed.kind,
-		payloadJson: JSON.stringify(resolved.parsed.payload),
-		reason: reasonCheck.value,
+		botAgentId: validated.botAgentId,
+		kind: prepared.plan.parsed.kind,
+		payloadJson: JSON.stringify(prepared.plan.parsed.payload),
+		reason: validated.reason,
 		status: "pending",
 		createdAt: input.now,
 		expiresAt: input.now + PROPOSAL_TTL_MS,
@@ -543,6 +991,109 @@ export async function createProposal(
 	return { ok: true, data: { proposal } };
 }
 
+function buildChangeLogInsert(
+	db: D1Database,
+	plan: PreparedMutationPlan,
+	whereSql: string,
+	whereBinds: (string | number)[],
+): D1PreparedStatement {
+	return db
+		.prepare(
+			`INSERT INTO change_log
+				(occurred_at, actor_type, actor_id, approver_id, action,
+				target_type, target_id, before_json, after_json, reverted_at)
+			SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+			WHERE ${whereSql}`,
+		)
+		.bind(
+			plan.changeEntry.occurredAt,
+			plan.changeEntry.actorType,
+			plan.changeEntry.actorId,
+			plan.changeEntry.approverId,
+			plan.changeEntry.action,
+			plan.changeEntry.targetType,
+			plan.changeEntry.targetId,
+			plan.changeEntry.beforeJson,
+			plan.changeEntry.afterJson,
+			plan.changeEntry.revertedAt,
+			...whereBinds,
+		);
+}
+
+/**
+ * Executes a loosening operation immediately on behalf of the admin bot while
+ * `superadmin` is active, recording `actor_type = 'admin_bot'` and
+ * `approver_id = NULL` in `change_log` without creating a proposal.
+ */
+export async function executeAdminBotLoosening(
+	db: D1Database,
+	input: CreateProposalInput,
+): Promise<ProposalResult<ExecuteLooseningData>> {
+	const validated = validateProposalInput(input);
+	if (!validated.ok) return validated;
+
+	const botRow = await db
+		.prepare("SELECT id FROM agents WHERE id = ?")
+		.bind(validated.botAgentId)
+		.first<{ id: string }>();
+	if (botRow === null) {
+		return fail("not_found", "管理者ボットが見つかりません");
+	}
+
+	const prepared = await prepareRequestPlan(db, input.request, {
+		actorId: validated.botAgentId,
+		approverId: null,
+		now: input.now,
+	});
+	if (!prepared.ok) return prepared;
+
+	const { plan } = prepared;
+	let results: D1Result[];
+	try {
+		results = await db.batch([
+			buildChangeLogInsert(
+				db,
+				plan,
+				plan.preconditionSql,
+				plan.preconditionBinds,
+			),
+			plan.mutationStatement,
+		]);
+	} catch (error) {
+		if (isUniqueConstraintError(error)) {
+			return fail(
+				"conflict",
+				"対象の状態が競合して変更されたため実行できませんでした",
+			);
+		}
+		throw error;
+	}
+
+	if (results[1]?.meta.changes !== 1) {
+		return fail(
+			"conflict",
+			"前提条件が変更されたため実行できませんでした。最新の状態を確認してください",
+		);
+	}
+	const changeId = Number(results[0]?.meta.last_row_id);
+	if (!Number.isSafeInteger(changeId) || changeId <= 0) {
+		throw new Error("change_log insert did not return a valid last_row_id");
+	}
+
+	return {
+		ok: true,
+		data: {
+			kind: plan.parsed.kind,
+			changeId,
+			effect: describeProposalEffect({
+				kind: plan.parsed.kind,
+				payloadJson: JSON.stringify(plan.parsed.payload),
+			}),
+			audit: plan.audit,
+		},
+	};
+}
+
 function failureForNonPending(status: ProposalStatus): ProposalFailure {
 	switch (status) {
 		case "approved":
@@ -559,334 +1110,23 @@ function failureForNonPending(status: ProposalStatus): ProposalFailure {
 	}
 }
 
-interface ApprovalPlan {
-	preconditionSql: string;
-	preconditionBinds: (string | number)[];
-	changeEntry: NewChangeLogEntry;
-	mutationStatement: D1PreparedStatement;
-}
-
-async function buildApprovalPlan(
-	db: D1Database,
-	proposal: Proposal,
-	parsed: ParsedProposal,
-	approverEmail: string,
-	now: UnixMillis,
-): Promise<{ ok: true; plan: ApprovalPlan } | ProposalFailure> {
-	const actor = {
-		occurredAt: now,
-		actorType: "admin_bot" as const,
-		actorId: proposal.botAgentId,
-		approverId: approverEmail,
-		revertedAt: null,
-	};
-
-	switch (parsed.kind) {
-		case "grant_allow_rule": {
-			const { fromAgentId, toAgentId, categoryId } = parsed.payload;
-			if (fromAgentId === toAgentId) {
-				return fail(
-					"self_addressed",
-					"自分自身への質問を許可するルールは承認できません",
-				);
-			}
-			const [fromResult, toResult, catResult, ruleResult] = await db.batch([
-				db.prepare("SELECT id FROM agents WHERE id = ?").bind(fromAgentId),
-				db.prepare("SELECT id FROM agents WHERE id = ?").bind(toAgentId),
-				db.prepare("SELECT id FROM categories WHERE id = ?").bind(categoryId),
-				db
-					.prepare(
-						`SELECT 1 AS found FROM allow_rules
-						WHERE from_agent_id = ? AND to_agent_id = ? AND category_id = ?`,
-					)
-					.bind(fromAgentId, toAgentId, categoryId),
-			]);
-			if ((fromResult?.results.length ?? 0) === 0) {
-				return fail(
-					"not_found",
-					"送信元エージェントが削除されているため承認できません",
-				);
-			}
-			if ((toResult?.results.length ?? 0) === 0) {
-				return fail(
-					"not_found",
-					"宛先エージェントが削除されているため承認できません",
-				);
-			}
-			if ((catResult?.results.length ?? 0) === 0) {
-				return fail("not_found", "カテゴリが削除されているため承認できません");
-			}
-			if ((ruleResult?.results.length ?? 0) > 0) {
-				return fail(
-					"duplicate_rule",
-					"同じ許可ルールがすでに存在するため承認できません",
-				);
-			}
-
-			const rule: AllowRule = {
-				fromAgentId,
-				toAgentId,
-				categoryId,
-				createdAt: now,
-			};
-			const preconditionSql = [
-				"EXISTS (SELECT 1 FROM agents WHERE id = ?)",
-				"AND EXISTS (SELECT 1 FROM agents WHERE id = ?)",
-				"AND EXISTS (SELECT 1 FROM categories WHERE id = ?)",
-				"AND NOT EXISTS (SELECT 1 FROM allow_rules WHERE from_agent_id = ? AND to_agent_id = ? AND category_id = ?)",
-			].join(" ");
-			const preconditionBinds = [
-				fromAgentId,
-				toAgentId,
-				categoryId,
-				fromAgentId,
-				toAgentId,
-				categoryId,
-			];
-
-			return {
-				ok: true,
-				plan: {
-					preconditionSql,
-					preconditionBinds,
-					changeEntry: {
-						...actor,
-						action: "allow_rule_granted",
-						targetType: "allow_rule",
-						targetId: `${fromAgentId}:${toAgentId}:${categoryId}`,
-						beforeJson: null,
-						afterJson: JSON.stringify(rule),
-					},
-					mutationStatement: db
-						.prepare(
-							`INSERT INTO allow_rules (from_agent_id, to_agent_id, category_id, created_at)
-							SELECT ?, ?, ?, ?
-							WHERE EXISTS (
-								SELECT 1 FROM proposals
-								WHERE id = ? AND status = 'approved' AND resolved_at = ? AND resolved_by = ?
-							) AND (${preconditionSql})`,
-						)
-						.bind(
-							rule.fromAgentId,
-							rule.toAgentId,
-							rule.categoryId,
-							rule.createdAt,
-							proposal.id,
-							now,
-							approverEmail,
-							...preconditionBinds,
-						),
-				},
-			};
-		}
-
-		case "create_category": {
-			const nameCheck = validateName(parsed.payload.name);
-			if (!nameCheck.ok) {
-				return fail("invalid_payload", nameCheck.message);
-			}
-			const existing = await db
-				.prepare("SELECT id FROM categories WHERE name = ?")
-				.bind(nameCheck.value)
-				.first<{ id: string }>();
-			if (existing !== null) {
-				return fail(
-					"duplicate_name",
-					`カテゴリ「${nameCheck.value}」はすでに存在するため承認できません`,
-				);
-			}
-
-			const category: Category = { id: newId(), name: nameCheck.value };
-			const preconditionSql =
-				"NOT EXISTS (SELECT 1 FROM categories WHERE name = ?)";
-			const preconditionBinds = [category.name];
-
-			return {
-				ok: true,
-				plan: {
-					preconditionSql,
-					preconditionBinds,
-					changeEntry: {
-						...actor,
-						action: "category_created",
-						targetType: "category",
-						targetId: category.id,
-						beforeJson: null,
-						afterJson: JSON.stringify(category),
-					},
-					mutationStatement: db
-						.prepare(
-							`INSERT INTO categories (id, name)
-							SELECT ?, ?
-							WHERE EXISTS (
-								SELECT 1 FROM proposals
-								WHERE id = ? AND status = 'approved' AND resolved_at = ? AND resolved_by = ?
-							) AND (${preconditionSql})`,
-						)
-						.bind(
-							category.id,
-							category.name,
-							proposal.id,
-							now,
-							approverEmail,
-							...preconditionBinds,
-						),
-				},
-			};
-		}
-
-		case "raise_daily_limit": {
-			const { agentId, newLimit } = parsed.payload;
-			const row = await db
-				.prepare("SELECT * FROM agents WHERE id = ?")
-				.bind(agentId)
-				.first<AgentRow>();
-			if (row === null) {
-				return fail(
-					"not_found",
-					"対象エージェントが削除されているため承認できません",
-				);
-			}
-			const current = agentFromRow(row);
-			if (newLimit <= current.dailyQuestionLimit) {
-				return fail(
-					"invalid_limit",
-					`現在の上限（${current.dailyQuestionLimit}）が提案値（${newLimit}）以上のため承認できません`,
-				);
-			}
-			const updated: Agent = { ...current, dailyQuestionLimit: newLimit };
-			const preconditionSql =
-				"EXISTS (SELECT 1 FROM agents WHERE id = ? AND daily_question_limit = ? AND daily_question_limit < ?)";
-			const preconditionBinds = [
-				current.id,
-				current.dailyQuestionLimit,
-				newLimit,
-			];
-
-			return {
-				ok: true,
-				plan: {
-					preconditionSql,
-					preconditionBinds,
-					changeEntry: {
-						...actor,
-						action: "agent_updated",
-						targetType: "agent",
-						targetId: current.id,
-						beforeJson: JSON.stringify(current),
-						afterJson: JSON.stringify(updated),
-					},
-					mutationStatement: db
-						.prepare(
-							`UPDATE agents
-							SET daily_question_limit = ?
-							WHERE id = ? AND daily_question_limit = ? AND daily_question_limit < ?
-								AND EXISTS (
-									SELECT 1 FROM proposals
-									WHERE id = ? AND status = 'approved' AND resolved_at = ? AND resolved_by = ?
-								)`,
-						)
-						.bind(
-							newLimit,
-							current.id,
-							current.dailyQuestionLimit,
-							newLimit,
-							proposal.id,
-							now,
-							approverEmail,
-						),
-				},
-			};
-		}
-
-		case "resume_agent": {
-			const { agentId } = parsed.payload;
-			const row = await db
-				.prepare("SELECT * FROM agents WHERE id = ?")
-				.bind(agentId)
-				.first<AgentRow>();
-			if (row === null) {
-				return fail(
-					"not_found",
-					"対象エージェントが削除されているため承認できません",
-				);
-			}
-			const current = agentFromRow(row);
-			if (current.status !== "suspended") {
-				return fail(
-					"already_active",
-					`エージェント「${current.name}」はすでに有効なため承認できません`,
-				);
-			}
-			const updated: Agent = { ...current, status: "active" };
-			const preconditionSql =
-				"EXISTS (SELECT 1 FROM agents WHERE id = ? AND status = 'suspended')";
-			const preconditionBinds = [current.id];
-
-			return {
-				ok: true,
-				plan: {
-					preconditionSql,
-					preconditionBinds,
-					changeEntry: {
-						...actor,
-						action: "agent_resumed",
-						targetType: "agent",
-						targetId: current.id,
-						beforeJson: JSON.stringify(current),
-						afterJson: JSON.stringify(updated),
-					},
-					mutationStatement: db
-						.prepare(
-							`UPDATE agents
-							SET status = 'active'
-							WHERE id = ? AND status = 'suspended'
-								AND EXISTS (
-									SELECT 1 FROM proposals
-									WHERE id = ? AND status = 'approved' AND resolved_at = ? AND resolved_by = ?
-								)`,
-						)
-						.bind(current.id, proposal.id, now, approverEmail),
-				},
-			};
-		}
-	}
-}
-
 async function executeApprovalBatch(
 	db: D1Database,
 	proposalId: string,
 	approverEmail: string,
 	now: UnixMillis,
-	plan: ApprovalPlan,
+	plan: PreparedMutationPlan,
 ): Promise<{ applied: true; changeId: number } | { applied: false }> {
 	const results = await db.batch([
-		db
-			.prepare(
-				`INSERT INTO change_log
-					(occurred_at, actor_type, actor_id, approver_id, action,
-					target_type, target_id, before_json, after_json, reverted_at)
-				SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-				WHERE EXISTS (
-					SELECT 1 FROM proposals
-					WHERE id = ? AND status = 'pending' AND expires_at > ?
-				) AND (${plan.preconditionSql})`,
-			)
-			.bind(
-				plan.changeEntry.occurredAt,
-				plan.changeEntry.actorType,
-				plan.changeEntry.actorId,
-				plan.changeEntry.approverId,
-				plan.changeEntry.action,
-				plan.changeEntry.targetType,
-				plan.changeEntry.targetId,
-				plan.changeEntry.beforeJson,
-				plan.changeEntry.afterJson,
-				plan.changeEntry.revertedAt,
-				proposalId,
-				now,
-				...plan.preconditionBinds,
-			),
+		buildChangeLogInsert(
+			db,
+			plan,
+			`EXISTS (
+				SELECT 1 FROM proposals
+				WHERE id = ? AND status = 'pending' AND expires_at > ?
+			) AND (${plan.preconditionSql})`,
+			[proposalId, now, ...plan.preconditionBinds],
+		),
 		db
 			.prepare(
 				`UPDATE proposals
@@ -959,12 +1199,18 @@ export async function approveProposal(
 		return fail("invalid_payload", "提案の内容が不正なため承認できません");
 	}
 
-	const planResult = await buildApprovalPlan(
+	const planResult = await prepareStoredProposalPlan(
 		db,
-		proposal,
 		parsed,
-		approverCheck.value,
-		input.now,
+		{
+			actorId: proposal.botAgentId,
+			approverId: approverCheck.value,
+			now: input.now,
+		},
+		{
+			proposalId: proposal.id,
+			approverEmail: approverCheck.value,
+		},
 	);
 	if (!planResult.ok) return planResult;
 

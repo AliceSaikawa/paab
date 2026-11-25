@@ -3,7 +3,12 @@ import {
 	type CategoryWithUsage,
 	isUndoableChangeAction,
 } from "../../admin";
-import type { AdminBotConfig } from "../../adminbot";
+import {
+	type AdminBotConfig,
+	isSuperadminActive,
+	SUPERADMIN_UNLIMITED,
+	type SuperadminDurationMode,
+} from "../../adminbot";
 import type { ChangeLogEntry, UnixMillis } from "../../types";
 import { csrfInput } from "../csrf";
 import { html, rawHtml, type SafeHtml } from "../html";
@@ -14,6 +19,17 @@ import {
 	describeChangeBeforeAfter,
 	describeChangeTarget,
 } from "../rules/render";
+
+const MINUTE_MS = 60 * 1000;
+const HOUR_MS = 60 * MINUTE_MS;
+const DAY_MS = 24 * HOUR_MS;
+
+const SUPERADMIN_MODE_LABELS: Record<SuperadminDurationMode, string> = {
+	"1d": "1日",
+	"7d": "7日",
+	"30d": "30日",
+	unlimited: "無期限",
+};
 
 export interface AdminBotPageView {
 	config: AdminBotConfig;
@@ -31,6 +47,13 @@ export interface ReadBodiesConfirmView {
 	agentName: string;
 	csrfToken: string;
 	superadminUntil: UnixMillis;
+	bodyRecordingEnabled: boolean;
+}
+
+export interface SuperadminConfirmView {
+	agentName: string;
+	csrfToken: string;
+	mode: SuperadminDurationMode;
 	bodyRecordingEnabled: boolean;
 }
 
@@ -99,12 +122,34 @@ function renderAdminTokenSection(
 }
 
 export function activeSuperadminUntil(
-	config: AdminBotConfig,
+	config: Pick<AdminBotConfig, "superadminUntil">,
 	now: UnixMillis,
 ): UnixMillis | null {
-	return config.superadminUntil !== null && config.superadminUntil > now
-		? config.superadminUntil
-		: null;
+	return isSuperadminActive(config, now) ? config.superadminUntil : null;
+}
+
+function formatRemainingDuration(remainingMs: number): string {
+	if (remainingMs >= DAY_MS) {
+		const days = Math.floor(remainingMs / DAY_MS);
+		const hours = Math.floor((remainingMs % DAY_MS) / HOUR_MS);
+		return hours > 0 ? `残り ${days}日${hours}時間` : `残り ${days}日`;
+	}
+	if (remainingMs >= HOUR_MS) {
+		const hours = Math.floor(remainingMs / HOUR_MS);
+		const minutes = Math.floor((remainingMs % HOUR_MS) / MINUTE_MS);
+		return minutes > 0 ? `残り ${hours}時間${minutes}分` : `残り ${hours}時間`;
+	}
+	if (remainingMs >= MINUTE_MS) {
+		const minutes = Math.floor(remainingMs / MINUTE_MS);
+		return `残り ${minutes}分`;
+	}
+	return "残り 1分未満";
+}
+
+function renderSuperadminExpiryLabel(superadminUntil: UnixMillis): SafeHtml {
+	return superadminUntil === SUPERADMIN_UNLIMITED
+		? html`無期限`
+		: formatTimestamp(superadminUntil);
 }
 
 function renderBodyRecordingNotice(
@@ -120,12 +165,32 @@ function renderBodyRecordingNotice(
 	`;
 }
 
+function renderSuperadminStatusMeta(
+	config: AdminBotConfig,
+	now: UnixMillis,
+): SafeHtml | false {
+	const until = activeSuperadminUntil(config, now);
+	if (until === SUPERADMIN_UNLIMITED) {
+		return html`<span class="muted">無期限</span>`;
+	}
+	if (until !== null) {
+		return html`<span class="muted">${formatRemainingDuration(until - now)}（有効期限: ${formatTimestamp(until)}）</span>`;
+	}
+	if (
+		config.superadminUntil !== null &&
+		config.superadminUntil !== SUPERADMIN_UNLIMITED
+	) {
+		return html`<span class="muted">（有効期限切れ: ${formatTimestamp(config.superadminUntil)}）</span>`;
+	}
+	return false;
+}
+
 function renderPermissionsSection(view: AdminBotPageView): SafeHtml {
 	const { config, bodyRecordingEnabled, csrfToken, now } = view;
 	const nextEnabled = config.readBodies ? "0" : "1";
 	const buttonLabel = config.readBodies ? "オフにする" : "オンにする";
 	const buttonClass = config.readBodies ? "btn" : "btn btn-primary";
-	const superadminActive = activeSuperadminUntil(config, now) !== null;
+	const superadminActive = isSuperadminActive(config, now);
 
 	return html`
 		<div class="stack">
@@ -140,8 +205,37 @@ function renderPermissionsSection(view: AdminBotPageView): SafeHtml {
 				<span class="muted">質問文や回答文に個人情報が含まれる可能性があるため、調査が必要な間だけ有効にしてください。</span>
 			</div>
 			${renderBodyRecordingNotice(bodyRecordingEnabled)}
-			<div class="muted">
-				最高管理者権限: <strong>${superadminActive ? "有効" : "オフ"}</strong>
+			<div class="stack" style="gap: 0.5rem;">
+				<div class="actions">
+					<strong>最高管理者権限:</strong>
+					<span class="${superadminActive ? "badge badge-ok" : "badge"}">${superadminActive ? "有効" : "オフ"}</span>
+					${renderSuperadminStatusMeta(config, now)}
+					${
+						superadminActive
+							? html`
+								<form class="inline-form" method="POST" action="/admin/adminbot/superadmin">
+									${csrfInput(csrfToken)}
+									<input type="hidden" name="mode" value="off">
+									<button type="submit" class="btn btn-danger">オフにする</button>
+								</form>
+							`
+							: false
+					}
+					<form class="inline-form actions" method="POST" action="/admin/adminbot/superadmin">
+						${csrfInput(csrfToken)}
+						<label for="superadmin-mode">有効期限:</label>
+						<select id="superadmin-mode" name="mode" style="width: auto;">
+							<option value="1d">1日</option>
+							<option value="7d" selected>7日（既定）</option>
+							<option value="30d">30日</option>
+							<option value="unlimited">無期限</option>
+						</select>
+						<button type="submit" class="btn btn-primary">${superadminActive ? "期間を変更する" : "オンにする"}</button>
+					</form>
+				</div>
+				<div class="banner banner-warning" role="note" style="margin-bottom: 0;">
+					注意（設計書 5.3 節）: 管理者ボットは参加者として質問を受けるため、質問文に仕込まれた指示（プロンプトインジェクション）によって管理者操作を実行させられるリスクがあります。最高管理者権限が有効な間は、許可ルールの追加・カテゴリの追加・1日あたりの質問数上限の引き上げ・停止解除を承認なしで即時実行し、全カテゴリの開示許可につながり得ます。必要な期間だけ有効にし、問題があれば下の変更履歴から 1 操作で元に戻してください。エージェントの登録・削除、トークン発行、指名変更、権限スイッチ自身の変更、管理者ボット自身の説明文承認、監査ログの停止・削除は引き続き実行できません。
+				</div>
 			</div>
 		</div>
 	`;
@@ -409,7 +503,7 @@ export function renderReadBodiesConfirmBody(
 
 			<section class="card stack">
 				<div class="banner banner-warning" role="alert">
-					現在、最高管理者権限（有効期限: ${formatTimestamp(view.superadminUntil)}）が有効です。本文閲覧を同時にオンにすると、外部から届いた質問文・回答文の内容を読んだ管理者ボットが単独で設定変更を行える状態になります。
+					現在、最高管理者権限（有効期限: ${renderSuperadminExpiryLabel(view.superadminUntil)}）が有効です。本文閲覧を同時にオンにすると、外部から届いた質問文・回答文の内容を読んだ管理者ボットが単独で設定変更を行える状態になります。
 				</div>
 				<p class="muted">
 					質問文や回答文に個人情報が含まれる可能性があるため、調査が必要な間だけ有効にしてください。
@@ -418,6 +512,40 @@ export function renderReadBodiesConfirmBody(
 				<form method="POST" action="/admin/adminbot/read-bodies" class="actions">
 					${csrfInput(view.csrfToken)}
 					<input type="hidden" name="enabled" value="1">
+					<input type="hidden" name="confirm" value="1">
+					<button type="submit" class="btn btn-primary">理解したうえでオンにする</button>
+					<a class="btn" href="/admin/adminbot">キャンセル</a>
+				</form>
+			</section>
+		</div>
+	`;
+}
+
+/**
+ * Renders the 1-step confirmation screen when enabling `superadmin` while
+ * `read_bodies` is already active (design 5.3).
+ */
+export function renderSuperadminConfirmBody(
+	view: SuperadminConfirmView,
+): SafeHtml {
+	return html`
+		<div class="stack">
+			<div>
+				<h1>最高管理者権限の有効化確認</h1>
+				<p class="muted">対象エージェント: <strong>${view.agentName}</strong></p>
+			</div>
+
+			<section class="card stack">
+				<div class="banner banner-warning" role="alert">
+					現在、本文閲覧がオンです。最高管理者権限（設定期間: ${SUPERADMIN_MODE_LABELS[view.mode]}）を同時にオンにすると、参加者の質問文・回答文の内容を読んだ管理者ボットが承認なしで許可ルールや上限を変更できる状態になります。質問文に仕込まれた指示（プロンプトインジェクション）によって全カテゴリの開示許可につながるリスクがあります。
+				</div>
+				<p class="muted">
+					問題が生じた場合は、<code>/admin/adminbot</code> の変更履歴から 1 操作で元に戻せます。必要な期間だけ有効にしてください。
+				</p>
+				${renderBodyRecordingNotice(view.bodyRecordingEnabled)}
+				<form method="POST" action="/admin/adminbot/superadmin" class="actions">
+					${csrfInput(view.csrfToken)}
+					<input type="hidden" name="mode" value="${view.mode}">
 					<input type="hidden" name="confirm" value="1">
 					<button type="submit" class="btn btn-primary">理解したうえでオンにする</button>
 					<a class="btn" href="/admin/adminbot">キャンセル</a>
