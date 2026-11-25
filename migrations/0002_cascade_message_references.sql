@@ -26,7 +26,7 @@ CREATE TABLE messages_new (
 	to_agent_id TEXT REFERENCES agents (id) ON DELETE CASCADE,
 	category_id TEXT REFERENCES categories (id) ON DELETE CASCADE,
 	body TEXT,
-	in_reply_to TEXT REFERENCES messages (id) ON DELETE CASCADE,
+	in_reply_to TEXT REFERENCES messages_new (id) ON DELETE CASCADE,
 	status TEXT NOT NULL,
 	created_at INTEGER NOT NULL,
 	received_at INTEGER,

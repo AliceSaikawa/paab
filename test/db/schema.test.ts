@@ -1,3 +1,4 @@
+import { applyD1Migrations } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
 	type AgentRow,
@@ -582,5 +583,101 @@ describe("row conversion", () => {
 		expect(() => auditLogEntryFromRow(row as AuditLogRow)).toThrow(
 			/audit_log\.event_type/,
 		);
+	});
+});
+
+describe("migration 0002 on populated data", () => {
+	function splitSql(sql: string): string[] {
+		return sql
+			.split("\n")
+			.filter((line) => !line.trimStart().startsWith("--"))
+			.join("\n")
+			.split(";")
+			.map((statement) => statement.trim())
+			.filter((statement) => statement.length > 0);
+	}
+
+	it("preserves existing answers and rejections when upgrading from 0001", async () => {
+		const rawMigrations = import.meta.glob<string>("../../migrations/*.sql", {
+			query: "?raw",
+			import: "default",
+			eager: true,
+		});
+		const findSql = (name: string): string[] => {
+			const entry = Object.entries(rawMigrations).find(([path]) =>
+				path.endsWith(`/${name}`),
+			);
+			if (entry === undefined) {
+				throw new Error(`Missing migration ${name}`);
+			}
+			return splitSql(entry[1]);
+		};
+		const m0001 = {
+			name: "0001_initial_schema.sql",
+			queries: findSql("0001_initial_schema.sql"),
+		};
+		const m0002 = {
+			name: "0002_cascade_message_references.sql",
+			queries: findSql("0002_cascade_message_references.sql"),
+		};
+
+		for (const table of [
+			"audit_log",
+			"messages",
+			"allow_rules",
+			"tokens",
+			"categories",
+			"agents",
+			"d1_migrations",
+		]) {
+			await db.prepare(`DROP TABLE IF EXISTS ${table}`).run();
+		}
+
+		await applyD1Migrations(db, [m0001]);
+
+		const a = await seedAgent(db, { name: "a" });
+		const b = await seedAgent(db, { name: "b" });
+		const cat = await seedCategory(db, { name: "schedule" });
+		const q1 = question(a, b, cat.id, { status: "answered" });
+		const r1 = reply(q1, { body: "confirmed" });
+		const q2 = question(b, a, cat.id, { status: "declined" });
+		const r2 = reply(q2, {
+			kind: "rejection",
+			fromAgentId: null,
+			body: null,
+		});
+		await db.batch([q1, r1, q2, r2].map((m) => insertMessage(db, m)));
+
+		await applyD1Migrations(db, [m0001, m0002]);
+
+		const { results } = await db
+			.prepare("SELECT id, kind, in_reply_to, body FROM messages ORDER BY id")
+			.all<{
+				id: string;
+				kind: string;
+				in_reply_to: string | null;
+				body: string | null;
+			}>();
+		expect(results.map((r) => r.id).sort()).toEqual(
+			[q1.id, r1.id, q2.id, r2.id].sort(),
+		);
+		expect(results.find((r) => r.id === r1.id)).toMatchObject({
+			kind: "answer",
+			in_reply_to: q1.id,
+			body: "confirmed",
+		});
+		expect(results.find((r) => r.id === r2.id)).toMatchObject({
+			kind: "rejection",
+			in_reply_to: q2.id,
+			body: null,
+		});
+		const fkCheck = await db.prepare("PRAGMA foreign_key_check").all();
+		expect(fkCheck.results).toEqual([]);
+
+		await db.prepare("DELETE FROM agents WHERE id = ?").bind(a.id).run();
+		const remaining = await db
+			.prepare("SELECT COUNT(*) AS n FROM messages")
+			.first<{ n: number }>();
+		expect(remaining?.n).toBe(0);
 	});
 });
