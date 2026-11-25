@@ -246,7 +246,16 @@ export async function deleteAgent(
 
 	const changeId = await runWithChangeLog(
 		db,
-		[db.prepare("DELETE FROM agents WHERE id = ?").bind(agent.id)],
+		[
+			db
+				.prepare(
+					`UPDATE admin_bot_config
+					SET agent_id = NULL, read_bodies = 0, superadmin_until = NULL, updated_at = ?
+					WHERE id = 1 AND agent_id = ?`,
+				)
+				.bind(ctx.value.now, agent.id),
+			db.prepare("DELETE FROM agents WHERE id = ?").bind(agent.id),
+		],
 		{
 			occurredAt: ctx.value.now,
 			actorType: ctx.value.actorType,
