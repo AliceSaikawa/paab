@@ -7,4 +7,13 @@ export default defineConfig({
 			wrangler: { configPath: "./wrangler.jsonc" },
 		}),
 	],
+	test: {
+		maxWorkers: 4,
+		exclude: [
+			"**/node_modules/**",
+			"**/.git/**",
+			"**/.agents/**",
+			"**/.audit/**",
+		],
+	},
 });

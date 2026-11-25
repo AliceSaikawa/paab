@@ -13,7 +13,9 @@
 			"*.json",
 			"*.jsonc",
 			"vitest.config.ts",
-			".github/**"
+			".github/**",
+			"!!.agents",
+			"!!.audit"
 		]
 	},
 	"formatter": {

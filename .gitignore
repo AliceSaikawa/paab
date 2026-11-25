@@ -2,6 +2,8 @@ node_modules/
 worker-configuration.d.ts
 dist/
 .wrangler/
+.agents/
+.audit/
 .dev.vars
 .dev.vars.*
 .env
