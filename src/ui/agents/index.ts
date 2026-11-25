@@ -14,6 +14,9 @@ import {
 import { adminPageResponse, type FlashMessage } from "../layout";
 import type { AdminGetContext, AdminPostContext, AdminRoute } from "../router";
 import {
+	AGENT_TOKEN_UI_CONFIG,
+	AGENT_UI_TOKEN_PURPOSES,
+	type AgentUiTokenPurpose,
 	type RegisterFormDraft,
 	renderAgentsPageBody,
 	renderDeleteConfirmBody,
@@ -274,13 +277,15 @@ async function handleDeleteAgent(ctx: AdminPostContext): Promise<Response> {
 	});
 }
 
-async function handleIssueParticipantToken(
+async function handleIssueAgentToken(
 	ctx: AdminPostContext,
+	purpose: AgentUiTokenPurpose,
 ): Promise<Response> {
+	const config = AGENT_TOKEN_UI_CONFIG[purpose];
 	const agentId = ctx.params.id ?? "";
 	const result = await issueAgentToken(ctx.env.DB, {
 		agentId,
-		purpose: "participant",
+		purpose,
 		actor: actorFrom(ctx),
 		now: ctx.now,
 	});
@@ -296,29 +301,32 @@ async function handleIssueParticipantToken(
 		agents.find((item) => item.agent.id === agentId)?.agent.name ?? agentId;
 
 	return adminPageResponse({
-		title: "参加者トークン発行",
+		title: config.issuedPageTitle,
 		currentPath: AGENTS_PATH,
 		user: ctx.user,
 		devMode: ctx.devMode,
 		flash: {
 			kind: "success",
-			message: `「${agentName}」の参加者トークンを発行しました`,
+			message: `「${agentName}」の${config.issuedFlashVerb}`,
 		},
 		body: renderIssuedTokenBody({
+			purpose,
 			agentName,
 			token: result.data.token,
 			revokedPrevious: result.data.revokedPrevious,
-			mcpUrl: `${ctx.url.origin}/mcp`,
+			endpointUrl: `${ctx.url.origin}${config.endpointPath}`,
 		}),
 	});
 }
 
-async function handleRevokeParticipantToken(
+async function handleRevokeAgentToken(
 	ctx: AdminPostContext,
+	purpose: AgentUiTokenPurpose,
 ): Promise<Response> {
+	const config = AGENT_TOKEN_UI_CONFIG[purpose];
 	const result = await revokeAgentTokens(ctx.env.DB, {
 		agentId: ctx.params.id ?? "",
-		purpose: "participant",
+		purpose,
 		actor: actorFrom(ctx),
 		now: ctx.now,
 	});
@@ -334,16 +342,30 @@ async function handleRevokeParticipantToken(
 			result.data.revokedCount > 0
 				? {
 						kind: "success",
-						message: "参加者トークンを失効させました",
+						message: config.revokedFlashMessage,
 					}
 				: {
 						kind: "info",
-						message: "有効な参加者トークンはありませんでした",
+						message: config.noActiveRevokeMessage,
 					},
 	});
 }
 
 export function agentRoutes(): AdminRoute[] {
+	const tokenRoutes = AGENT_UI_TOKEN_PURPOSES.flatMap((purpose) => {
+		const config = AGENT_TOKEN_UI_CONFIG[purpose];
+		return [
+			{
+				pattern: `/admin/agents/:id${config.issuePathSuffix}`,
+				post: (ctx: AdminPostContext) => handleIssueAgentToken(ctx, purpose),
+			},
+			{
+				pattern: `/admin/agents/:id${config.revokePathSuffix}`,
+				post: (ctx: AdminPostContext) => handleRevokeAgentToken(ctx, purpose),
+			},
+		];
+	});
+
 	return [
 		{
 			pattern: "/admin/agents",
@@ -367,13 +389,6 @@ export function agentRoutes(): AdminRoute[] {
 			get: handleGetDeleteConfirm,
 			post: handleDeleteAgent,
 		},
-		{
-			pattern: "/admin/agents/:id/token",
-			post: handleIssueParticipantToken,
-		},
-		{
-			pattern: "/admin/agents/:id/token/revoke",
-			post: handleRevokeParticipantToken,
-		},
+		...tokenRoutes,
 	];
 }

@@ -1,6 +1,7 @@
 import { handleAdminMcpRequest } from "./adminbot";
 import { handleMcpRequest, runScheduledMaintenance } from "./mcp";
 import { handleAdminRequest } from "./ui";
+import { handleUnreadRequest } from "./unread";
 
 export default {
 	async fetch(
@@ -17,6 +18,9 @@ export default {
 		}
 		if (url.pathname === "/mcp/admin") {
 			return handleAdminMcpRequest(request, env, Date.now());
+		}
+		if (url.pathname === "/unread") {
+			return handleUnreadRequest(request, env, Date.now());
 		}
 		if (url.pathname === "/admin" || url.pathname.startsWith("/admin/")) {
 			return handleAdminRequest(request, env, Date.now());
