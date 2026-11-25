@@ -1,6 +1,6 @@
 import { env } from "cloudflare:workers";
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { queryAuditLog } from "../../src/audit";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { queryAuditLog, recordAuditEvent } from "../../src/audit";
 import { submitQuestion } from "../../src/inbox";
 import { runScheduledMaintenance } from "../../src/mcp";
 import { DAY_MS, T0 } from "../helpers/fixtures";
@@ -18,6 +18,10 @@ let world: McpWorld;
 
 beforeEach(async () => {
 	world = await createMcpWorld();
+});
+
+afterEach(() => {
+	vi.restoreAllMocks();
 });
 
 /** The boundary of the first frame in a response. */
@@ -50,15 +54,35 @@ function framedTexts(text: string): string[] {
 	return texts;
 }
 
-/** Sizes of the `db.batch` calls that wrote to the audit log. */
-function auditWriteBatches(batch: { mock: { calls: unknown[][] } }): number[] {
-	return batch.mock.calls
-		.filter(([statements]) =>
-			(statements as { statement?: string }[]).some((statement) =>
-				String(statement.statement ?? "").includes("INSERT INTO audit_log"),
-			),
-		)
-		.map(([statements]) => (statements as unknown[]).length);
+/**
+ * Observes `db.prepare` + `bind` + `db.batch` through the public D1 interface
+ * so tests do not rely on internal statement properties.
+ */
+function spyAuditWriteBatches(db: D1Database): () => number[] {
+	const auditStatements = new WeakSet<object>();
+	const prepare = db.prepare.bind(db);
+	vi.spyOn(db, "prepare").mockImplementation((query: string) => {
+		const statement = prepare(query);
+		if (query.includes("INSERT INTO audit_log")) {
+			auditStatements.add(statement);
+			const bind = statement.bind.bind(statement);
+			statement.bind = (...values: unknown[]) => {
+				const bound = bind(...values);
+				auditStatements.add(bound);
+				return bound;
+			};
+		}
+		return statement;
+	});
+	const batch = vi.spyOn(db, "batch");
+	return () =>
+		batch.mock.calls
+			.filter(([statements]) =>
+				(statements as object[]).some((statement) =>
+					auditStatements.has(statement),
+				),
+			)
+			.map(([statements]) => (statements as unknown[]).length);
 }
 
 /** The message blocks of a check_inbox result, keyed by kind. */
@@ -143,11 +167,11 @@ describe("check_inbox", () => {
 			});
 		}
 
-		const batch = vi.spyOn(world.db, "batch");
+		const batchSizes = spyAuditWriteBatches(world.db);
 		await runScheduledMaintenance(env, T0 + 8 * DAY_MS);
 
 		// Two audit chunks, not one write per expired question.
-		expect(auditWriteBatches(batch)).toEqual([25, 5]);
+		expect(batchSizes()).toEqual([25, 5]);
 		const expired = (await queryAuditLog(world.db)).filter(
 			(row) => row.eventType === "question_expired",
 		);
@@ -179,11 +203,11 @@ describe("check_inbox", () => {
 		await askBob(alice, "two");
 		await askBob(alice, "three");
 
-		const batch = vi.spyOn(world.db, "batch");
+		const batchSizes = spyAuditWriteBatches(world.db);
 		const { text } = await call(bob, "check_inbox");
 
 		expect(inboxBlocks(text)).toHaveLength(3);
-		expect(auditWriteBatches(batch)).toEqual([3]);
+		expect(batchSizes()).toEqual([3]);
 		const delivered = (await queryAuditLog(world.db)).filter(
 			(row) => row.eventType === "question_delivered",
 		);
@@ -218,6 +242,39 @@ describe("check_inbox", () => {
 				),
 			),
 		]);
+	});
+
+	it("preserves both errors in AggregateError when expiry and audit purge both fail", async () => {
+		await recordAuditEvent(
+			world.db,
+			{ recordBodies: true, bodyRetentionDays: 30 },
+			{
+				occurredAt: T0,
+				eventType: "question_accepted",
+				fromAgentId: world.alice.agent.id,
+				toAgentId: world.bob.agent.id,
+				categoryId: world.schedule.id,
+				messageId: "q-old",
+				body: "secret",
+			},
+		);
+
+		const prepare = world.db.prepare.bind(world.db);
+		vi.spyOn(world.db, "prepare").mockImplementation((query: string) => {
+			if (query.includes("FROM messages")) {
+				throw new Error("expiry failed");
+			}
+			if (query.includes("UPDATE audit_log")) {
+				throw new Error("purge failed");
+			}
+			return prepare(query);
+		});
+
+		const err = await runScheduledMaintenance(env, T0 + 40 * DAY_MS).catch(
+			(e: unknown) => e,
+		);
+		expect(err).toBeInstanceOf(AggregateError);
+		expect((err as AggregateError).errors).toHaveLength(2);
 	});
 });
 
