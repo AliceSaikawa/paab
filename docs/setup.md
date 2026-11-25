@@ -338,6 +338,35 @@ Cloudflare Access（ローカル開発では `ADMIN_DEV_USER`）を設定した�
    - 同一エージェントへの未送信通知は 1 件に統合される。許可された `ask` と `answer` / `decline` はリクエスト末尾の `waitUntil` で初回送信を試み、失敗時は定期実行で最大 3 回（60 秒後、300 秒後）まで再試行する。3 回失敗すると配信を打ち切り、監査ログに `webhook_failed`（理由 `webhook_delivery_failed`）を記録する。ブリッジが拒否した `ask` はタイミング差で拒否理由が漏れないよう初回即時送信を行わず、遅延キューに積む。Webhook が失敗しても受信箱のメッセージは失われない。
    - ローカル開発で `http://localhost:...` 宛のテスト受信サーバーを使う場合だけ、`.dev.vars` に `ALLOW_LOCAL_WEBHOOKS=true` を書く。再試行や期限切れ通知をローカルで進めるには `curl "http://localhost:8787/cdn-cgi/local/scheduled"` を実行する。
 
+### VM 上の定期確認スクリプト（`examples/poll-unread.sh`）
+
+エージェントが動く VM 側から 5 分おきに未読件数を確認し、1 件以上のときだけエージェントを起こす見本スクリプトを `examples/` に同梱している（[設計書 2.5 節](design.md#25-vm上の定期確認スクリプト確定)）。確認は `GET /unread` への HTTP リクエストだけで完結するため、AI の利用枠を消費せず、外部から到達可能な入口がない VM でも使える。
+
+1. **件数確認トークンをファイルに保存する（`chmod 600`）**
+   `/admin/agents` で発行した `unread_count` トークンを、所有者だけが読めるファイルに 1 行で保存する。環境変数や crontab に平文トークンを直接書くとプロセス一覧やログから漏れるおそれがあるため、`PAAB_UNREAD_TOKEN_FILE` を使う。
+
+   ```sh
+   mkdir -p ~/.config/paab ~/.local/state/paab
+   umask 077 && printf '%s\n' '<件数確認トークン>' > ~/.config/paab/unread-token
+   chmod 600 ~/.config/paab/unread-token
+   ```
+
+2. **起こし方のスクリプト（`examples/wake-agent.sh`）を差し替える**
+   `examples/poll-unread.sh` は `unread > 0` のときだけ既定で隣にある `examples/wake-agent.sh` を第 1 引数に未読件数を渡して呼び出す（`cron` 実行時にカレントディレクトリが異なっていてもスクリプト自身の場所から解決する）。`examples/wake-agent.sh` を編集して自分のエージェントの起動コマンドやローカル通知先へ書き換えるか、`PAAB_WAKE_CMD` 環境変数で別の実行可能スクリプトを指定する。
+
+   動作確認の例（未読が 0 件なら何も出力せず終了コード 0 で終わる）:
+
+   ```sh
+   PAAB_URL=https://paab.<サブドメイン>.workers.dev \
+   	PAAB_UNREAD_TOKEN_FILE=~/.config/paab/unread-token \
+   	./examples/poll-unread.sh
+   ```
+
+   接続先 URL 全体を上書きしたいときは `PAAB_UNREAD_URL` を使う。`PAAB_UNREAD_TOKEN_FILE` の代わりに `PAAB_UNREAD_TOKEN` を使うこともできる。
+
+3. **cron に登録する（`examples/paab-poll.cron`）**
+   `examples/paab-poll.cron` には `*/5 * * * *` の定期実行例を入れている。`cron` は最小限の `PATH`（`/usr/bin:/bin` など）で動くため、ファイルの `PATH=` に `curl` と `PAAB_WAKE_CMD` が使うコマンドのディレクトリを含め、絶対パスとログ出力先を自分の環境に合わせて書き換えてから `crontab examples/paab-poll.cron` で登録する。
+
 ### ルールとカテゴリの編集（`/admin/rules`）
 
 `/admin/rules` から、許可ルールと質問カテゴリを編集できる。変更は即時反映され、変更履歴（`change_log`）に新しい順で記録される。

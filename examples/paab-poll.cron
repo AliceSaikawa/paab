@@ -1,0 +1,21 @@
+# Poll paab GET /unread every 5 minutes and wake the agent when unread > 0.
+#
+# Setup:
+#   1. Store the agent's unread_count token in a private file (mode 600):
+#        mkdir -p ~/.config/paab ~/.local/state/paab
+#        umask 077 && printf '%s\n' '<unread-count-token>' > ~/.config/paab/unread-token
+#        chmod 600 ~/.config/paab/unread-token
+#   2. Customize examples/wake-agent.sh or set PAAB_WAKE_CMD below.
+#   3. Set PATH to include curl and your wake command directory because cron
+#      starts with a minimal PATH (often /usr/bin:/bin).
+#   4. Replace /home/<user>/paab and log paths with absolute paths, then install:
+#        crontab examples/paab-poll.cron
+
+SHELL=/bin/sh
+PATH=/usr/local/bin:/usr/bin:/bin
+
+PAAB_URL=https://paab.<subdomain>.workers.dev
+PAAB_UNREAD_TOKEN_FILE=/home/<user>/.config/paab/unread-token
+# PAAB_WAKE_CMD=/home/<user>/paab/examples/wake-agent.sh
+
+*/5 * * * * /home/<user>/paab/examples/poll-unread.sh >> /home/<user>/.local/state/paab/poll.log 2>&1
