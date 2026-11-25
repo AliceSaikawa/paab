@@ -202,6 +202,7 @@ export const CHANGE_ACTIONS = [
 	"admin_bot_designated",
 	"admin_bot_cleared",
 	"admin_bot_switches_updated",
+	"change_reverted",
 ] as const;
 export type ChangeAction = (typeof CHANGE_ACTIONS)[number];
 
