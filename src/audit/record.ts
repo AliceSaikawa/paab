@@ -180,22 +180,25 @@ export async function recordAuditEvents(
 	if (events.length === 0) {
 		return true;
 	}
+	let failedFrom = 0;
 	try {
 		const statements = events.map((event) =>
 			insertAuditLogEntry(db, buildAuditLogEntry(config, event)),
 		);
 		for (let i = 0; i < statements.length; i += AUDIT_WRITE_CHUNK) {
+			failedFrom = i;
 			await db.batch(statements.slice(i, i + AUDIT_WRITE_CHUNK));
 		}
 		return true;
 	} catch (error) {
+		const unwritten = events.slice(failedFrom);
 		try {
 			console.error("audit log write failed", {
-				eventTypes: events.map((event) => String(event?.eventType)),
-				messageIds: events.map((event) => event?.messageId ?? null),
+				eventTypes: unwritten.map((event) => String(event?.eventType)),
+				messageIds: unwritten.map((event) => event?.messageId ?? null),
 				error: describeFailure(
 					error,
-					events.map((event) => event?.body),
+					unwritten.map((event) => event?.body),
 				),
 			});
 		} catch {

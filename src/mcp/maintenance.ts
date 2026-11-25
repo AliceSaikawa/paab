@@ -16,6 +16,8 @@ export async function runScheduledMaintenance(
 ): Promise<void> {
 	const db = env.DB;
 	const audit = auditBodyConfig(env);
+	const errors: unknown[] = [];
+
 	try {
 		const { expiredQuestions } = await runInboxMaintenance(db, now);
 		await recordAuditEvents(
@@ -30,7 +32,20 @@ export async function runScheduledMaintenance(
 				messageId: question.questionId,
 			})),
 		);
-	} finally {
+	} catch (error) {
+		errors.push(error);
+	}
+
+	try {
 		await purgeExpiredAuditBodies(db, audit, now);
+	} catch (error) {
+		errors.push(error);
+	}
+
+	if (errors.length === 1) {
+		throw errors[0];
+	}
+	if (errors.length > 1) {
+		throw new AggregateError(errors, "scheduled maintenance failed");
 	}
 }

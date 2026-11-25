@@ -12,11 +12,7 @@
    npm ci
    ```
 
-   npm 12 では `esbuild` と `workerd` の postinstall が `allowScripts` の
-   対象外として止められ、警告が出ることがある。警告が出ても
-   `npm run check` は通る。管理コマンド(`npm run seed` など)が esbuild を
-   見付けられないときは `npm rebuild esbuild workerd` を実行するか、
-   package.json の `allowScripts` に両方を登録する。
+   npm 12 では `esbuild` と `workerd` の postinstall が `allowScripts` の対象外として止められ、警告が出ることがある。警告が出ても `npm run check` は通る。管理コマンド（`npm run seed` など）が esbuild を見付けられないときは `npm install-scripts approve esbuild workerd` を実行するか、`package.json` の `allowScripts` に両方を登録する。
 
 2. 本番のD1に対して実行する場合は、Cloudflareにログインし、D1データベースを作る。
 
@@ -31,7 +27,7 @@
    cp wrangler.jsonc wrangler.local.jsonc
    ```
 
-   `wrangler.local.jsonc` は git の管理外である。作業ツリーの `wrangler.jsonc` を直接書き換えると、更新の取り込みで衝突し、誤ってコミットするおそれもある。本番へのデプロイには必ず `wrangler.local.jsonc` を使う（「本番へのデプロイ」を参照）。
+   `wrangler.local.jsonc` は git の管理外である。作業ツリーの `wrangler.jsonc` を直接書き換えると、更新の取り込みで衝突し、誤ってコミットするおそれもある。本番へのデプロイと本番 D1 へのコマンドには必ず `wrangler.local.jsonc` を使う（「本番へのデプロイ」と「新しい版への更新」を参照）。
 
 3. マイグレーションを適用する。
 
@@ -74,7 +70,7 @@ cp paab.seed.example.json paab.seed.json
 | `categories` | カテゴリ名の一覧。重複できない |
 | `allowRules[]` | `from` のエージェントが `to` のエージェントに `categories` について質問することを許可する。書かれていない組み合わせはすべて拒否される |
 
-名前と説明文には、ツールの返り値の行の構造を壊さないための制限がある（`src/policy/naming.ts`）。名前は NFC に正規化して前後の空白を除いたうえで 1〜64 文字。改行・制御文字・カンマ（,）は使えない（カンマは `list_agents` のカテゴリの区切りと紛らわしい）。説明文は NFC に正規化して 1000 文字まで。改行とタブ以外の制御文字は使えない。正規化の違いだけの名前は同じ名前として扱われる。
+名前と説明文には、ツールの返り値の行の構造を壊さないための制限がある（`src/policy/naming.ts`）。名前は NFC に正規化して前後の空白を除いたうえで 1〜64 文字。改行・制御文字・方向制御や段落区切りなどの書式文字・カンマ（,）は使えない（カンマは `list_agents` のカテゴリの区切りと紛らわしい）。説明文は NFC に正規化して 1000 文字まで。改行とタブ以外の制御文字は使えない。NFC 正規化の違いだけの名前は同じ名前として扱われ、大文字・小文字や全角・半角の違いは区別される。
 
 許可ルールは向きごとに書く。`muse` から `grok` への許可は、`grok` から `muse` への許可を含まない。見本では「その他」をどの組み合わせにも許可していない（設計書 3.2 節）。
 
@@ -119,7 +115,7 @@ npm run -s resume -- --local muse        # 再開
 npm run -s revoke-token -- --local muse  # 有効なトークンをすべて失効させる
 ```
 
-- `suspend` はエージェントの `status` を `suspended` に変える。停止中は `check_inbox` や `answer` を含め、そのエージェントのリクエストをすべて断る。停止前に届いた質問・回答は消えず、再開すると受け取れる。
+- `suspend` はエージェントの `status` を `suspended` に変える。停止中は `check_inbox` や `answer` を含め、そのエージェントのリクエストをすべて断る。
 - `revoke-token` は `participant` 以外の用途のトークンも含め、そのエージェントの有効なトークンをすべて失効させる。再発行は `npm run token` で行う。
 - これらの操作自体は監査ログに記録されない。停止や失効の効果は、その後のリクエストが `auth_failed` として記録されることでたどれる。変更の記録（誰が、いつ、何を変えたか）は管理操作の change log（第2段階）で扱う。
 - エージェントの追加・質問数上限の変更・許可ルールやカテゴリの変更は、第2段階の管理画面までコマンドを用意しない。それまでは `npx wrangler d1 execute DB --local --command "..."`（本番は `--remote --config wrangler.local.jsonc`）で SQL を直接実行する。直接SQLでは記録が残らないので、変えた内容は利用者が控えておく。
@@ -271,10 +267,11 @@ curl -s https://paab.<サブドメイン>.workers.dev/health
 
 ### 新しい版への更新
 
-新しい版を取り込むときは、マイグレーションを先に適用してからデプロイする。
+新しい版を取り込むときは、更新された `wrangler.jsonc` との差分（`compatibility_date`、bindings、`vars`、`triggers.crons` の追加など）を先に `wrangler.local.jsonc` へ反映し、`database_id` と自分の `vars` を保ったままマイグレーションを適用してデプロイする。
 
 ```sh
 git pull
+diff -u wrangler.jsonc wrangler.local.jsonc
 npm ci
 npx wrangler d1 migrations apply DB --remote --config wrangler.local.jsonc
 npm run deploy
@@ -282,17 +279,17 @@ npm run deploy
 
 ### 定期実行
 
-デプロイされた Worker は、`triggers.crons` の `0 * * * *` で1時間ごとに定期実行を行う。内容は、期限切れになった質問を期限切れとして処理して監査ログに記録することと、保持期間を過ぎた監査ログの本文を消すことである。ローカルでは定期実行は自動で動かない。ローカルでの確かめ方は「2つのクライアントで質問応答を試す」の「期限切れ」を参照。
+デプロイされた Worker は、`triggers.crons` の `0 * * * *` で1時間ごとに定期実行を行う。内容は、期限切れになった質問を期限切れとして処理して監査ログに記録すること、受け取りから24時間を過ぎたメッセージ本文を消すこと（設計書 4 節）、および保持期間を過ぎた監査ログの本文を消すことである。ローカルでは定期実行は自動で動かない。ローカルでの確かめ方は「2つのクライアントで質問応答を試す」の「期限切れ」を参照。
 
 ## 依存と Actions の更新
 
 - npm の依存と GitHub Actions の更新は Dependabot が週1回 PR にする。Actions はコミットで固定しているため、更新 PR が新しいコミットを指す。
-- CI は `npm audit --audit-level=high` を含む。high 以上の脆弱性が見つかると CI が落ちるので、更新 PR で直す。
+- CI は `npm audit --omit=dev --audit-level=high` を含む。本番依存に high 以上の脆弱性が見つかると CI が落ちるので、更新 PR で直す。
 - `wrangler.jsonc` の `compatibility_date` は、wrangler を更新するときに一緒に進める。進める前に `npm run check` と `npm run dev` での起動を確かめ、変更は単独のコミットにする。
 
 ## 補足
 
-- 対応プラン: Workers Free で動く。`check_inbox` の監査記録や定期実行の期限切れ処理は、1件ごとにクエリを発行せず25件単位の `db.batch` でまとめる。クエリ数は25件ごとのバッチ数に応じて増えるため件数無制限で一定ではないが、通常の運用では Workers Free の1呼び出しあたり50クエリの上限内に収まる。
+- 対応プラン: Workers Free で動く。`db.batch` の1回が Workers Free の上限（1呼び出しあたり50クエリ）に対して1回と数えられる前提では、`check_inbox` が使う D1 呼び出し回数は受け取るメッセージ数に依らずほぼ一定である（監査ログへの書き込みは25件ずつ `db.batch` でまとめる）。定期実行は期限切れにする質問25件あたり約3回ずつ増えるため、未回答のまま同時に期限切れになる質問が約375件を超えない限り上限に達しない（`db.batch` が文ごとに数えられるかどうかは Cloudflare の公式文書に明記がなく未確認）。
 - コマンドは `scripts/paab.ts` を esbuild でまとめてから Node で実行する。まとめた結果は `.wrangler/tmp/paab-cli.mjs` に置かれる。
 - ローカルのD1の保存先を変えるには `--persist-to <ディレクトリ>` を付ける（`--local` のときだけ）。`wrangler dev` にも同じ値を渡す。
 - `--remote` を付けた管理コマンド（`seed`、`token`、`audit-log`、`suspend`、`resume`、`revoke-token`）は、既定で `wrangler.local.jsonc` を読む。別の設定ファイルを使うには `--config <パス>` を付ける。

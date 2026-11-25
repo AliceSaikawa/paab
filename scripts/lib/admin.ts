@@ -27,27 +27,32 @@ async function agentByName(db: D1Client, agentName: string): Promise<AgentRow> {
 }
 
 /**
- * Sets the agent's status. Returns false when the agent already had it, so
- * the caller can say that nothing changed.
+ * Sets the agent's status atomically. Returns false when the agent already
+ * had it, so the caller can say that nothing changed.
  */
 export async function setAgentStatus(
 	db: D1Client,
 	agentName: string,
 	status: "active" | "suspended",
 ): Promise<boolean> {
-	const agent = await agentByName(db, agentName);
-	if (agent.status === status) {
-		return false;
+	const updated = await db.query(
+		sql(
+			"UPDATE agents SET status = ? WHERE name = ? AND status <> ? RETURNING id",
+			status,
+			agentName,
+			status,
+		),
+	);
+	if (updated.length > 0) {
+		return true;
 	}
-	await db.execute([
-		sql("UPDATE agents SET status = ? WHERE id = ?", status, agent.id),
-	]);
-	return true;
+	await agentByName(db, agentName);
+	return false;
 }
 
 /**
- * Revokes every valid token of the agent, of every purpose. Returns how
- * many tokens were revoked.
+ * Revokes every valid token of the agent atomically across all purposes.
+ * Returns how many tokens were revoked.
  */
 export async function revokeAgentTokens(
 	db: D1Client,
@@ -55,22 +60,12 @@ export async function revokeAgentTokens(
 	now: UnixMillis,
 ): Promise<number> {
 	const agent = await agentByName(db, agentName);
-	const [row] = await db.query(
+	const rows = await db.query(
 		sql(
-			"SELECT count(*) AS n FROM tokens WHERE agent_id = ? AND revoked_at IS NULL",
-			agent.id,
-		),
-	);
-	const count = Number(row?.n ?? 0);
-	if (count === 0) {
-		return 0;
-	}
-	await db.execute([
-		sql(
-			"UPDATE tokens SET revoked_at = ? WHERE agent_id = ? AND revoked_at IS NULL",
+			"UPDATE tokens SET revoked_at = ? WHERE agent_id = ? AND revoked_at IS NULL RETURNING id",
 			now,
 			agent.id,
 		),
-	]);
-	return count;
+	);
+	return rows.length;
 }

@@ -9,7 +9,7 @@ export type Row = Record<string, unknown>;
  * as one unit that rolls back on failure.
  */
 export interface D1Client {
-	/** Runs one read-only statement and returns its rows. */
+	/** Runs one statement and returns its rows. */
 	query(statement: string): Promise<Row[]>;
 	/** Runs the statements as one transaction. */
 	execute(statements: string[]): Promise<void>;

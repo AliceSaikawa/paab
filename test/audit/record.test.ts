@@ -233,6 +233,40 @@ describe("recordAuditEvent", () => {
 			expect(await storedRows()).toEqual([]);
 			expect(error).toHaveBeenCalledTimes(1);
 		});
+
+		it("reports only unwritten chunks when a later chunk fails", async () => {
+			const error = vi.spyOn(console, "error").mockImplementation(() => {});
+			const realBatch = db.batch.bind(db);
+			let calls = 0;
+			vi.spyOn(db, "batch").mockImplementation(async (statements) => {
+				calls += 1;
+				if (calls === 2) {
+					throw new Error("chunk 2 down: secret tail");
+				}
+				return realBatch(statements);
+			});
+
+			const events: AuditEvent[] = Array.from(
+				{ length: AUDIT_WRITE_CHUNK + 2 },
+				(_, i) => ({
+					...question,
+					occurredAt: T0 + i,
+					eventType:
+						i < AUDIT_WRITE_CHUNK ? "question_delivered" : "question_expired",
+					messageId: `q${i}`,
+					body: i === AUDIT_WRITE_CHUNK ? "secret tail" : `body-${i}`,
+				}),
+			);
+
+			expect(await recordAuditEvents(db, RECORDING, events)).toBe(false);
+			expect(error).toHaveBeenCalledTimes(1);
+			expect(error.mock.calls[0]?.[1]).toMatchObject({
+				eventTypes: ["question_expired", "question_expired"],
+				messageIds: [`q${AUDIT_WRITE_CHUNK}`, `q${AUDIT_WRITE_CHUNK + 1}`],
+				error: "chunk 2 down: [body]",
+			});
+			expect((await storedRows()).length).toBe(AUDIT_WRITE_CHUNK);
+		});
 	});
 
 	it("leaves the body column empty when recording is on without a retention period", async () => {
