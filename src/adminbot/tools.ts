@@ -4,8 +4,10 @@ import {
 	type AuditLogFilter,
 	type AuditLogView,
 	DEFAULT_AUDIT_QUERY_LIMIT,
+	isBodyRecordingEnabled,
 	MAX_AUDIT_QUERY_LIMIT,
 	queryAuditLog,
+	recordAuditEvents,
 } from "../audit";
 import { type Frame, renderFramed } from "../mcp/frame";
 import {
@@ -193,7 +195,7 @@ function renderLabeledExternalName(
 }
 
 function renderAuditEntry(entry: AuditLogView, frame: Frame): string {
-	return [
+	const lines = [
 		`id: ${entry.id}`,
 		`occurred_at: ${new Date(entry.occurredAt).toISOString()}`,
 		`event_type: ${entry.eventType}`,
@@ -206,13 +208,17 @@ function renderAuditEntry(entry: AuditLogView, frame: Frame): string {
 		renderLabeledExternalName("to_name", entry.toAgentName, frame),
 		`category_id: ${entry.categoryId ?? "-"}`,
 		renderLabeledExternalName("category_name", entry.categoryName, frame),
-	].join("\n");
+	];
+	if (entry.body !== null) {
+		lines.push(renderLabeledExternalName("body", entry.body, frame));
+	}
+	return lines.join("\n");
 }
 
 const viewAuditLog = defineAdminTool({
 	name: "view_audit_log",
 	description:
-		"Read bridge audit log metadata (without message bodies) with optional filters and cursor pagination.",
+		"Read bridge audit log entries with optional filters and cursor pagination. Message bodies are omitted unless include_body is true and body reading permission is enabled.",
 	inputSchema: z.object({
 		since: z
 			.string()
@@ -259,8 +265,21 @@ const viewAuditLog = defineAdminTool({
 			.boolean()
 			.optional()
 			.describe("Return oldest entries first instead of newest first."),
+		include_body: z
+			.boolean()
+			.optional()
+			.describe(
+				"Include stored question/answer bodies when both read_bodies for the admin bot and AUDIT_RECORD_BODIES are enabled (default false).",
+			),
 	}),
 	async run(ctx, args) {
+		if (args.include_body === true && !ctx.config.readBodies) {
+			return adminToolFail(
+				"body reading permission is disabled for the admin bot",
+				{ deniedReason: "permission_denied" },
+			);
+		}
+
 		let occurredFrom: UnixMillis | undefined;
 		if (args.since !== undefined) {
 			const parsed = parseAuditTimestamp(args.since);
@@ -294,6 +313,8 @@ const viewAuditLog = defineAdminTool({
 		);
 		if (!messageIdCheck.ok) return adminToolFail(messageIdCheck.error);
 
+		const includeBody =
+			args.include_body === true && isBodyRecordingEnabled(ctx.audit);
 		const limit = args.limit ?? DEFAULT_AUDIT_QUERY_LIMIT;
 		const order = args.oldest === true ? "asc" : "desc";
 		const baseFilter: AuditLogFilter = {
@@ -307,8 +328,7 @@ const viewAuditLog = defineAdminTool({
 			beforeId: args.before_id,
 			afterId: args.after_id,
 			order,
-			// Body inspection is out of scope for #34 and requires the read_bodies switch.
-			includeBody: false,
+			includeBody,
 		};
 
 		let entries: AuditLogView[];
@@ -336,6 +356,26 @@ const viewAuditLog = defineAdminTool({
 
 		if (entries.length === 0) {
 			return adminToolOk("no matching audit log entries");
+		}
+
+		if (includeBody) {
+			const bodyEntries = entries.filter((entry) => entry.body !== null);
+			if (bodyEntries.length > 0) {
+				await recordAuditEvents(
+					ctx.db,
+					ctx.audit,
+					bodyEntries.map((entry) => ({
+						eventType: "admin_body_read" as const,
+						occurredAt: ctx.now,
+						fromAgentId: ctx.agent.id,
+						toAgentId: entry.toAgentId,
+						categoryId: entry.categoryId,
+						messageId: entry.messageId,
+						// Never echo bodies back into audit_log when recording that they were read.
+						body: null,
+					})),
+				);
+			}
 		}
 
 		const lastEntry = entries.at(-1);
