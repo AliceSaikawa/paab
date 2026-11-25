@@ -24,6 +24,8 @@ import {
 	type MessageRow,
 	messageFromRow,
 	newId,
+	type ProposalRow,
+	proposalFromRow,
 	type TokenRow,
 	tokenFromRow,
 } from "../../src/db";
@@ -109,6 +111,7 @@ describe("test database helper", () => {
 			"categories",
 			"change_log",
 			"messages",
+			"proposals",
 			"tokens",
 		]);
 		for (const table of tables) {
@@ -673,6 +676,7 @@ describe("migrations", () => {
 
 	it("preserves all existing tables when migrating a populated database from 0002 to 0003 and enforces change_log constraints", async () => {
 		await db.batch([
+			db.prepare("DROP TABLE IF EXISTS proposals"),
 			db.prepare("DROP TABLE IF EXISTS admin_bot_config"),
 			db.prepare("DROP TABLE IF EXISTS change_log"),
 			db.prepare("DROP TABLE IF EXISTS audit_log"),
@@ -826,6 +830,7 @@ describe("migrations", () => {
 
 	it("preserves all existing tables when migrating a populated database from 0003 to 0004 and enforces admin_bot_config constraints", async () => {
 		await db.batch([
+			db.prepare("DROP TABLE IF EXISTS proposals"),
 			db.prepare("DROP TABLE IF EXISTS admin_bot_config"),
 			db.prepare("DROP TABLE IF EXISTS change_log"),
 			db.prepare("DROP TABLE IF EXISTS audit_log"),
@@ -993,6 +998,208 @@ describe("migrations", () => {
 				.run(),
 		).rejects.toThrow(/FOREIGN KEY/);
 	});
+
+	it("preserves all existing tables when migrating a populated database from 0004 to 0005 and enforces proposals constraints", async () => {
+		await db.batch([
+			db.prepare("DROP TABLE IF EXISTS proposals"),
+			db.prepare("DROP TABLE IF EXISTS admin_bot_config"),
+			db.prepare("DROP TABLE IF EXISTS change_log"),
+			db.prepare("DROP TABLE IF EXISTS audit_log"),
+			db.prepare("DROP TABLE IF EXISTS messages"),
+			db.prepare("DROP TABLE IF EXISTS allow_rules"),
+			db.prepare("DROP TABLE IF EXISTS tokens"),
+			db.prepare("DROP TABLE IF EXISTS categories"),
+			db.prepare("DROP TABLE IF EXISTS agents"),
+			db.prepare("DROP TABLE IF EXISTS d1_migrations"),
+		]);
+
+		const m1 = migration("0001_initial_schema.sql");
+		const m2 = migration("0002_cascade_message_references.sql");
+		const m3 = migration("0003_change_log.sql");
+		const m4 = migration("0004_admin_bot.sql");
+		const m5 = migration("0005_proposals.sql");
+		await applyD1Migrations(db, [m1, m2, m3, m4]);
+
+		const a = await seedAgent(db, { name: "a" });
+		const b = await seedAgent(db, { name: "b" });
+		const category = await seedCategory(db, { name: "schedule" });
+		const rule: AllowRule = {
+			fromAgentId: a.id,
+			toAgentId: b.id,
+			categoryId: category.id,
+			createdAt: T0,
+		};
+		const tok: Token = {
+			id: newId(),
+			agentId: a.id,
+			tokenHash: `hash-${newId()}`,
+			purpose: "participant",
+			createdAt: T0,
+			revokedAt: null,
+		};
+		const msg = question(a, b, category.id);
+		const audit: NewAuditLogEntry = {
+			occurredAt: T0,
+			eventType: "question_accepted",
+			fromAgentId: a.id,
+			toAgentId: b.id,
+			categoryId: category.id,
+			outcome: "ok",
+			reasonCode: null,
+			messageId: msg.id,
+			body: null,
+		};
+		const change: NewChangeLogEntry = {
+			occurredAt: T0,
+			actorType: "owner",
+			actorId: "me",
+			approverId: null,
+			action: "agent_registered",
+			targetType: "agent",
+			targetId: a.id,
+			beforeJson: null,
+			afterJson: JSON.stringify(a),
+			revertedAt: null,
+		};
+		await db.batch([
+			insertAllowRule(db, rule),
+			insertToken(db, tok),
+			insertMessage(db, msg),
+			insertAuditLogEntry(db, audit),
+			insertChangeLogEntry(db, change),
+			db
+				.prepare(
+					`INSERT INTO admin_bot_config (id, agent_id, read_bodies, superadmin_until, updated_at)
+					VALUES (1, ?, 0, NULL, ?)`,
+				)
+				.bind(a.id, T0),
+		]);
+
+		await applyD1Migrations(db, [m1, m2, m3, m4, m5]);
+
+		const fkViolations = await db.prepare("PRAGMA foreign_key_check").all();
+		expect(fkViolations.results).toEqual([]);
+
+		expect(
+			(
+				await db.prepare("SELECT * FROM agents ORDER BY name").all<AgentRow>()
+			).results.map(agentFromRow),
+		).toEqual([a, b]);
+		expect(
+			(
+				await db.prepare("SELECT * FROM categories").all<CategoryRow>()
+			).results.map(categoryFromRow),
+		).toEqual([category]);
+		expect(
+			(
+				await db.prepare("SELECT * FROM allow_rules").all<AllowRuleRow>()
+			).results.map(allowRuleFromRow),
+		).toEqual([rule]);
+		expect(
+			(await db.prepare("SELECT * FROM tokens").all<TokenRow>()).results.map(
+				tokenFromRow,
+			),
+		).toEqual([tok]);
+		expect(
+			(
+				await db.prepare("SELECT * FROM messages").all<MessageRow>()
+			).results.map(messageFromRow),
+		).toEqual([msg]);
+		const auditRows = (
+			await db.prepare("SELECT * FROM audit_log").all<AuditLogRow>()
+		).results.map(auditLogEntryFromRow);
+		expect(auditRows.map(({ id: _id, ...rest }) => rest)).toEqual([audit]);
+		const changeRows = (
+			await db.prepare("SELECT * FROM change_log").all<ChangeLogRow>()
+		).results.map(changeLogEntryFromRow);
+		expect(changeRows.map(({ id: _id, ...rest }) => rest)).toEqual([change]);
+		const configRow = await db
+			.prepare("SELECT * FROM admin_bot_config WHERE id = 1")
+			.first<AdminBotConfigRow>();
+		expect(configRow && adminBotConfigFromRow(configRow)).toEqual({
+			agentId: a.id,
+			readBodies: false,
+			superadminUntil: null,
+			updatedAt: T0,
+		});
+
+		const proposalId = newId();
+		await db
+			.prepare(
+				`INSERT INTO proposals
+					(id, bot_agent_id, kind, payload_json, reason, status, created_at, expires_at, resolved_at, resolved_by)
+				VALUES (?, ?, 'create_category', '{"name":"hobby"}', 'needed', 'pending', ?, ?, NULL, NULL)`,
+			)
+			.bind(proposalId, a.id, T0, T0 + 14 * DAY_MS)
+			.run();
+
+		const proposalRow = await db
+			.prepare("SELECT * FROM proposals WHERE id = ?")
+			.bind(proposalId)
+			.first<ProposalRow>();
+		expect(proposalRow && proposalFromRow(proposalRow)).toEqual({
+			id: proposalId,
+			botAgentId: a.id,
+			kind: "create_category",
+			payloadJson: '{"name":"hobby"}',
+			reason: "needed",
+			status: "pending",
+			createdAt: T0,
+			expiresAt: T0 + 14 * DAY_MS,
+			resolvedAt: null,
+			resolvedBy: null,
+		});
+
+		await expect(
+			db
+				.prepare(
+					`INSERT INTO proposals
+						(id, bot_agent_id, kind, payload_json, reason, status, created_at, expires_at)
+					VALUES (?, ?, 'delete_agent', '{}', 'bad', 'pending', ?, ?)`,
+				)
+				.bind(newId(), a.id, T0, T0 + DAY_MS)
+				.run(),
+		).rejects.toThrow(/CHECK/);
+
+		await expect(
+			db
+				.prepare(
+					`INSERT INTO proposals
+						(id, bot_agent_id, kind, payload_json, reason, status, created_at, expires_at)
+					VALUES (?, ?, 'create_category', '{}', 'bad', 'cancelled', ?, ?)`,
+				)
+				.bind(newId(), a.id, T0, T0 + DAY_MS)
+				.run(),
+		).rejects.toThrow(/CHECK/);
+
+		await expect(
+			db
+				.prepare(
+					`INSERT INTO proposals
+						(id, bot_agent_id, kind, payload_json, reason, status, created_at, expires_at)
+					VALUES (?, ?, 'create_category', '{}', 'bad', 'pending', 'not-int', ?)`,
+				)
+				.bind(newId(), a.id, T0 + DAY_MS)
+				.run(),
+		).rejects.toThrow(/STRICT|datatype/i);
+
+		await expect(
+			db
+				.prepare(
+					`INSERT INTO proposals
+						(id, bot_agent_id, kind, payload_json, reason, status, created_at, expires_at)
+					VALUES (?, ?, 'create_category', '{}', 'bad', 'pending', ?, ?)`,
+				)
+				.bind(newId(), newId(), T0, T0 + DAY_MS)
+				.run(),
+		).rejects.toThrow(/FOREIGN KEY/);
+
+		await db.prepare("DELETE FROM agents WHERE id = ?").bind(a.id).run();
+		const remainingProposals = await db
+			.prepare("SELECT COUNT(*) AS n FROM proposals")
+			.first<{ n: number }>();
+		expect(remainingProposals?.n).toBe(0);
+	});
 });
 
 describe("row conversion", () => {
@@ -1039,6 +1246,38 @@ describe("row conversion", () => {
 			}),
 		).toThrow(/admin_bot_config\.read_bodies/);
 	});
+
+	it("throws on unknown proposals.kind or proposals.status values", () => {
+		expect(() =>
+			proposalFromRow({
+				id: "p1",
+				bot_agent_id: "a1",
+				kind: "unknown_kind",
+				payload_json: "{}",
+				reason: "because",
+				status: "pending",
+				created_at: T0,
+				expires_at: T0 + DAY_MS,
+				resolved_at: null,
+				resolved_by: null,
+			}),
+		).toThrow(/proposals\.kind/);
+
+		expect(() =>
+			proposalFromRow({
+				id: "p1",
+				bot_agent_id: "a1",
+				kind: "create_category",
+				payload_json: "{}",
+				reason: "because",
+				status: "unknown_status",
+				created_at: T0,
+				expires_at: T0 + DAY_MS,
+				resolved_at: null,
+				resolved_by: null,
+			}),
+		).toThrow(/proposals\.status/);
+	});
 });
 
 describe("migration 0002 on populated data", () => {
@@ -1047,6 +1286,7 @@ describe("migration 0002 on populated data", () => {
 		const m0002 = migrationByName("0002_cascade_message_references.sql");
 
 		for (const table of [
+			"proposals",
 			"admin_bot_config",
 			"change_log",
 			"audit_log",

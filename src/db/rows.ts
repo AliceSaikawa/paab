@@ -14,6 +14,9 @@ import {
 	MESSAGE_KINDS,
 	MESSAGE_STATUSES,
 	type Message,
+	PROPOSAL_KINDS,
+	PROPOSAL_STATUSES,
+	type Proposal,
 	REASON_CODES,
 	TOKEN_PURPOSES,
 	type Token,
@@ -108,6 +111,19 @@ export interface AdminBotConfigRow {
 	read_bodies: number;
 	superadmin_until: number | null;
 	updated_at: number;
+}
+
+export interface ProposalRow {
+	id: string;
+	bot_agent_id: string;
+	kind: string;
+	payload_json: string;
+	reason: string;
+	status: string;
+	created_at: number;
+	expires_at: number;
+	resolved_at: number | null;
+	resolved_by: string | null;
 }
 
 /** Narrows a stored string to one of the known values, or throws. */
@@ -236,5 +252,20 @@ export function adminBotConfigFromRow(row: AdminBotConfigRow): AdminBotConfig {
 		readBodies: row.read_bodies === 1,
 		superadminUntil: row.superadmin_until,
 		updatedAt: row.updated_at,
+	};
+}
+
+export function proposalFromRow(row: ProposalRow): Proposal {
+	return {
+		id: row.id,
+		botAgentId: row.bot_agent_id,
+		kind: oneOf(PROPOSAL_KINDS, row.kind, "proposals.kind"),
+		payloadJson: row.payload_json,
+		reason: row.reason,
+		status: oneOf(PROPOSAL_STATUSES, row.status, "proposals.status"),
+		createdAt: row.created_at,
+		expiresAt: row.expires_at,
+		resolvedAt: row.resolved_at,
+		resolvedBy: row.resolved_by,
 	};
 }
