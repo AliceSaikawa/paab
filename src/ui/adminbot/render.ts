@@ -4,7 +4,7 @@ import {
 	isUndoableChangeAction,
 } from "../../admin";
 import type { AdminBotConfig } from "../../adminbot";
-import type { ChangeLogEntry } from "../../types";
+import type { ChangeLogEntry, UnixMillis } from "../../types";
 import { csrfInput } from "../csrf";
 import { html, rawHtml, type SafeHtml } from "../html";
 import { formatTimestamp } from "../layout";
@@ -23,6 +23,15 @@ export interface AdminBotPageView {
 	changes: readonly ChangeLogEntry[];
 	csrfToken: string;
 	adminMcpUrl: string;
+	bodyRecordingEnabled: boolean;
+	now: UnixMillis;
+}
+
+export interface ReadBodiesConfirmView {
+	agentName: string;
+	csrfToken: string;
+	superadminUntil: UnixMillis;
+	bodyRecordingEnabled: boolean;
 }
 
 export interface IssuedAdminTokenView {
@@ -89,6 +98,55 @@ function renderAdminTokenSection(
 	`;
 }
 
+export function activeSuperadminUntil(
+	config: AdminBotConfig,
+	now: UnixMillis,
+): UnixMillis | null {
+	return config.superadminUntil !== null && config.superadminUntil > now
+		? config.superadminUntil
+		: null;
+}
+
+function renderBodyRecordingNotice(
+	bodyRecordingEnabled: boolean,
+): SafeHtml | false {
+	if (bodyRecordingEnabled) {
+		return false;
+	}
+	return html`
+		<div class="banner banner-info" role="note">
+			監査ログへの本文記録（<code>AUDIT_RECORD_BODIES</code>）が現在オフ（または保持日数未設定）のため、本文閲覧を有効にしても読み取れる本文は保存されていません。
+		</div>
+	`;
+}
+
+function renderPermissionsSection(view: AdminBotPageView): SafeHtml {
+	const { config, bodyRecordingEnabled, csrfToken, now } = view;
+	const nextEnabled = config.readBodies ? "0" : "1";
+	const buttonLabel = config.readBodies ? "オフにする" : "オンにする";
+	const buttonClass = config.readBodies ? "btn" : "btn btn-primary";
+	const superadminActive = activeSuperadminUntil(config, now) !== null;
+
+	return html`
+		<div class="stack">
+			<div class="actions">
+				<strong>本文閲覧:</strong>
+				<span class="${config.readBodies ? "badge badge-ok" : "badge"}">${config.readBodies ? "オン" : "オフ"}</span>
+				<form class="inline-form" method="POST" action="/admin/adminbot/read-bodies">
+					${csrfInput(csrfToken)}
+					<input type="hidden" name="enabled" value="${nextEnabled}">
+					<button type="submit" class="${buttonClass}">${buttonLabel}</button>
+				</form>
+				<span class="muted">質問文や回答文に個人情報が含まれる可能性があるため、調査が必要な間だけ有効にしてください。</span>
+			</div>
+			${renderBodyRecordingNotice(bodyRecordingEnabled)}
+			<div class="muted">
+				最高管理者権限: <strong>${superadminActive ? "有効" : "オフ"}</strong>
+			</div>
+		</div>
+	`;
+}
+
 function renderCurrentSection(view: AdminBotPageView): SafeHtml {
 	const { config, designated, csrfToken, adminMcpUrl } = view;
 
@@ -102,6 +160,7 @@ function renderCurrentSection(view: AdminBotPageView): SafeHtml {
 				<p class="muted">
 					管理者ボットはまだ指名されていません。下のフォームから登録済みエージェントを 1 体だけ指名してください。
 				</p>
+				${renderBodyRecordingNotice(view.bodyRecordingEnabled)}
 			</section>
 		`;
 	}
@@ -133,9 +192,7 @@ function renderCurrentSection(view: AdminBotPageView): SafeHtml {
 			<div class="muted">
 				管理者用 MCP 接続先: <code>${adminMcpUrl}</code>
 			</div>
-			<div class="muted">
-				任意の権限（既定はオフ）: 本文閲覧 <strong>${config.readBodies ? "オン" : "オフ"}</strong> / 最高管理者権限 <strong>${config.superadminUntil !== null ? "有効" : "オフ"}</strong>
-			</div>
+			${renderPermissionsSection(view)}
 
 			${renderAdminTokenSection(designated, csrfToken)}
 
@@ -331,6 +388,40 @@ export function renderIssuedAdminTokenBody(
 				<div class="actions">
 					<a class="btn btn-primary" href="/admin/adminbot">管理者ボット設定へ戻る</a>
 				</div>
+			</section>
+		</div>
+	`;
+}
+
+/**
+ * Renders the 1-step confirmation screen when enabling `read_bodies` while
+ * `superadmin` is active (design 5.3).
+ */
+export function renderReadBodiesConfirmBody(
+	view: ReadBodiesConfirmView,
+): SafeHtml {
+	return html`
+		<div class="stack">
+			<div>
+				<h1>本文閲覧の有効化確認</h1>
+				<p class="muted">対象エージェント: <strong>${view.agentName}</strong></p>
+			</div>
+
+			<section class="card stack">
+				<div class="banner banner-warning" role="alert">
+					現在、最高管理者権限（有効期限: ${formatTimestamp(view.superadminUntil)}）が有効です。本文閲覧を同時にオンにすると、外部から届いた質問文・回答文の内容を読んだ管理者ボットが単独で設定変更を行える状態になります。
+				</div>
+				<p class="muted">
+					質問文や回答文に個人情報が含まれる可能性があるため、調査が必要な間だけ有効にしてください。
+				</p>
+				${renderBodyRecordingNotice(view.bodyRecordingEnabled)}
+				<form method="POST" action="/admin/adminbot/read-bodies" class="actions">
+					${csrfInput(view.csrfToken)}
+					<input type="hidden" name="enabled" value="1">
+					<input type="hidden" name="confirm" value="1">
+					<button type="submit" class="btn btn-primary">理解したうえでオンにする</button>
+					<a class="btn" href="/admin/adminbot">キャンセル</a>
+				</form>
 			</section>
 		</div>
 	`;

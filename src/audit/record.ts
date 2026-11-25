@@ -63,6 +63,7 @@ const OUTCOMES: Record<AuditEventType, AuditOutcome> = {
 	admin_tool_called: "ok",
 	admin_tool_denied: "denied",
 	description_submitted: "ok",
+	admin_body_read: "ok",
 };
 
 /** The outcome an event type is recorded with. */

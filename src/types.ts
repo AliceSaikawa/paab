@@ -77,6 +77,7 @@ export const AUDIT_EVENT_TYPES = [
 	"admin_tool_called",
 	"admin_tool_denied",
 	"description_submitted",
+	"admin_body_read",
 ] as const;
 export type AuditEventType = (typeof AUDIT_EVENT_TYPES)[number];
 
