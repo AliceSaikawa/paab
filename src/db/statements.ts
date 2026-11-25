@@ -4,6 +4,7 @@ import type {
 	Category,
 	Message,
 	NewAuditLogEntry,
+	NewChangeLogEntry,
 	Token,
 } from "../types";
 
@@ -119,5 +120,31 @@ export function insertAuditLogEntry(
 			entry.reasonCode,
 			entry.messageId,
 			entry.body,
+		);
+}
+
+/** The database assigns the ID; read it from `meta.last_row_id`. */
+export function insertChangeLogEntry(
+	db: D1Database,
+	entry: NewChangeLogEntry,
+): D1PreparedStatement {
+	return db
+		.prepare(
+			`INSERT INTO change_log
+				(occurred_at, actor_type, actor_id, approver_id, action,
+				target_type, target_id, before_json, after_json, reverted_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		)
+		.bind(
+			entry.occurredAt,
+			entry.actorType,
+			entry.actorId,
+			entry.approverId,
+			entry.action,
+			entry.targetType,
+			entry.targetId,
+			entry.beforeJson,
+			entry.afterJson,
+			entry.revertedAt,
 		);
 }

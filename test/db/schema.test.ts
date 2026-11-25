@@ -8,12 +8,15 @@ import {
 	allowRuleFromRow,
 	auditLogEntryFromRow,
 	type CategoryRow,
+	type ChangeLogRow,
 	categoryFromRow,
+	changeLogEntryFromRow,
 	getDb,
 	insertAgent,
 	insertAllowRule,
 	insertAuditLogEntry,
 	insertCategory,
+	insertChangeLogEntry,
 	insertMessage,
 	insertToken,
 	type MessageRow,
@@ -27,6 +30,7 @@ import type {
 	AllowRule,
 	Message,
 	NewAuditLogEntry,
+	NewChangeLogEntry,
 	Token,
 } from "../../src/types";
 import { createTestDb } from "../helpers/db";
@@ -100,6 +104,7 @@ describe("test database helper", () => {
 			"allow_rules",
 			"audit_log",
 			"categories",
+			"change_log",
 			"messages",
 			"tokens",
 		]);
@@ -484,6 +489,80 @@ describe("audit_log", () => {
 	});
 });
 
+describe("change_log", () => {
+	function entry(
+		overrides: Partial<NewChangeLogEntry> = {},
+	): NewChangeLogEntry {
+		return {
+			occurredAt: T0,
+			actorType: "owner",
+			actorId: "me",
+			approverId: null,
+			action: "agent_registered",
+			targetType: "agent",
+			targetId: "agent-1",
+			beforeJson: null,
+			afterJson: '{"name":"muse"}',
+			revertedAt: null,
+			...overrides,
+		};
+	}
+
+	it("stores and returns entries newest first using the time index", async () => {
+		const first = await insertChangeLogEntry(db, entry()).run();
+		await db.batch([
+			insertChangeLogEntry(
+				db,
+				entry({
+					occurredAt: T0,
+					actorType: "admin_bot",
+					actorId: "bot-1",
+					approverId: "me",
+					action: "allow_rule_granted",
+					targetType: "allow_rule",
+					targetId: "a:b:c",
+					revertedAt: T0 + 10,
+				}),
+			),
+			insertChangeLogEntry(
+				db,
+				entry({
+					occurredAt: T0 + 1,
+					action: "category_created",
+					targetType: "category",
+					targetId: "cat-1",
+				}),
+			),
+		]);
+
+		const sql =
+			"SELECT * FROM change_log ORDER BY occurred_at DESC, id DESC LIMIT 10";
+		const { results } = await db.prepare(sql).all<ChangeLogRow>();
+		const entries = results.map(changeLogEntryFromRow);
+		expect(entries).toHaveLength(3);
+		expect(entries[0]?.action).toBe("category_created");
+		expect(entries[1]?.actorType).toBe("admin_bot");
+		expect(entries[1]?.approverId).toBe("me");
+		expect(entries[1]?.revertedAt).toBe(T0 + 10);
+		expect(entries[2]?.id).toBe(first.meta.last_row_id);
+		expect(await queryPlan(sql)).toContain("change_log_occurred_at_idx");
+	});
+
+	it("uses the target index when querying by target_type and target_id", async () => {
+		await insertChangeLogEntry(db, entry({ targetId: "agent-a" })).run();
+		const sql =
+			"SELECT * FROM change_log WHERE target_type = ? AND target_id = ? ORDER BY id DESC";
+		const { results } = await db
+			.prepare(sql)
+			.bind("agent", "agent-a")
+			.all<ChangeLogRow>();
+		expect(results).toHaveLength(1);
+		expect(await queryPlan(sql, "agent", "agent-a")).toContain(
+			"change_log_target_idx",
+		);
+	});
+});
+
 describe("deletion", () => {
 	let a: Agent;
 	let b: Agent;
@@ -611,6 +690,7 @@ describe("migrations", () => {
 
 	it("preserves questions and replies when migrating a populated database to 0002", async () => {
 		await db.batch([
+			db.prepare("DROP TABLE IF EXISTS change_log"),
 			db.prepare("DROP TABLE IF EXISTS audit_log"),
 			db.prepare("DROP TABLE IF EXISTS messages"),
 			db.prepare("DROP TABLE IF EXISTS allow_rules"),
@@ -685,6 +765,158 @@ describe("migrations", () => {
 			.first<{ n: number }>();
 		expect(afterCategoryDelete?.n).toBe(0);
 	});
+
+	it("preserves all existing tables when migrating a populated database from 0002 to 0003 and enforces change_log constraints", async () => {
+		await db.batch([
+			db.prepare("DROP TABLE IF EXISTS change_log"),
+			db.prepare("DROP TABLE IF EXISTS audit_log"),
+			db.prepare("DROP TABLE IF EXISTS messages"),
+			db.prepare("DROP TABLE IF EXISTS allow_rules"),
+			db.prepare("DROP TABLE IF EXISTS tokens"),
+			db.prepare("DROP TABLE IF EXISTS categories"),
+			db.prepare("DROP TABLE IF EXISTS agents"),
+			db.prepare("DROP TABLE IF EXISTS d1_migrations"),
+		]);
+
+		const m1 = migration("0001_initial_schema.sql");
+		const m2 = migration("0002_cascade_message_references.sql");
+		const m3 = migration("0003_change_log.sql");
+		await applyD1Migrations(db, [m1, m2]);
+
+		const a = await seedAgent(db, { name: "a" });
+		const b = await seedAgent(db, { name: "b" });
+		const category = await seedCategory(db, { name: "schedule" });
+		const rule: AllowRule = {
+			fromAgentId: a.id,
+			toAgentId: b.id,
+			categoryId: category.id,
+			createdAt: T0,
+		};
+		const tok: Token = {
+			id: newId(),
+			agentId: a.id,
+			tokenHash: `hash-${newId()}`,
+			purpose: "participant",
+			createdAt: T0,
+			revokedAt: null,
+		};
+		const msg = question(a, b, category.id);
+		const audit: NewAuditLogEntry = {
+			occurredAt: T0,
+			eventType: "question_accepted",
+			fromAgentId: a.id,
+			toAgentId: b.id,
+			categoryId: category.id,
+			outcome: "ok",
+			reasonCode: null,
+			messageId: msg.id,
+			body: null,
+		};
+		await db.batch([
+			insertAllowRule(db, rule),
+			insertToken(db, tok),
+			insertMessage(db, msg),
+			insertAuditLogEntry(db, audit),
+		]);
+
+		await applyD1Migrations(db, [m1, m2, m3]);
+
+		const fkViolations = await db.prepare("PRAGMA foreign_key_check").all();
+		expect(fkViolations.results).toEqual([]);
+
+		expect(
+			(
+				await db.prepare("SELECT * FROM agents ORDER BY name").all<AgentRow>()
+			).results.map(agentFromRow),
+		).toEqual([a, b]);
+		expect(
+			(
+				await db.prepare("SELECT * FROM categories").all<CategoryRow>()
+			).results.map(categoryFromRow),
+		).toEqual([category]);
+		expect(
+			(
+				await db.prepare("SELECT * FROM allow_rules").all<AllowRuleRow>()
+			).results.map(allowRuleFromRow),
+		).toEqual([rule]);
+		expect(
+			(await db.prepare("SELECT * FROM tokens").all<TokenRow>()).results.map(
+				tokenFromRow,
+			),
+		).toEqual([tok]);
+		expect(
+			(
+				await db.prepare("SELECT * FROM messages").all<MessageRow>()
+			).results.map(messageFromRow),
+		).toEqual([msg]);
+		const auditRows = (
+			await db.prepare("SELECT * FROM audit_log").all<AuditLogRow>()
+		).results.map(auditLogEntryFromRow);
+		expect(auditRows.map(({ id: _id, ...rest }) => rest)).toEqual([audit]);
+
+		for (const actorType of ["owner", "admin_bot"] as const) {
+			for (const targetType of [
+				"agent",
+				"token",
+				"category",
+				"allow_rule",
+				"admin_bot",
+				"description",
+			] as const) {
+				await db
+					.prepare(
+						`INSERT INTO change_log
+							(occurred_at, actor_type, actor_id, action, target_type, target_id)
+						VALUES (?, ?, 'actor-1', 'test_action', ?, 'target-1')`,
+					)
+					.bind(T0, actorType, targetType)
+					.run();
+			}
+		}
+
+		await expect(
+			db
+				.prepare(
+					`INSERT INTO change_log
+						(occurred_at, actor_type, actor_id, action, target_type, target_id)
+					VALUES (?, 'agent', 'actor-1', 'test_action', 'agent', 'target-1')`,
+				)
+				.bind(T0)
+				.run(),
+		).rejects.toThrow(/CHECK/);
+
+		await expect(
+			db
+				.prepare(
+					`INSERT INTO change_log
+						(occurred_at, actor_type, actor_id, action, target_type, target_id)
+					VALUES (?, 'owner', 'actor-1', 'test_action', 'message', 'target-1')`,
+				)
+				.bind(T0)
+				.run(),
+		).rejects.toThrow(/CHECK/);
+
+		await expect(
+			db
+				.prepare(
+					`INSERT INTO change_log
+						(occurred_at, actor_type, actor_id, action, target_type, target_id)
+					VALUES ('not-an-int', 'owner', 'actor-1', 'test_action', 'agent', 'target-1')`,
+				)
+				.run(),
+		).rejects.toThrow(/STRICT|datatype/i);
+
+		await expect(
+			db
+				.prepare(
+					`INSERT INTO change_log
+						(occurred_at, actor_type, actor_id, action, target_type, target_id)
+					VALUES (?, 'owner', NULL, 'test_action', 'agent', 'target-1')`,
+				)
+				.bind(T0)
+				.run(),
+		).rejects.toThrow(/NOT NULL/);
+	});
 });
 
 describe("row conversion", () => {
@@ -700,6 +932,23 @@ describe("row conversion", () => {
 			.first<AuditLogRow>();
 		expect(() => auditLogEntryFromRow(row as AuditLogRow)).toThrow(
 			/audit_log\.event_type/,
+		);
+	});
+
+	it("throws on unknown change_log enum values", async () => {
+		await db
+			.prepare(
+				`INSERT INTO change_log
+					(occurred_at, actor_type, actor_id, action, target_type, target_id)
+				VALUES (?, 'owner', 'me', 'unknown_action', 'agent', 'a1')`,
+			)
+			.bind(T0)
+			.run();
+		const row = await db
+			.prepare("SELECT * FROM change_log")
+			.first<ChangeLogRow>();
+		expect(() => changeLogEntryFromRow(row as ChangeLogRow)).toThrow(
+			/change_log\.action/,
 		);
 	});
 });

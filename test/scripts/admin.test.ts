@@ -3,6 +3,7 @@ import { revokeAgentTokens, setAgentStatus } from "../../scripts/lib/admin";
 import { CliError } from "../../scripts/lib/sql";
 import { issueParticipantToken } from "../../scripts/lib/token";
 import { authenticate } from "../../src/auth";
+import { type ChangeLogRow, changeLogEntryFromRow } from "../../src/db";
 import type { Agent } from "../../src/types";
 import { createTestDb } from "../helpers/db";
 import { seedAgent, T0 } from "../helpers/fixtures";
@@ -16,40 +17,80 @@ beforeEach(async () => {
 	muse = await seedAgent(db, { name: "muse" });
 });
 
+async function changeLogs() {
+	const { results } = await db
+		.prepare("SELECT * FROM change_log ORDER BY id")
+		.all<ChangeLogRow>();
+	return results.map(changeLogEntryFromRow);
+}
+
 describe("setAgentStatus", () => {
-	it("suspends and resumes the named agent", async () => {
-		expect(await setAgentStatus(d1Client(db), "muse", "suspended")).toBe(true);
+	it("suspends and resumes the named agent and records change_log entries", async () => {
+		expect(await setAgentStatus(d1Client(db), "muse", "suspended", T0)).toBe(
+			true,
+		);
 		const suspended = await db
 			.prepare("SELECT status FROM agents WHERE id = ?")
 			.bind(muse.id)
 			.first<{ status: string }>();
 		expect(suspended?.status).toBe("suspended");
 
-		expect(await setAgentStatus(d1Client(db), "muse", "active")).toBe(true);
+		expect(await setAgentStatus(d1Client(db), "muse", "active", T0 + 1)).toBe(
+			true,
+		);
 		const resumed = await db
 			.prepare("SELECT status FROM agents WHERE id = ?")
 			.bind(muse.id)
 			.first<{ status: string }>();
 		expect(resumed?.status).toBe("active");
+
+		const logs = await changeLogs();
+		expect(logs).toHaveLength(2);
+		expect(logs[0]).toMatchObject({
+			occurredAt: T0,
+			actorType: "owner",
+			actorId: "cli",
+			action: "agent_suspended",
+			targetType: "agent",
+			targetId: muse.id,
+		});
+		expect(JSON.parse(logs[0]?.beforeJson ?? "null")).toMatchObject({
+			status: "active",
+		});
+		expect(JSON.parse(logs[0]?.afterJson ?? "null")).toMatchObject({
+			status: "suspended",
+		});
+		expect(logs[1]).toMatchObject({
+			occurredAt: T0 + 1,
+			actorType: "owner",
+			actorId: "cli",
+			action: "agent_resumed",
+			targetType: "agent",
+			targetId: muse.id,
+		});
 	});
 
 	it("reports no change when the agent already has the status", async () => {
 		const before = await snapshot(db);
-		expect(await setAgentStatus(d1Client(db), "muse", "active")).toBe(false);
+		expect(await setAgentStatus(d1Client(db), "muse", "active", T0)).toBe(
+			false,
+		);
 		expect(await snapshot(db)).toEqual(before);
+		expect(await changeLogs()).toHaveLength(0);
 	});
 
 	it("refuses an unknown agent without touching the database", async () => {
 		const before = await snapshot(db);
 		await expect(
-			setAgentStatus(d1Client(db), "ghost", "suspended"),
+			setAgentStatus(d1Client(db), "ghost", "suspended", T0),
 		).rejects.toBeInstanceOf(CliError);
 		expect(await snapshot(db)).toEqual(before);
+		expect(await changeLogs()).toHaveLength(0);
 	});
 });
 
 describe("revokeAgentTokens", () => {
-	it("revokes every valid token of the agent", async () => {
+	it("revokes every valid token of the agent and logs the change", async () => {
 		const { token } = await issueParticipantToken(d1Client(db), "muse", T0);
 		await db
 			.prepare("INSERT INTO tokens VALUES ('t2', ?, 'hash2', 'admin', ?, NULL)")
@@ -64,6 +105,20 @@ describe("revokeAgentTokens", () => {
 		expect(valid?.n).toBe(0);
 		const auth = await authenticate(db, `Bearer ${token}`, "participant");
 		expect(auth.ok).toBe(false);
+
+		const logs = await changeLogs();
+		expect(logs).toHaveLength(2);
+		expect(logs[1]).toMatchObject({
+			occurredAt: T0 + 1,
+			actorType: "owner",
+			actorId: "cli",
+			action: "token_revoked",
+			targetType: "token",
+			targetId: muse.id,
+			afterJson: null,
+		});
+		expect(logs[1]?.beforeJson).not.toContain(token);
+		expect(logs[1]?.beforeJson).not.toContain("hash2");
 	});
 
 	it("leaves the tokens of other agents alone", async () => {
@@ -80,6 +135,7 @@ describe("revokeAgentTokens", () => {
 		const before = await snapshot(db);
 		expect(await revokeAgentTokens(d1Client(db), "muse", T0)).toBe(0);
 		expect(await snapshot(db)).toEqual(before);
+		expect(await changeLogs()).toHaveLength(0);
 	});
 
 	it("refuses an unknown agent without touching the database", async () => {
@@ -88,5 +144,6 @@ describe("revokeAgentTokens", () => {
 			revokeAgentTokens(d1Client(db), "ghost", T0),
 		).rejects.toBeInstanceOf(CliError);
 		expect(await snapshot(db)).toEqual(before);
+		expect(await changeLogs()).toHaveLength(0);
 	});
 });
