@@ -239,7 +239,15 @@ describe("invalid seed files", () => {
 			"agents[0].name:",
 		],
 		[
-			"a category name with comma or bidi override",
+			"a category name with a comma",
+			seedText({
+				categories: ["予定", "a,b"],
+				allowRules: [],
+			}),
+			"categories[1]:",
+		],
+		[
+			"a category name with a bidi override",
 			seedText({
 				categories: ["予定", "a\u202eb"],
 				allowRules: [],
