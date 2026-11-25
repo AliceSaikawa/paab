@@ -159,6 +159,30 @@ describe("queryAuditLog", () => {
 		expect(await ids({ outcome: "denied", limit: 1 })).toEqual(["q2"]);
 	});
 
+	it("returns newest first when asked", async () => {
+		expect(await ids({ order: "desc" })).toEqual(["q4", "q3", "q2", "q1"]);
+		expect(await ids({ order: "desc", limit: 2 })).toEqual(["q4", "q3"]);
+	});
+
+	it("pages by ID in both directions", async () => {
+		const page = await queryAuditLog(db, { order: "desc", limit: 2 });
+		expect(page.map((entry) => entry.messageId)).toEqual(["q4", "q3"]);
+
+		const lastShown = page[page.length - 1]?.id;
+		expect(await ids({ order: "desc", beforeId: lastShown })).toEqual([
+			"q2",
+			"q1",
+		]);
+		expect(await ids({ afterId: page[0]?.id })).toEqual([]);
+
+		const first = await queryAuditLog(db, { limit: 2 });
+		expect(await ids({ afterId: first[first.length - 1]?.id })).toEqual([
+			"q3",
+			"q4",
+		]);
+		expect(await ids({ beforeId: first[0]?.id })).toEqual([]);
+	});
+
 	it("returns current names, and null for what has no name", async () => {
 		const entries = await queryAuditLog(db);
 		expect(entries[0]).toMatchObject({
@@ -229,12 +253,23 @@ describe("buildAuditLogQuery", () => {
 		]);
 	});
 
+	it("builds a descending query with a cursor", () => {
+		const query = buildAuditLogQuery({ order: "desc", beforeId: 42 });
+		expect(query.sql).toContain("WHERE l.id < ?");
+		expect(query.sql).toMatch(
+			/ORDER BY l\.occurred_at DESC, l\.id DESC LIMIT \?$/,
+		);
+		expect(query.params).toEqual([42, DEFAULT_AUDIT_QUERY_LIMIT]);
+	});
+
 	it.each([
 		["a zero limit", { limit: 0 }],
 		["a fractional limit", { limit: 1.5 }],
 		["a time that is not an integer", { occurredFrom: Number.NaN }],
 		["an unknown outcome", { outcome: "maybe" }],
 		["an empty name", { fromAgentName: "" }],
+		["a fractional afterId", { afterId: 1.5 }],
+		["a negative beforeId", { beforeId: -1 }],
 	])("throws on %s", (_name, filter) => {
 		expect(() => buildAuditLogQuery(filter as AuditLogFilter)).toThrow(
 			RangeError,

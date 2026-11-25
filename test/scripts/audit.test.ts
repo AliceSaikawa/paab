@@ -75,6 +75,22 @@ describe("auditLogFilter", () => {
 			outcome: "denied",
 			limit: 5,
 			includeBody: true,
+			order: "desc",
+		});
+	});
+
+	it("reads the log newest first unless --oldest is given", () => {
+		expect(auditLogFilter({}).order).toBe("desc");
+		expect(auditLogFilter({ oldest: true })).toEqual({
+			includeBody: false,
+			order: "asc",
+		});
+	});
+
+	it("maps the cursor options", () => {
+		expect(auditLogFilter({ afterId: "10", beforeId: "20" })).toMatchObject({
+			afterId: 10,
+			beforeId: 20,
 		});
 	});
 
@@ -84,6 +100,8 @@ describe("auditLogFilter", () => {
 		[{ outcome: "error" }, "--outcome"],
 		[{ limit: "0" }, "--limit"],
 		[{ limit: "ten" }, "--limit"],
+		[{ afterId: "-1" }, "--after-id"],
+		[{ beforeId: "soon" }, "--before-id"],
 	])("refuses %j", (options, option) => {
 		expect(() => auditLogFilter(options)).toThrow(CliError);
 		expect(() => auditLogFilter(options)).toThrow(option);
@@ -114,6 +132,8 @@ describe("readAuditLog", () => {
 		{ outcome: "denied" as const },
 		{ occurredFrom: T0 + HOUR_MS, occurredBefore: T0 + 2 * HOUR_MS },
 		{ includeBody: true, limit: 1 },
+		{ order: "desc" as const },
+		{ order: "desc" as const, limit: 2 },
 	])("returns what queryAuditLog returns for %j", async (filter) => {
 		const entries = await readAuditLog(d1Client(db), filter);
 		expect(entries).toEqual(await queryAuditLog(db, filter));
@@ -127,6 +147,7 @@ describe("formatAuditLog", () => {
 		const entries = await readAuditLog(d1Client(db), { includeBody: true });
 		const [header, ...lines] = formatAuditLog(entries, true).split("\n");
 		expect(header?.split("\t")).toEqual([
+			"id",
 			"occurred_at",
 			"event_type",
 			"from",
@@ -137,7 +158,10 @@ describe("formatAuditLog", () => {
 			"message_id",
 			"body",
 		]);
-		expect(lines.map((line) => line.split("\t").slice(1))).toEqual([
+		expect(lines.map((line) => line.split("\t")[0])).toEqual(
+			entries.map((entry) => String(entry.id)),
+		);
+		expect(lines.map((line) => line.split("\t").slice(2))).toEqual([
 			[
 				"question_accepted",
 				"muse",
