@@ -1,3 +1,4 @@
+import { applyD1Migrations, type D1Migration } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
 	type AgentRow,
@@ -480,6 +481,209 @@ describe("audit_log", () => {
 			.prepare("SELECT COUNT(*) AS n FROM audit_log")
 			.first<{ n: number }>();
 		expect(count?.n).toBe(1);
+	});
+});
+
+describe("deletion", () => {
+	let a: Agent;
+	let b: Agent;
+	let categoryId: string;
+
+	beforeEach(async () => {
+		a = await seedAgent(db, { name: "a" });
+		b = await seedAgent(db, { name: "b" });
+		categoryId = (await seedCategory(db, { name: "schedule" })).id;
+	});
+
+	async function messageCount(): Promise<number> {
+		const row = await db
+			.prepare("SELECT COUNT(*) AS n FROM messages")
+			.first<{ n: number }>();
+		return row?.n ?? -1;
+	}
+
+	it("deletes an agent that has messages, taking their messages and replies", async () => {
+		const asked = question(a, b, categoryId);
+		const answer = reply(asked);
+		const received = question(b, a, categoryId);
+		await db.batch([asked, answer, received].map((m) => insertMessage(db, m)));
+		await insertAuditLogEntry(db, {
+			occurredAt: T0,
+			eventType: "question_accepted",
+			fromAgentId: a.id,
+			toAgentId: b.id,
+			categoryId,
+			outcome: "ok",
+			reasonCode: null,
+			messageId: asked.id,
+			body: null,
+		}).run();
+		expect(await messageCount()).toBe(3);
+
+		await db.prepare("DELETE FROM agents WHERE id = ?").bind(a.id).run();
+
+		expect(await messageCount()).toBe(0);
+		const audit = await db
+			.prepare("SELECT COUNT(*) AS n FROM audit_log")
+			.first<{ n: number }>();
+		expect(audit?.n).toBe(1);
+		const survivors = await db
+			.prepare("SELECT COUNT(*) AS n FROM agents")
+			.first<{ n: number }>();
+		expect(survivors?.n).toBe(1);
+	});
+
+	it("removes a bridge rejection with the question it refers to", async () => {
+		const asked = question(b, a, categoryId);
+		const rejection = reply(asked, {
+			kind: "rejection",
+			fromAgentId: null,
+			categoryId: null,
+			body: null,
+		});
+		await db.batch([asked, rejection].map((m) => insertMessage(db, m)));
+
+		// Only in_reply_to ties the rejection to the deleted agent.
+		await db.prepare("DELETE FROM agents WHERE id = ?").bind(a.id).run();
+
+		expect(await messageCount()).toBe(0);
+	});
+
+	it("deletes a category that has messages", async () => {
+		const asked = question(a, b, categoryId);
+		const expired = question(a, b, categoryId, { status: "expired" });
+		await db.batch([asked, expired].map((m) => insertMessage(db, m)));
+
+		await db
+			.prepare("DELETE FROM categories WHERE id = ?")
+			.bind(categoryId)
+			.run();
+
+		expect(await messageCount()).toBe(0);
+		const agents = await db
+			.prepare("SELECT COUNT(*) AS n FROM agents")
+			.first<{ n: number }>();
+		expect(agents?.n).toBe(2);
+	});
+
+	it("removes a rejection without a category when its question's category is deleted", async () => {
+		const asked = question(a, b, categoryId, { status: "expired" });
+		const rejection = reply(asked, {
+			kind: "rejection",
+			fromAgentId: null,
+			categoryId: null,
+			body: null,
+		});
+		await db.batch([asked, rejection].map((m) => insertMessage(db, m)));
+
+		await db
+			.prepare("DELETE FROM categories WHERE id = ?")
+			.bind(categoryId)
+			.run();
+
+		expect(await messageCount()).toBe(0);
+	});
+});
+
+describe("migrations", () => {
+	const migrationFiles = import.meta.glob<string>("../../migrations/*.sql", {
+		query: "?raw",
+		import: "default",
+		eager: true,
+	});
+
+	function migration(filename: string): D1Migration {
+		const entry = Object.entries(migrationFiles).find(([path]) =>
+			path.endsWith(`/${filename}`),
+		);
+		if (!entry) {
+			throw new Error(`Missing migration ${filename}`);
+		}
+		const queries = entry[1]
+			.split("\n")
+			.filter((line) => !line.trimStart().startsWith("--"))
+			.join("\n")
+			.split(";")
+			.map((statement) => statement.trim())
+			.filter((statement) => statement.length > 0);
+		return { name: filename, queries };
+	}
+
+	it("preserves questions and replies when migrating a populated database to 0002", async () => {
+		await db.batch([
+			db.prepare("DROP TABLE IF EXISTS audit_log"),
+			db.prepare("DROP TABLE IF EXISTS messages"),
+			db.prepare("DROP TABLE IF EXISTS allow_rules"),
+			db.prepare("DROP TABLE IF EXISTS tokens"),
+			db.prepare("DROP TABLE IF EXISTS categories"),
+			db.prepare("DROP TABLE IF EXISTS agents"),
+			db.prepare("DROP TABLE IF EXISTS d1_migrations"),
+		]);
+
+		const initial = migration("0001_initial_schema.sql");
+		const cascade = migration("0002_cascade_message_references.sql");
+		await applyD1Migrations(db, [initial]);
+
+		const a = await seedAgent(db, { name: "a" });
+		const b = await seedAgent(db, { name: "b" });
+		const category = await seedCategory(db, { name: "schedule" });
+		const answered = question(a, b, category.id, {
+			status: "answered",
+			createdAt: T0,
+			receivedAt: T0 + 1,
+		});
+		const answer = reply(answered, { createdAt: T0 + 1 });
+		const declined = question(b, a, category.id, {
+			status: "declined",
+			createdAt: T0 + 2,
+			receivedAt: T0 + 3,
+		});
+		const rejection = reply(declined, {
+			kind: "rejection",
+			fromAgentId: null,
+			categoryId: null,
+			body: null,
+			createdAt: T0 + 3,
+		});
+		await db.batch(
+			[answered, answer, declined, rejection].map((m) => insertMessage(db, m)),
+		);
+
+		await applyD1Migrations(db, [initial, cascade]);
+
+		const { results } = await db
+			.prepare("SELECT * FROM messages ORDER BY created_at")
+			.all<MessageRow>();
+		expect(results.map(messageFromRow)).toEqual([
+			answered,
+			answer,
+			declined,
+			rejection,
+		]);
+
+		const fkViolations = await db.prepare("PRAGMA foreign_key_check").all();
+		expect(fkViolations.results).toEqual([]);
+
+		await db
+			.prepare("DELETE FROM messages WHERE id = ?")
+			.bind(answered.id)
+			.run();
+		const remaining = await db
+			.prepare("SELECT id FROM messages ORDER BY created_at")
+			.all<{ id: string }>();
+		expect(remaining.results.map((row) => row.id)).toEqual([
+			declined.id,
+			rejection.id,
+		]);
+
+		await db
+			.prepare("DELETE FROM categories WHERE id = ?")
+			.bind(category.id)
+			.run();
+		const afterCategoryDelete = await db
+			.prepare("SELECT COUNT(*) AS n FROM messages")
+			.first<{ n: number }>();
+		expect(afterCategoryDelete?.n).toBe(0);
 	});
 });
 
