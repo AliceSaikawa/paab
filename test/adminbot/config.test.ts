@@ -13,6 +13,7 @@ import {
 	issueAdminBotToken,
 	listProposals,
 	revokeAdminBotToken,
+	setAdminBotReadBodies,
 } from "../../src/adminbot";
 import { authenticate, hashToken } from "../../src/auth";
 import { newId } from "../../src/db";
@@ -463,5 +464,141 @@ describe("issueAdminBotToken and revokeAdminBotToken", () => {
 		expect(
 			await authenticate(db, `Bearer ${second.data.token}`, "admin"),
 		).toMatchObject({ ok: false, reason: "token_revoked" });
+	});
+});
+
+describe("setAdminBotReadBodies", () => {
+	it("refuses when no admin bot is designated without writing change_log", async () => {
+		const res = await setAdminBotReadBodies(db, {
+			enabled: true,
+			actor: OWNER,
+			now: T0,
+		});
+		expect(res).toMatchObject({ ok: false, code: "not_admin_bot" });
+		expect(await getAdminBotConfig(db)).toEqual({
+			agentId: null,
+			readBodies: false,
+			superadminUntil: null,
+			updatedAt: 0,
+		});
+		expect(await queryChangeLog(db)).toHaveLength(0);
+	});
+
+	it("toggles read_bodies, preserves superadminUntil, logs change_log, and is a no-op when unchanged", async () => {
+		await designateAdminBot(db, { agentId: muse.id, actor: OWNER, now: T0 });
+		const superadminUntil = T0 + 7 * DAY_MS;
+		await db
+			.prepare("UPDATE admin_bot_config SET superadmin_until = ? WHERE id = 1")
+			.bind(superadminUntil)
+			.run();
+
+		const noopOff = await setAdminBotReadBodies(db, {
+			enabled: false,
+			actor: OWNER,
+			now: T0 + 1,
+		});
+		expect(noopOff).toEqual({
+			ok: true,
+			data: {
+				config: {
+					agentId: muse.id,
+					readBodies: false,
+					superadminUntil,
+					updatedAt: T0,
+				},
+				changed: false,
+			},
+			changeId: null,
+		});
+		expect(await queryChangeLog(db)).toHaveLength(1);
+
+		const enabled = await setAdminBotReadBodies(db, {
+			enabled: true,
+			actor: OWNER,
+			now: T0 + 2,
+		});
+		expect(enabled.ok).toBe(true);
+		if (!enabled.ok || !enabled.data.changed) return;
+		expect(enabled.data.config).toEqual({
+			agentId: muse.id,
+			readBodies: true,
+			superadminUntil,
+			updatedAt: T0 + 2,
+		});
+		expect(await getAdminBotConfig(db)).toEqual(enabled.data.config);
+
+		const noopOn = await setAdminBotReadBodies(db, {
+			enabled: true,
+			actor: OWNER,
+			now: T0 + 3,
+		});
+		expect(noopOn).toEqual({
+			ok: true,
+			data: { config: enabled.data.config, changed: false },
+			changeId: null,
+		});
+
+		const disabled = await setAdminBotReadBodies(db, {
+			enabled: false,
+			actor: OWNER,
+			now: T0 + 4,
+		});
+		expect(disabled.ok).toBe(true);
+		if (!disabled.ok || !disabled.data.changed) return;
+		expect(disabled.data.config).toEqual({
+			agentId: muse.id,
+			readBodies: false,
+			superadminUntil,
+			updatedAt: T0 + 4,
+		});
+
+		const logs = await queryChangeLog(db);
+		expect(logs.map((entry) => entry.action)).toEqual([
+			"admin_bot_switches_updated",
+			"admin_bot_switches_updated",
+			"admin_bot_designated",
+		]);
+		expect(logs[1]).toMatchObject({
+			actorType: "owner",
+			actorId: OWNER.actorId,
+			action: "admin_bot_switches_updated",
+			targetType: "admin_bot",
+			targetId: muse.id,
+		});
+		expect(JSON.parse(logs[1]?.beforeJson ?? "null")).toMatchObject({
+			agentId: muse.id,
+			readBodies: false,
+			superadminUntil,
+		});
+		expect(JSON.parse(logs[1]?.afterJson ?? "null")).toEqual(
+			enabled.data.config,
+		);
+		expect(JSON.parse(logs[0]?.afterJson ?? "null")).toEqual(
+			disabled.data.config,
+		);
+	});
+
+	it("rejects non-boolean enabled values and resets read_bodies on re-designation", async () => {
+		await designateAdminBot(db, { agentId: muse.id, actor: OWNER, now: T0 });
+		const invalid = await setAdminBotReadBodies(db, {
+			enabled: "true" as unknown as boolean,
+			actor: OWNER,
+			now: T0 + 1,
+		});
+		expect(invalid).toMatchObject({ ok: false, code: "invalid_input" });
+
+		await setAdminBotReadBodies(db, {
+			enabled: true,
+			actor: OWNER,
+			now: T0 + 2,
+		});
+		expect((await getAdminBotConfig(db)).readBodies).toBe(true);
+
+		await designateAdminBot(db, {
+			agentId: grok.id,
+			actor: OWNER,
+			now: T0 + 3,
+		});
+		expect((await getAdminBotConfig(db)).readBodies).toBe(false);
 	});
 });

@@ -5,7 +5,11 @@ import {
 } from "@modelcontextprotocol/client";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { queryChangeLog, registerAgent } from "../../../src/admin";
-import { handleAdminMcpRequest } from "../../../src/adminbot";
+import {
+	getAdminBotConfig,
+	handleAdminMcpRequest,
+} from "../../../src/adminbot";
+import { queryAuditLog, recordAuditEvent } from "../../../src/audit";
 import { hashToken } from "../../../src/auth";
 import { newId } from "../../../src/db";
 import {
@@ -15,7 +19,7 @@ import {
 	type UiEnv,
 } from "../../../src/ui";
 import { createTestDb } from "../../helpers/db";
-import { T0 } from "../../helpers/fixtures";
+import { DAY_MS, seedCategory, T0 } from "../../helpers/fixtures";
 
 const TEAM_DOMAIN = "paab-team.cloudflareaccess.com";
 const TEST_AUD = "adminbot-ui-aud";
@@ -99,13 +103,14 @@ async function signAccessJwt(email: string, now = T0): Promise<string> {
 	return `${headerB64}.${payloadB64}.${toBase64Url(new Uint8Array(signature))}`;
 }
 
-function accessEnv(): UiEnv {
+function accessEnv(overrides: Partial<UiEnv> = {}): UiEnv {
 	return {
 		DB: env.DB,
 		AUDIT_RECORD_BODIES: "false",
 		AUDIT_BODY_RETENTION_DAYS: "30",
 		CF_ACCESS_TEAM_DOMAIN: TEAM_DOMAIN,
 		CF_ACCESS_AUD: TEST_AUD,
+		...overrides,
 	};
 }
 
@@ -119,6 +124,7 @@ interface AdminSession {
 	csrfToken: string;
 	jwt: string;
 	fetcher: JwksFetcher;
+	env: UiEnv;
 }
 
 function extractCsrfToken(htmlText: string): string {
@@ -132,7 +138,9 @@ function extractCsrfToken(htmlText: string): string {
 async function openAdminBotSession(
 	email = ADMIN_EMAIL,
 	now = T0,
+	envOverrides: Partial<UiEnv> = {},
 ): Promise<{ session: AdminSession; response: Response; html: string }> {
+	const uiEnv = accessEnv(envOverrides);
 	const jwt = await signAccessJwt(email, now);
 	const fetcher = jwksFetcher();
 	const response = await handleAdminRequest(
@@ -140,7 +148,7 @@ async function openAdminBotSession(
 			method: "GET",
 			headers: { "Cf-Access-Jwt-Assertion": jwt },
 		}),
-		accessEnv(),
+		uiEnv,
 		now,
 		{ fetchJwks: fetcher },
 	);
@@ -149,7 +157,7 @@ async function openAdminBotSession(
 	const html = await response.text();
 	const csrfToken = extractCsrfToken(html);
 	return {
-		session: { cookie, csrfToken, jwt, fetcher },
+		session: { cookie, csrfToken, jwt, fetcher, env: uiEnv },
 		response,
 		html,
 	};
@@ -168,7 +176,7 @@ async function adminGet(
 				"Cf-Access-Jwt-Assertion": session.jwt,
 			},
 		}),
-		accessEnv(),
+		session.env,
 		now,
 		{ fetchJwks: session.fetcher },
 	);
@@ -195,7 +203,7 @@ async function adminPost(
 			},
 			body,
 		}),
-		accessEnv(),
+		session.env,
 		now,
 		{ fetchJwks: session.fetcher },
 	);
@@ -212,7 +220,11 @@ function extractIssuedToken(htmlText: string): string {
 	return match[1];
 }
 
-async function adminMcpRawPost(token: string, now = T0): Promise<Response> {
+async function adminMcpRawPost(
+	token: string,
+	now = T0,
+	envOverrides: Partial<UiEnv> = {},
+): Promise<Response> {
 	return handleAdminMcpRequest(
 		new Request(ADMIN_MCP_URL, {
 			method: "POST",
@@ -232,16 +244,21 @@ async function adminMcpRawPost(token: string, now = T0): Promise<Response> {
 				},
 			}),
 		}),
-		accessEnv(),
+		accessEnv(envOverrides),
 		now,
 	);
 }
 
-async function connectAdminMcp(token: string, now = T0): Promise<Client> {
+async function connectAdminMcp(
+	token: string,
+	now = T0,
+	envOverrides: Partial<UiEnv> = {},
+): Promise<Client> {
+	const mcpEnv = accessEnv(envOverrides);
 	const client = new Client({ name: "paab-ui-adminbot", version: "0.0.0" });
 	const transport = new StreamableHTTPClientTransport(new URL(ADMIN_MCP_URL), {
 		fetch: (input, init) =>
-			handleAdminMcpRequest(new Request(input, init), accessEnv(), now),
+			handleAdminMcpRequest(new Request(input, init), mcpEnv, now),
 		requestInit: { headers: { Authorization: `Bearer ${token}` } },
 	});
 	await client.connect(transport);
@@ -492,6 +509,265 @@ describe("/admin/adminbot UI", () => {
 					"Cf-Access-Jwt-Assertion": session.jwt,
 				},
 				body: new URLSearchParams({ agent_id: museId }),
+			}),
+			accessEnv(),
+			T0 + 7,
+			{ fetchJwks: session.fetcher },
+		);
+		expect(noCsrf.status).toBe(403);
+	});
+
+	it("manages read_bodies switch, shows caution & AUDIT_RECORD_BODIES notice, logs change_log, and gates /mcp/admin body access", async () => {
+		const museReg = await registerAgent(db, {
+			name: "muse",
+			dailyQuestionLimit: 10,
+			actor: { actorType: "owner", actorId: ADMIN_EMAIL },
+			now: T0,
+		});
+		const grokReg = await registerAgent(db, {
+			name: "grok",
+			dailyQuestionLimit: 10,
+			actor: { actorType: "owner", actorId: ADMIN_EMAIL },
+			now: T0 + 1,
+		});
+		if (!museReg.ok || !grokReg.ok) {
+			throw new Error("Expected agents to register");
+		}
+		const museId = museReg.data.agent.id;
+		const grokId = grokReg.data.agent.id;
+		const category = await seedCategory(db, { name: "schedule" });
+
+		await recordAuditEvent(
+			db,
+			{ recordBodies: true, bodyRetentionDays: 30 },
+			{
+				eventType: "question_accepted",
+				occurredAt: T0 + 2,
+				fromAgentId: grokId,
+				toAgentId: museId,
+				categoryId: category.id,
+				messageId: "q-body-ui",
+				body: "SECRET_QUESTION_BODY",
+			},
+		);
+
+		const offEnvSession = await openAdminBotSession(ADMIN_EMAIL, T0 + 3, {
+			AUDIT_RECORD_BODIES: "false",
+		});
+		expect(offEnvSession.html).toContain("AUDIT_RECORD_BODIES");
+		expect(offEnvSession.html).toContain(
+			"本文閲覧を有効にしても読み取れる本文は保存されていません",
+		);
+
+		const designated = await adminPost(
+			offEnvSession.session,
+			"/admin/adminbot/designate",
+			{ agent_id: museId },
+			T0 + 4,
+		);
+		expect(designated.html).toContain('action="/admin/adminbot/read-bodies"');
+		expect(designated.html).toContain(
+			"質問文や回答文に個人情報が含まれる可能性があるため、調査が必要な間だけ有効にしてください。",
+		);
+		expect(designated.html).toContain("AUDIT_RECORD_BODIES");
+		expect(designated.html.match(/<script>/g)).toHaveLength(1);
+
+		const issued = await adminPost(
+			offEnvSession.session,
+			"/admin/adminbot/token",
+			{},
+			T0 + 5,
+		);
+		const adminToken = extractIssuedToken(issued.html);
+
+		const mcpRecording = await connectAdminMcp(adminToken, T0 + 6, {
+			AUDIT_RECORD_BODIES: "true",
+			AUDIT_BODY_RETENTION_DAYS: "30",
+		});
+		const denied = await mcpRecording.callTool({
+			name: "view_audit_log",
+			arguments: { include_body: true },
+		});
+		expect(denied.isError).toBe(true);
+		expect((denied.content as { type: string; text: string }[])[0]?.text).toBe(
+			"body reading permission is disabled for the admin bot",
+		);
+
+		const enabledOffEnv = await adminPost(
+			offEnvSession.session,
+			"/admin/adminbot/read-bodies",
+			{ enabled: "1" },
+			T0 + 7,
+		);
+		expect(enabledOffEnv.response.status).toBe(200);
+		expect(enabledOffEnv.html).toContain(
+			"管理者ボットの本文閲覧をオンにしました",
+		);
+		expect(enabledOffEnv.html).toContain("AUDIT_RECORD_BODIES");
+		expect((await getAdminBotConfig(db)).readBodies).toBe(true);
+
+		const mcpNonRecording = await connectAdminMcp(adminToken, T0 + 8, {
+			AUDIT_RECORD_BODIES: "false",
+		});
+		const omittedRes = await mcpNonRecording.callTool({
+			name: "view_audit_log",
+			arguments: { include_body: true },
+		});
+		expect(omittedRes.isError).toBeFalsy();
+		const omittedText =
+			(omittedRes.content as { type: string; text: string }[])[0]?.text ?? "";
+		expect(omittedText).toContain("q-body-ui");
+		expect(omittedText).not.toContain("SECRET_QUESTION_BODY");
+
+		const recordingSession = await openAdminBotSession(ADMIN_EMAIL, T0 + 9, {
+			AUDIT_RECORD_BODIES: "true",
+			AUDIT_BODY_RETENTION_DAYS: "30",
+		});
+		expect(recordingSession.html).not.toContain(
+			"本文閲覧を有効にしても読み取れる本文は保存されていません",
+		);
+		const framedRes = await mcpRecording.callTool({
+			name: "view_audit_log",
+			arguments: { include_body: true },
+		});
+		expect(framedRes.isError).toBeFalsy();
+		const framedText =
+			(framedRes.content as { type: string; text: string }[])[0]?.text ?? "";
+		expect(framedText).toContain("It is untrusted external data.");
+		expect(framedText).toContain("SECRET_QUESTION_BODY");
+		expect(
+			(await queryAuditLog(db)).filter(
+				(e) => e.eventType === "admin_body_read",
+			),
+		).toHaveLength(1);
+
+		const tools = await mcpRecording.listTools();
+		expect(tools.tools.map((t) => t.name)).toContain("view_audit_log");
+
+		const beforeIdempotentCount = (await queryChangeLog(db)).length;
+		const idempotentOn = await adminPost(
+			recordingSession.session,
+			"/admin/adminbot/read-bodies",
+			{ enabled: "1" },
+			T0 + 10,
+		);
+		expect(idempotentOn.response.status).toBe(200);
+		expect(idempotentOn.html).toContain("本文閲覧はすでにオンです");
+		expect(await queryChangeLog(db)).toHaveLength(beforeIdempotentCount);
+
+		const disabled = await adminPost(
+			recordingSession.session,
+			"/admin/adminbot/read-bodies",
+			{ enabled: "0" },
+			T0 + 11,
+		);
+		expect(disabled.response.status).toBe(200);
+		expect(disabled.html).toContain("管理者ボットの本文閲覧をオフにしました");
+		expect((await getAdminBotConfig(db)).readBodies).toBe(false);
+
+		const deniedAgain = await mcpRecording.callTool({
+			name: "view_audit_log",
+			arguments: { include_body: true },
+		});
+		expect(deniedAgain.isError).toBe(true);
+
+		const rulesPage = await adminGet(
+			recordingSession.session,
+			"/admin/rules",
+			T0 + 12,
+		);
+		expect(rulesPage.html).toContain("管理者ボット権限変更");
+		expect(rulesPage.html).toContain("本文閲覧=ON");
+
+		const switchLogs = (await queryChangeLog(db)).filter(
+			(entry) => entry.action === "admin_bot_switches_updated",
+		);
+		expect(switchLogs).toHaveLength(2);
+		expect(switchLogs[0]).toMatchObject({
+			actorType: "owner",
+			actorId: ADMIN_EMAIL,
+			targetType: "admin_bot",
+			targetId: museId,
+		});
+	});
+
+	it("requires 1-step confirmation when enabling read_bodies while superadmin is active and validates errors/CSRF", async () => {
+		const reg = await registerAgent(db, {
+			name: "muse",
+			dailyQuestionLimit: 5,
+			actor: { actorType: "owner", actorId: ADMIN_EMAIL },
+			now: T0,
+		});
+		if (!reg.ok) throw new Error("Expected agent");
+
+		const { session } = await openAdminBotSession(ADMIN_EMAIL, T0 + 1);
+
+		const getMethodNotAllowed = await adminGet(
+			session,
+			"/admin/adminbot/read-bodies",
+			T0 + 2,
+		);
+		expect(getMethodNotAllowed.response.status).toBe(405);
+
+		const unconfigured = await adminPost(
+			session,
+			"/admin/adminbot/read-bodies",
+			{ enabled: "1" },
+			T0 + 2,
+		);
+		expect(unconfigured.response.status).toBe(409);
+
+		const badEnabled = await adminPost(
+			session,
+			"/admin/adminbot/read-bodies",
+			{ enabled: "maybe" },
+			T0 + 3,
+		);
+		expect(badEnabled.response.status).toBe(400);
+
+		await adminPost(
+			session,
+			"/admin/adminbot/designate",
+			{ agent_id: reg.data.agent.id },
+			T0 + 4,
+		);
+
+		await db
+			.prepare("UPDATE admin_bot_config SET superadmin_until = ? WHERE id = 1")
+			.bind(T0 + 7 * DAY_MS)
+			.run();
+
+		const confirmPage = await adminPost(
+			session,
+			"/admin/adminbot/read-bodies",
+			{ enabled: "1" },
+			T0 + 5,
+		);
+		expect(confirmPage.response.status).toBe(200);
+		expect(confirmPage.html).toContain("本文閲覧の有効化確認");
+		expect(confirmPage.html).toContain('name="confirm" value="1"');
+		expect(confirmPage.html.match(/<script>/g)).toHaveLength(1);
+		expect((await getAdminBotConfig(db)).readBodies).toBe(false);
+
+		const confirmed = await adminPost(
+			session,
+			"/admin/adminbot/read-bodies",
+			{ enabled: "1", confirm: "1" },
+			T0 + 6,
+		);
+		expect(confirmed.response.status).toBe(200);
+		expect(confirmed.html).toContain("管理者ボットの本文閲覧をオンにしました");
+		expect((await getAdminBotConfig(db)).readBodies).toBe(true);
+
+		const noCsrf = await handleAdminRequest(
+			new Request("https://paab.test/admin/adminbot/read-bodies", {
+				method: "POST",
+				headers: {
+					Cookie: session.cookie,
+					Origin: "https://paab.test",
+					"Cf-Access-Jwt-Assertion": session.jwt,
+				},
+				body: new URLSearchParams({ enabled: "0" }),
 			}),
 			accessEnv(),
 			T0 + 7,

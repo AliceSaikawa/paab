@@ -13,11 +13,19 @@ import {
 	getAdminBotConfig,
 	issueAdminBotToken,
 	revokeAdminBotToken,
+	setAdminBotReadBodies,
 } from "../../adminbot";
+import { isBodyRecordingEnabled } from "../../audit";
+import { auditBodyConfig } from "../../mcp/config";
 import { adminPageResponse, type FlashMessage } from "../layout";
 import type { AdminGetContext, AdminPostContext, AdminRoute } from "../router";
 import { CHANGE_ACTION_LABELS } from "../rules/render";
-import { renderAdminBotPageBody, renderIssuedAdminTokenBody } from "./render";
+import {
+	activeSuperadminUntil,
+	renderAdminBotPageBody,
+	renderIssuedAdminTokenBody,
+	renderReadBodiesConfirmBody,
+} from "./render";
 
 const ADMIN_BOT_PATH = "/admin/adminbot";
 const ADMIN_BOT_TITLE = "管理者ボット";
@@ -96,6 +104,8 @@ async function renderAdminBotScreen(
 				changes,
 				csrfToken: ctx.csrfToken,
 				adminMcpUrl: `${ctx.url.origin}/mcp/admin`,
+				bodyRecordingEnabled: isBodyRecordingEnabled(auditBodyConfig(ctx.env)),
+				now: ctx.now,
 			}),
 		},
 		options.status ?? 200,
@@ -328,6 +338,97 @@ async function handleRevertAdminBotChange(
 	});
 }
 
+function parseReadBodiesEnabled(raw: string | null): boolean | null {
+	if (raw === null) return null;
+	switch (raw.trim().toLowerCase()) {
+		case "1":
+		case "true":
+		case "on":
+			return true;
+		case "0":
+		case "false":
+		case "off":
+			return false;
+		default:
+			return null;
+	}
+}
+
+async function handleSetReadBodies(ctx: AdminPostContext): Promise<Response> {
+	const enabled = parseReadBodiesEnabled(ctx.form.get("enabled"));
+	if (enabled === null) {
+		return renderAdminBotScreen(ctx, {
+			status: 400,
+			flash: {
+				kind: "error",
+				message: "本文閲覧スイッチの指定が不正です",
+			},
+		});
+	}
+
+	if (enabled && ctx.form.get("confirm") !== "1") {
+		const config = await getAdminBotConfig(ctx.env.DB);
+		const superadminUntil = activeSuperadminUntil(config, ctx.now);
+		if (
+			config.agentId !== null &&
+			!config.readBodies &&
+			superadminUntil !== null
+		) {
+			const row = await ctx.env.DB.prepare(
+				"SELECT name FROM agents WHERE id = ?",
+			)
+				.bind(config.agentId)
+				.first<{ name: string }>();
+			return adminPageResponse({
+				title: "本文閲覧の有効化確認",
+				currentPath: ADMIN_BOT_PATH,
+				user: ctx.user,
+				devMode: ctx.devMode,
+				body: renderReadBodiesConfirmBody({
+					agentName: row?.name ?? config.agentId,
+					csrfToken: ctx.csrfToken,
+					superadminUntil,
+					bodyRecordingEnabled: isBodyRecordingEnabled(
+						auditBodyConfig(ctx.env),
+					),
+				}),
+			});
+		}
+	}
+
+	const result = await setAdminBotReadBodies(ctx.env.DB, {
+		enabled,
+		actor: ownerActor(ctx),
+		now: ctx.now,
+	});
+	if (!result.ok) {
+		return renderAdminBotScreen(ctx, {
+			status: statusForError(result.code),
+			flash: { kind: "error", message: result.message },
+		});
+	}
+
+	if (!result.data.changed) {
+		return renderAdminBotScreen(ctx, {
+			flash: {
+				kind: "info",
+				message: enabled
+					? "本文閲覧はすでにオンです"
+					: "本文閲覧はすでにオフです",
+			},
+		});
+	}
+
+	return renderAdminBotScreen(ctx, {
+		flash: {
+			kind: "success",
+			message: enabled
+				? "管理者ボットの本文閲覧をオンにしました"
+				: "管理者ボットの本文閲覧をオフにしました",
+		},
+	});
+}
+
 /** Admin UI routes for designating the admin bot and managing its `/mcp/admin` token. */
 export function adminBotRoutes(): AdminRoute[] {
 	return [
@@ -343,5 +444,6 @@ export function adminBotRoutes(): AdminRoute[] {
 			pattern: "/admin/adminbot/changes/:id/revert",
 			post: handleRevertAdminBotChange,
 		},
+		{ pattern: "/admin/adminbot/read-bodies", post: handleSetReadBodies },
 	];
 }

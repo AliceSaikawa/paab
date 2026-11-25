@@ -14,6 +14,9 @@ export {
 	issueAdminBotToken,
 	type RevokeAdminBotTokenResult,
 	revokeAdminBotToken,
+	type SetAdminBotReadBodiesInput,
+	type SetAdminBotReadBodiesResult,
+	setAdminBotReadBodies,
 } from "./config";
 export { handleAdminMcpRequest } from "./handler";
 export { ADMIN_SERVER_INSTRUCTIONS } from "./instructions";
