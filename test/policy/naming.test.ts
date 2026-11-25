@@ -32,13 +32,24 @@ describe("nameProblem", () => {
 		);
 		expect(nameProblem("a,b")).toBe("改行・制御文字・カンマ（,）は使えません");
 		expect(nameProblem("a\tb")).toBe("改行・制御文字・カンマ（,）は使えません");
+		expect(nameProblem("a\u2028b")).toBe(
+			"改行・制御文字・カンマ（,）は使えません",
+		);
+		expect(nameProblem("a\u2029b")).toBe(
+			"改行・制御文字・カンマ（,）は使えません",
+		);
+		expect(nameProblem("a\u202eb")).toBe(
+			"改行・制御文字・カンマ（,）は使えません",
+		);
 	});
 
-	it("normalizes to NFC before checking, so look-alike names collide", () => {
-		const composed = "が"; // ガ + combining voice mark
-		const decomposed = "が";
+	it("normalizes to NFC while keeping case and width distinct", () => {
+		const composed = "が"; // U+304C
+		const decomposed = "か\u3099";
 		expect(normalizeName(decomposed)).toBe(composed);
 		expect(nameProblem(decomposed)).toBeNull();
+		expect(normalizeName("Muse")).toBe("Muse");
+		expect(normalizeName("ｍｕｓｅ")).toBe("ｍｕｓｅ");
 	});
 
 	it("trims outer whitespace before storing", () => {
