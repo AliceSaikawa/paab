@@ -3,10 +3,12 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
 	type AdminBotConfigRow,
 	type AgentRow,
+	type AgentWebhookRow,
 	type AllowRuleRow,
 	type AuditLogRow,
 	adminBotConfigFromRow,
 	agentFromRow,
+	agentWebhookFromRow,
 	allowRuleFromRow,
 	auditLogEntryFromRow,
 	type CategoryRow,
@@ -21,6 +23,7 @@ import {
 	insertChangeLogEntry,
 	insertMessage,
 	insertToken,
+	insertWebhookDelivery,
 	type MessageRow,
 	messageFromRow,
 	newId,
@@ -28,6 +31,8 @@ import {
 	proposalFromRow,
 	type TokenRow,
 	tokenFromRow,
+	type WebhookDeliveryRow,
+	webhookDeliveryFromRow,
 } from "../../src/db";
 import type {
 	Agent,
@@ -105,6 +110,7 @@ describe("test database helper", () => {
 		const tables = results.map((row) => row.name);
 		expect(tables).toEqual([
 			"admin_bot_config",
+			"agent_webhooks",
 			"agents",
 			"allow_rules",
 			"audit_log",
@@ -114,6 +120,7 @@ describe("test database helper", () => {
 			"pending_descriptions",
 			"proposals",
 			"tokens",
+			"webhook_deliveries",
 		]);
 		for (const table of tables) {
 			const count = await db
@@ -710,6 +717,8 @@ describe("migrations", () => {
 			)
 			.all<{ name: string }>();
 		const knownOrder = [
+			"webhook_deliveries",
+			"agent_webhooks",
 			"pending_descriptions",
 			"proposals",
 			"admin_bot_config",
@@ -1409,6 +1418,182 @@ describe("migrations", () => {
 			.all<{ agent_id: string }>();
 		expect(remaining.results.map((r) => r.agent_id)).toEqual([b.id]);
 	});
+
+	it("preserves all existing tables when migrating to 0007 and enforces webhook constraints, index, and cascade delete", async () => {
+		await dropAllTables();
+
+		const prior = migrationsBefore("0007_");
+		const m7 = migration("0007_webhooks.sql");
+		await applyD1Migrations(db, prior);
+
+		const a = await seedAgent(db, { name: "a" });
+		const b = await seedAgent(db, { name: "b" });
+		const category = await seedCategory(db, { name: "schedule" });
+		const rule: AllowRule = {
+			fromAgentId: a.id,
+			toAgentId: b.id,
+			categoryId: category.id,
+			createdAt: T0,
+		};
+		await insertAllowRule(db, rule).run();
+		await db
+			.prepare(
+				"INSERT INTO pending_descriptions (agent_id, description, submitted_at) VALUES (?, ?, ?)",
+			)
+			.bind(a.id, "pending a", T0 + 1)
+			.run();
+
+		await applyD1Migrations(db, [...prior, m7]);
+
+		const fkViolations = await db.prepare("PRAGMA foreign_key_check").all();
+		expect(fkViolations.results).toEqual([]);
+		expect(
+			(
+				await db.prepare("SELECT * FROM agents ORDER BY name").all<AgentRow>()
+			).results.map(agentFromRow),
+		).toEqual([a, b]);
+		expect(
+			(
+				await db.prepare("SELECT * FROM allow_rules").all<AllowRuleRow>()
+			).results.map(allowRuleFromRow),
+		).toEqual([rule]);
+
+		await db
+			.prepare(
+				`INSERT INTO agent_webhooks (agent_id, url, signing_secret, created_at, updated_at)
+				VALUES (?, ?, ?, ?, ?)`,
+			)
+			.bind(a.id, "https://a.example/wake", "secret-a", T0, T0)
+			.run();
+		await db
+			.prepare(
+				`INSERT INTO agent_webhooks (agent_id, url, signing_secret, created_at, updated_at)
+				VALUES (?, ?, ?, ?, ?)`,
+			)
+			.bind(b.id, "https://b.example/wake", "secret-b", T0, T0)
+			.run();
+
+		const hookRow = await db
+			.prepare("SELECT * FROM agent_webhooks WHERE agent_id = ?")
+			.bind(a.id)
+			.first<AgentWebhookRow>();
+		expect(hookRow && agentWebhookFromRow(hookRow)).toEqual({
+			agentId: a.id,
+			url: "https://a.example/wake",
+			signingSecret: "secret-a",
+			createdAt: T0,
+			updatedAt: T0,
+		});
+
+		await expect(
+			db
+				.prepare(
+					`INSERT INTO agent_webhooks (agent_id, url, signing_secret, created_at, updated_at)
+					VALUES (?, 'https://dup.example/wake', 'secret-dup', ?, ?)`,
+				)
+				.bind(a.id, T0, T0)
+				.run(),
+		).rejects.toThrow(/UNIQUE|PRIMARY KEY/);
+
+		await expect(
+			db
+				.prepare(
+					`INSERT INTO agent_webhooks (agent_id, url, signing_secret, created_at, updated_at)
+					VALUES (?, 'https://ghost.example/wake', 'secret-ghost', ?, ?)`,
+				)
+				.bind(newId(), T0, T0)
+				.run(),
+		).rejects.toThrow(/FOREIGN KEY/);
+
+		await expect(
+			db
+				.prepare(
+					`INSERT INTO agent_webhooks (agent_id, url, signing_secret, created_at, updated_at)
+					VALUES (?, 'https://a.example/wake', 'secret', 'bad-int', ?)`,
+				)
+				.bind(newId(), T0)
+				.run(),
+		).rejects.toThrow(/STRICT|datatype/i);
+
+		const dDue = {
+			id: newId(),
+			agentId: a.id,
+			status: "pending" as const,
+			attempts: 0,
+			nextAttemptAt: T0 + 10,
+			lastError: null,
+			createdAt: T0,
+			updatedAt: T0,
+		};
+		const dLater = {
+			id: newId(),
+			agentId: b.id,
+			status: "pending" as const,
+			attempts: 1,
+			nextAttemptAt: T0 + 100,
+			lastError: "HTTP 502",
+			createdAt: T0,
+			updatedAt: T0 + 5,
+		};
+		await db.batch([
+			insertWebhookDelivery(db, dDue),
+			insertWebhookDelivery(db, dLater),
+		]);
+
+		const dueSql =
+			"SELECT * FROM webhook_deliveries WHERE status = 'pending' AND next_attempt_at <= ?";
+		const dueRows = await db
+			.prepare(dueSql)
+			.bind(T0 + 10)
+			.all<WebhookDeliveryRow>();
+		expect(dueRows.results.map(webhookDeliveryFromRow)).toEqual([dDue]);
+		expect(await queryPlan(dueSql, T0 + 10)).toContain(
+			"webhook_deliveries_due_idx",
+		);
+
+		await expect(
+			db
+				.prepare(
+					`INSERT INTO webhook_deliveries
+						(id, agent_id, status, attempts, next_attempt_at, created_at, updated_at)
+					VALUES (?, ?, 'retrying', 0, ?, ?, ?)`,
+				)
+				.bind(newId(), a.id, T0, T0, T0)
+				.run(),
+		).rejects.toThrow(/CHECK/);
+
+		await expect(
+			db
+				.prepare(
+					`INSERT INTO webhook_deliveries
+						(id, agent_id, status, attempts, next_attempt_at, created_at, updated_at)
+					VALUES (?, ?, 'pending', 'nan', ?, ?, ?)`,
+				)
+				.bind(newId(), a.id, T0, T0, T0)
+				.run(),
+		).rejects.toThrow(/STRICT|datatype/i);
+
+		await expect(
+			db
+				.prepare(
+					`INSERT INTO webhook_deliveries
+						(id, agent_id, status, attempts, next_attempt_at, created_at, updated_at)
+					VALUES (?, ?, 'pending', 0, ?, ?, ?)`,
+				)
+				.bind(newId(), newId(), T0, T0, T0)
+				.run(),
+		).rejects.toThrow(/FOREIGN KEY/);
+
+		await db.prepare("DELETE FROM agents WHERE id = ?").bind(a.id).run();
+		const remainingHooks = await db
+			.prepare("SELECT agent_id FROM agent_webhooks")
+			.all<{ agent_id: string }>();
+		expect(remainingHooks.results.map((r) => r.agent_id)).toEqual([b.id]);
+		const remainingDeliveries = await db
+			.prepare("SELECT agent_id FROM webhook_deliveries")
+			.all<{ agent_id: string }>();
+		expect(remainingDeliveries.results.map((r) => r.agent_id)).toEqual([b.id]);
+	});
 });
 
 describe("row conversion", () => {
@@ -1486,5 +1671,20 @@ describe("row conversion", () => {
 				resolved_by: null,
 			}),
 		).toThrow(/proposals\.status/);
+	});
+
+	it("throws on unknown webhook_deliveries.status values", () => {
+		expect(() =>
+			webhookDeliveryFromRow({
+				id: "d1",
+				agent_id: "a1",
+				status: "unknown_status",
+				attempts: 0,
+				next_attempt_at: T0,
+				last_error: null,
+				created_at: T0,
+				updated_at: T0,
+			}),
+		).toThrow(/webhook_deliveries\.status/);
 	});
 });

@@ -62,6 +62,7 @@ export async function createMcpWorld(): Promise<McpWorld> {
 export interface ConnectOptions {
 	now?: number;
 	env?: McpEnv;
+	executionCtx?: Pick<ExecutionContext, "waitUntil">;
 }
 
 /** Connects a real MCP client that sends `token` with every request. */
@@ -76,6 +77,7 @@ export async function connect(
 				new Request(input, init),
 				options.env ?? env,
 				options.now ?? T0,
+				options.executionCtx,
 			),
 		requestInit:
 			token === null ? {} : { headers: { Authorization: `Bearer ${token}` } },

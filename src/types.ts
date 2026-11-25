@@ -78,6 +78,8 @@ export const AUDIT_EVENT_TYPES = [
 	"admin_tool_denied",
 	"description_submitted",
 	"admin_body_read",
+	"webhook_notified",
+	"webhook_failed",
 ] as const;
 export type AuditEventType = (typeof AUDIT_EVENT_TYPES)[number];
 
@@ -101,6 +103,7 @@ export const REASON_CODES = [
 	"token_revoked",
 	"not_admin_bot",
 	"permission_denied",
+	"webhook_delivery_failed",
 ] as const;
 export type ReasonCode = (typeof REASON_CODES)[number];
 
@@ -213,6 +216,8 @@ export const CHANGE_ACTIONS = [
 	"change_reverted",
 	"description_approved",
 	"description_rejected",
+	"webhook_configured",
+	"webhook_deleted",
 ] as const;
 export type ChangeAction = (typeof CHANGE_ACTIONS)[number];
 
@@ -267,4 +272,37 @@ export interface Proposal {
 	expiresAt: UnixMillis;
 	resolvedAt: UnixMillis | null;
 	resolvedBy: string | null;
+}
+
+export const WEBHOOK_DELIVERY_STATUSES = [
+	"pending",
+	"delivered",
+	"abandoned",
+] as const;
+export type WebhookDeliveryStatus = (typeof WEBHOOK_DELIVERY_STATUSES)[number];
+
+export interface AgentWebhook {
+	agentId: string;
+	url: string;
+	signingSecret: string;
+	createdAt: UnixMillis;
+	updatedAt: UnixMillis;
+}
+
+export interface AgentWebhookSummary {
+	agentId: string;
+	url: string;
+	createdAt: UnixMillis;
+	updatedAt: UnixMillis;
+}
+
+export interface WebhookDelivery {
+	id: string;
+	agentId: string;
+	status: WebhookDeliveryStatus;
+	attempts: number;
+	nextAttemptAt: UnixMillis;
+	lastError: string | null;
+	createdAt: UnixMillis;
+	updatedAt: UnixMillis;
 }

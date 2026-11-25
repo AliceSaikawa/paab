@@ -1,9 +1,11 @@
 import { createMcpHandler } from "@modelcontextprotocol/server";
 import { recordAuditEvent } from "../audit";
 import { auditReasonCode, authenticate } from "../auth";
+import { isLocalWebhookAllowed } from "../notify";
 import type { UnixMillis } from "../types";
 import { auditBodyConfig, type McpEnv } from "./config";
 import { createMcpServer } from "./server";
+import type { McpContext } from "./tools";
 
 /**
  * Serves one HTTP request to `/mcp`. Nothing is kept between requests: the
@@ -14,6 +16,7 @@ export async function handleMcpRequest(
 	request: Request,
 	env: McpEnv,
 	now: UnixMillis,
+	executionCtx?: Pick<ExecutionContext, "waitUntil">,
 ): Promise<Response> {
 	const db = env.DB;
 	const audit = auditBodyConfig(env);
@@ -46,6 +49,14 @@ export async function handleMcpRequest(
 		return new Response("agent suspended", { status: 403 });
 	}
 
-	const ctx = { db, agent: auth.agent, audit, now };
+	const ctx: McpContext = {
+		db,
+		agent: auth.agent,
+		audit,
+		now,
+		allowLocalWebhooks: isLocalWebhookAllowed(env),
+		webhookFetcher: env.webhookFetcher,
+		executionCtx,
+	};
 	return createMcpHandler(() => createMcpServer(ctx)).fetch(request);
 }

@@ -1,9 +1,12 @@
 import {
 	type AdminErrorCode,
 	type ChangeActor,
+	configureAgentWebhook,
 	deleteAgent,
+	deleteAgentWebhook,
 	issueAgentToken,
 	listAgentsWithStatus,
+	listAgentWebhooks,
 	registerAgent,
 	resolveDefaultOwnerId,
 	resumeAgent,
@@ -11,6 +14,7 @@ import {
 	suspendAgent,
 	updateAgent,
 } from "../../admin";
+import { isLocalWebhookAllowed } from "../../notify";
 import { adminPageResponse, type FlashMessage } from "../layout";
 import type { AdminGetContext, AdminPostContext, AdminRoute } from "../router";
 import {
@@ -19,6 +23,7 @@ import {
 	type AgentUiTokenPurpose,
 	type RegisterFormDraft,
 	renderAgentsPageBody,
+	renderConfiguredWebhookBody,
 	renderDeleteConfirmBody,
 	renderIssuedTokenBody,
 } from "./render";
@@ -72,9 +77,10 @@ async function renderAgentsList(
 		registerDraft?: RegisterFormDraft;
 	} = {},
 ): Promise<Response> {
-	const [agents, defaultOwnerId] = await Promise.all([
+	const [agents, defaultOwnerId, webhooks] = await Promise.all([
 		listAgentsWithStatus(ctx.env.DB, ctx.now),
 		resolveDefaultOwnerId(ctx.env.DB),
+		listAgentWebhooks(ctx.env.DB),
 	]);
 	return adminPageResponse(
 		{
@@ -85,6 +91,7 @@ async function renderAgentsList(
 			flash: options.flash,
 			body: renderAgentsPageBody({
 				agents,
+				webhooks,
 				defaultOwnerId,
 				csrfToken: ctx.csrfToken,
 				registerDraft: options.registerDraft,
@@ -351,6 +358,70 @@ async function handleRevokeAgentToken(
 	});
 }
 
+async function handleConfigureWebhook(
+	ctx: AdminPostContext,
+): Promise<Response> {
+	const agentId = ctx.params.id ?? "";
+	const url = ctx.form.get("url") ?? "";
+	const result = await configureAgentWebhook(ctx.env.DB, {
+		agentId,
+		url,
+		allowLocal: isLocalWebhookAllowed(ctx.env),
+		actor: actorFrom(ctx),
+		now: ctx.now,
+	});
+	if (!result.ok) {
+		return renderAgentsList(ctx, {
+			status: errorStatus(result.code),
+			flash: { kind: "error", message: result.message },
+		});
+	}
+
+	return adminPageResponse({
+		title: "Webhook 設定完了",
+		currentPath: AGENTS_PATH,
+		user: ctx.user,
+		devMode: ctx.devMode,
+		flash: {
+			kind: "success",
+			message: `「${result.data.agentName}」の Webhook を設定しました`,
+		},
+		body: renderConfiguredWebhookBody({
+			agentName: result.data.agentName,
+			url: result.data.url,
+			signingSecret: result.data.signingSecret,
+			replacedPrevious: result.data.replacedPrevious,
+		}),
+	});
+}
+
+async function handleDeleteWebhook(ctx: AdminPostContext): Promise<Response> {
+	const agentId = ctx.params.id ?? "";
+	const result = await deleteAgentWebhook(ctx.env.DB, {
+		agentId,
+		actor: actorFrom(ctx),
+		now: ctx.now,
+	});
+	if (!result.ok) {
+		return renderAgentsList(ctx, {
+			status: errorStatus(result.code),
+			flash: { kind: "error", message: result.message },
+		});
+	}
+
+	return renderAgentsList(ctx, {
+		flash: result.data.deleted
+			? {
+					kind: "success",
+					message: `「${result.data.agentName}」の Webhook を削除しました`,
+				}
+			: {
+					kind: "info",
+					message: "Webhook は設定されていませんでした",
+				},
+	});
+}
+
 export function agentRoutes(): AdminRoute[] {
 	const tokenRoutes = AGENT_UI_TOKEN_PURPOSES.flatMap((purpose) => {
 		const config = AGENT_TOKEN_UI_CONFIG[purpose];
@@ -390,5 +461,13 @@ export function agentRoutes(): AdminRoute[] {
 			post: handleDeleteAgent,
 		},
 		...tokenRoutes,
+		{
+			pattern: "/admin/agents/:id/webhook",
+			post: handleConfigureWebhook,
+		},
+		{
+			pattern: "/admin/agents/:id/webhook/delete",
+			post: handleDeleteWebhook,
+		},
 	];
 }

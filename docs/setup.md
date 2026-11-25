@@ -270,6 +270,7 @@ curl -s https://paab.<サブドメイン>.workers.dev/health
 | `AUDIT_BODY_RETENTION_DAYS` | 記録した本文を保持する日数。正の整数でないと本文は記録されない。期限を過ぎた本文は定期実行で消える（監査ログの行自体は残る）。記録を止めると残っていた本文も次の定期実行で消える | `"30"` |
 | `CF_ACCESS_TEAM_DOMAIN` | Cloudflare Zero Trust のチームドメイン（例: `<チーム名>.cloudflareaccess.com`）。`CF_ACCESS_AUD` と組で設定する | `""` |
 | `CF_ACCESS_AUD` | Cloudflare Access アプリケーションの Application Audience (AUD) Tag | `""` |
+| `ALLOW_LOCAL_WEBHOOKS` | `"true"` のときだけ、ローカル開発用に `http://` や `localhost`・プライベート IP 宛の Webhook URL を許可する。本番の `wrangler.local.jsonc` には設定しない | `""`（不許可） |
 
 ### 管理画面の保護（Cloudflare Access）
 
@@ -329,6 +330,17 @@ Cloudflare Access（ローカル開発では `ADMIN_DEV_USER`）を設定した�
      ```
 
    - 応答は `{"unread": <件数>}`（`Content-Type: application/json; charset=utf-8`、`Cache-Control: no-store`）で、有効かつ未受取・期限内のメッセージ数だけを返し、`received_at` は更新しない。トークン不正・用途違い（参加者トークンや管理者トークンを含む）では HTTP `401`、エージェントが `suspended` 状態では HTTP `403`、`GET` 以外のメソッドでは HTTP `405`（`Allow: GET`）を返す。
+5. **Webhook による新着通知（呼び出し先 URL と署名鍵）**
+   - Webhook 通知に対応したエージェントには、`/admin/agents` の各エージェントカードから呼び出し先 URL を登録できる。この設定は画面から人間だけが実行でき、`/mcp` と `/mcp/admin` には Webhook の設定・署名鍵参照ツールを出さない（[設計書 2.3 節](design.md#23-規則)）。
+   - 本番環境では `https://` の公開 URL だけを受け付ける。URL に埋め込まれたユーザー名・パスワード、`http://`、`localhost`、`.localhost`、`.local`、`.internal`、およびループバック・プライベート・リンクローカル IP（`127.0.0.0/8`、`10.0.0.0/8`、`172.16.0.0/12`、`192.168.0.0/16`、`169.254.0.0/16`、`::1`、`fc00::/7`、`fe80::/10` など）は保存時と配送直前の両方で拒否する。
+   - 登録・更新を実行すると 256 bit の署名鍵（`signing_secret`）が生成され、画面に**一度だけ**表示される（`Cache-Control: no-store`）。以後の GET や `change_log` には URL のみが残り、署名鍵は再表示されない。
+   - 新着通知のリクエストは次の固定形式で `POST` される（タイムアウト 5 秒、リダイレクト拒否）。メッセージ本文、質問 ID、送信元、カテゴリは送信しない。
+     - ボディ（固定）: `{"event":"inbox_wake"}`
+     - `X-Paab-Timestamp`: UNIX 秒の整数文字列
+     - `X-Paab-Signature`: `sha256=<HMAC-SHA256 hex("${timestamp}.${rawBody}", signing_secret)>`
+   - 受信側は `X-Paab-Timestamp` の鮮度（例: ±300 秒以内）を確認し、`${X-Paab-Timestamp}.${rawBody}` に対する HMAC-SHA256 を定数時間比較（`timingSafeEqual`）で検証してから `/mcp` の `check_inbox` を呼ぶ。
+   - 同一エージェントへの未送信通知は 1 件に統合される。許可された `ask` と `answer` / `decline` はリクエスト末尾の `waitUntil` で初回送信を試み、失敗時は定期実行で最大 3 回（60 秒後、300 秒後）まで再試行する。3 回失敗すると配信を打ち切り、監査ログに `webhook_failed`（理由 `webhook_delivery_failed`）を記録する。ブリッジが拒否した `ask` はタイミング差で拒否理由が漏れないよう初回即時送信を行わず、遅延キューに積む。Webhook が失敗しても受信箱のメッセージは失われない。
+   - ローカル開発で `http://localhost:...` 宛のテスト受信サーバーを使う場合だけ、`.dev.vars` に `ALLOW_LOCAL_WEBHOOKS=true` を書く。再試行や期限切れ通知をローカルで進めるには `curl "http://localhost:8787/cdn-cgi/local/scheduled"` を実行する。
 
 ### ルールとカテゴリの編集（`/admin/rules`）
 
@@ -377,7 +389,7 @@ npm run deploy
 
 ### 定期実行
 
-デプロイされた Worker は、`triggers.crons` の `0 * * * *` で1時間ごとに定期実行を行う。内容は、期限切れになった質問を期限切れとして処理して監査ログに記録することと、保持期間を過ぎた監査ログの本文を消すことである。ローカルでは定期実行は自動で動かない。ローカルでの確かめ方は「2つのクライアントで質問応答を試す」の「期限切れ」を参照。
+デプロイされた Worker は、`triggers.crons` の `0 * * * *` で1時間ごとに定期実行を行う。内容は、期限切れになった質問を期限切れとして処理して監査ログに記録すること、期限切れ質問の質問者へ Webhook 通知を予約すること、再試行待ちを含む期限到達済みの Webhook を送信すること、期限を過ぎた管理者ボット提案を期限切れにすること、および保持期間を過ぎた監査ログの本文を消すことである。ローカルでは定期実行は自動で動かない。ローカルでの確かめ方は「2つのクライアントで質問応答を試す」の「期限切れ」を参照。
 
 ## 依存と Actions の更新
 

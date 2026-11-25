@@ -13,6 +13,7 @@ import {
 	recordBlockedQuestion,
 	submitQuestion,
 } from "../inbox";
+import { type WebhookFetcher, wakeAgentWithWebhook } from "../notify";
 import {
 	checkQuestion,
 	DESCRIPTION_MAX_LENGTH,
@@ -36,6 +37,9 @@ export interface McpContext {
 	agent: Agent;
 	audit: AuditBodyConfig;
 	now: UnixMillis;
+	allowLocalWebhooks?: boolean;
+	webhookFetcher?: WebhookFetcher;
+	executionCtx?: Pick<ExecutionContext, "waitUntil">;
 }
 
 export interface ToolOutput {
@@ -138,6 +142,15 @@ const ask = defineTool({
 				messageId: questionId,
 				body: question,
 			});
+			await wakeAgentWithWebhook(ctx.db, {
+				agentId: decision.toAgentId,
+				now: ctx.now,
+				immediate: true,
+				audit: ctx.audit,
+				allowLocal: ctx.allowLocalWebhooks ?? false,
+				fetcher: ctx.webhookFetcher,
+				executionCtx: ctx.executionCtx,
+			});
 		} else {
 			({ questionId } = await recordBlockedQuestion(ctx.db, {
 				fromAgentId: ctx.agent.id,
@@ -153,6 +166,17 @@ const ask = defineTool({
 				categoryId: decision.categoryId,
 				reasonCode: decision.reasonCode,
 				messageId: questionId,
+			});
+			// Delay the synthetic rejection wake-up so blocked questions match accepted
+			// questions in timing and never reveal bridge policy decisions inline.
+			await wakeAgentWithWebhook(ctx.db, {
+				agentId: ctx.agent.id,
+				now: ctx.now,
+				immediate: false,
+				audit: ctx.audit,
+				allowLocal: ctx.allowLocalWebhooks ?? false,
+				fetcher: ctx.webhookFetcher,
+				executionCtx: ctx.executionCtx,
 			});
 		}
 		// Identical for accepted and blocked questions, so that the asker
@@ -315,6 +339,15 @@ const answer = defineTool({
 			categoryId: result.categoryId,
 			messageId: question_id,
 			body: reply.kind === "answer" ? reply.body : null,
+		});
+		await wakeAgentWithWebhook(ctx.db, {
+			agentId: result.askerAgentId,
+			now: ctx.now,
+			immediate: true,
+			audit: ctx.audit,
+			allowLocal: ctx.allowLocalWebhooks ?? false,
+			fetcher: ctx.webhookFetcher,
+			executionCtx: ctx.executionCtx,
 		});
 		return ok(
 			reply.kind === "answer"

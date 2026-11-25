@@ -34,6 +34,8 @@ const migrations: D1Migration[] = Object.entries(migrationFiles)
 
 // Children before parents, so that foreign keys hold while emptying.
 const TABLES = [
+	"webhook_deliveries",
+	"agent_webhooks",
 	"pending_descriptions",
 	"proposals",
 	"admin_bot_config",

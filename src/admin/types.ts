@@ -187,3 +187,41 @@ export interface CategoryDeletionSnapshot {
 	category: Category;
 	allowRules: AllowRule[];
 }
+
+export interface ConfigureAgentWebhookInput {
+	agentId: string;
+	url: string;
+	allowLocal?: boolean;
+	actor: ChangeActor;
+	now: UnixMillis;
+}
+
+export interface ConfiguredAgentWebhook {
+	agentId: string;
+	agentName: string;
+	url: string;
+	/** Plaintext signing secret shown once to the owner and never logged. */
+	signingSecret: string;
+	replacedPrevious: boolean;
+	createdAt: UnixMillis;
+	updatedAt: UnixMillis;
+}
+
+export interface DeleteAgentWebhookInput {
+	agentId: string;
+	actor: ChangeActor;
+	now: UnixMillis;
+}
+
+export type DeleteAgentWebhookResult =
+	| {
+			ok: true;
+			data: { deleted: true; agentName: string; url: string };
+			changeId: number;
+	  }
+	| {
+			ok: true;
+			data: { deleted: false; agentName: string; url: null };
+			changeId: null;
+	  }
+	| AdminFailure;

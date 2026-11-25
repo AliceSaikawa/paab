@@ -7,14 +7,14 @@ export default {
 	async fetch(
 		request: Request,
 		env: Env,
-		_ctx: ExecutionContext,
+		ctx: ExecutionContext,
 	): Promise<Response> {
 		const url = new URL(request.url);
 		if (request.method === "GET" && url.pathname === "/health") {
 			return new Response("ok", { status: 200 });
 		}
 		if (url.pathname === "/mcp") {
-			return handleMcpRequest(request, env, Date.now());
+			return handleMcpRequest(request, env, Date.now(), ctx);
 		}
 		if (url.pathname === "/mcp/admin") {
 			return handleAdminMcpRequest(request, env, Date.now());
