@@ -1,0 +1,92 @@
+import { beforeEach, describe, expect, it } from "vitest";
+import { revokeAgentTokens, setAgentStatus } from "../../scripts/lib/admin";
+import { CliError } from "../../scripts/lib/sql";
+import { issueParticipantToken } from "../../scripts/lib/token";
+import { authenticate } from "../../src/auth";
+import type { Agent } from "../../src/types";
+import { createTestDb } from "../helpers/db";
+import { seedAgent, T0 } from "../helpers/fixtures";
+import { d1Client, snapshot } from "./support";
+
+let db: D1Database;
+let muse: Agent;
+
+beforeEach(async () => {
+	db = await createTestDb();
+	muse = await seedAgent(db, { name: "muse" });
+});
+
+describe("setAgentStatus", () => {
+	it("suspends and resumes the named agent", async () => {
+		expect(await setAgentStatus(d1Client(db), "muse", "suspended")).toBe(true);
+		const suspended = await db
+			.prepare("SELECT status FROM agents WHERE id = ?")
+			.bind(muse.id)
+			.first<{ status: string }>();
+		expect(suspended?.status).toBe("suspended");
+
+		expect(await setAgentStatus(d1Client(db), "muse", "active")).toBe(true);
+		const resumed = await db
+			.prepare("SELECT status FROM agents WHERE id = ?")
+			.bind(muse.id)
+			.first<{ status: string }>();
+		expect(resumed?.status).toBe("active");
+	});
+
+	it("reports no change when the agent already has the status", async () => {
+		const before = await snapshot(db);
+		expect(await setAgentStatus(d1Client(db), "muse", "active")).toBe(false);
+		expect(await snapshot(db)).toEqual(before);
+	});
+
+	it("refuses an unknown agent without touching the database", async () => {
+		const before = await snapshot(db);
+		await expect(
+			setAgentStatus(d1Client(db), "ghost", "suspended"),
+		).rejects.toBeInstanceOf(CliError);
+		expect(await snapshot(db)).toEqual(before);
+	});
+});
+
+describe("revokeAgentTokens", () => {
+	it("revokes every valid token of the agent", async () => {
+		const { token } = await issueParticipantToken(d1Client(db), "muse", T0);
+		await db
+			.prepare("INSERT INTO tokens VALUES ('t2', ?, 'hash2', 'admin', ?, NULL)")
+			.bind(muse.id, T0)
+			.run();
+
+		expect(await revokeAgentTokens(d1Client(db), "muse", T0 + 1)).toBe(2);
+
+		const valid = await db
+			.prepare("SELECT count(*) AS n FROM tokens WHERE revoked_at IS NULL")
+			.first<{ n: number }>();
+		expect(valid?.n).toBe(0);
+		const auth = await authenticate(db, `Bearer ${token}`, "participant");
+		expect(auth.ok).toBe(false);
+	});
+
+	it("leaves the tokens of other agents alone", async () => {
+		const grok = await seedAgent(db, { name: "grok" });
+		const other = await issueParticipantToken(d1Client(db), "grok", T0);
+		await issueParticipantToken(d1Client(db), "muse", T0);
+
+		expect(await revokeAgentTokens(d1Client(db), "muse", T0 + 1)).toBe(1);
+		const auth = await authenticate(db, `Bearer ${other.token}`, "participant");
+		expect(auth).toMatchObject({ ok: true, agent: { id: grok.id } });
+	});
+
+	it("reports zero when no token is valid", async () => {
+		const before = await snapshot(db);
+		expect(await revokeAgentTokens(d1Client(db), "muse", T0)).toBe(0);
+		expect(await snapshot(db)).toEqual(before);
+	});
+
+	it("refuses an unknown agent without touching the database", async () => {
+		const before = await snapshot(db);
+		await expect(
+			revokeAgentTokens(d1Client(db), "ghost", T0),
+		).rejects.toBeInstanceOf(CliError);
+		expect(await snapshot(db)).toEqual(before);
+	});
+});

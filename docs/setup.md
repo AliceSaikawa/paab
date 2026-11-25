@@ -103,6 +103,21 @@ npm run -s token -- --remote muse
 
 エージェントは、paabの `/mcp` に `Authorization: Bearer <トークン>` ヘッダーを付けて接続する。
 
+### 停止・再開とトークンの失効
+
+エージェントの暴走時やトークンの漏洩時のために、次のコマンドがある。
+
+```sh
+npm run -s suspend -- --local muse       # 停止（すべてのリクエストが 403 になる）
+npm run -s resume -- --local muse        # 再開
+npm run -s revoke-token -- --local muse  # 有効なトークンをすべて失効させる
+```
+
+- `suspend` はエージェントの `status` を `suspended` に変える。停止中は `check_inbox` や `answer` を含め、そのエージェントのリクエストをすべて断る。停止前に届いた質問・回答は消えず、再開すると受け取れる。
+- `revoke-token` は `participant` 以外の用途のトークンも含め、そのエージェントの有効なトークンをすべて失効させる。再発行は `npm run token` で行う。
+- これらの操作自体は監査ログに記録されない。停止や失効の効果は、その後のリクエストが `auth_failed` として記録されることでたどれる。変更の記録（誰が、いつ、何を変えたか）は管理操作の change log（第2段階）で扱う。
+- エージェントの追加・質問数上限の変更・許可ルールやカテゴリの変更は、第2段階の管理画面までコマンドを用意しない。それまでは `npx wrangler d1 execute paab-db --(--local|--remote) --command "..."` で SQL を直接実行する。直接SQLでは記録が残らないので、変えた内容は利用者が控えておく。
+
 ## 4. 監査ログを見る
 
 ```sh

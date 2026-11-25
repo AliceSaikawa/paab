@@ -17,6 +17,7 @@ import {
 	MAX_AUDIT_QUERY_LIMIT,
 } from "../src/audit/query";
 import { newId } from "../src/db/client";
+import { revokeAgentTokens, setAgentStatus } from "./lib/admin";
 import { auditLogFilter, formatAuditLog, readAuditLog } from "./lib/audit";
 import { loadSeed } from "./lib/seed";
 import {
@@ -34,6 +35,9 @@ const USAGE = `使い方:
       [--from 送信元] [--to 宛先] [--category カテゴリ]
       [--outcome ok|denied|expired] [--limit 件数] [--body]
       [--oldest] [--after-id ID] [--before-id ID]
+  npm run suspend -- (--local | --remote) <エージェント名>
+  npm run resume -- (--local | --remote) <エージェント名>
+  npm run revoke-token -- (--local | --remote) <エージェント名>
 
 共通: --persist-to <ディレクトリ> でローカル D1 の保存先を変えられます（--local のときだけ）。
 詳しくは docs/setup.md を参照してください。`;
@@ -90,6 +94,14 @@ function wranglerClient(target: string[]): D1Client {
 	};
 }
 
+function singleAgentName(operands: string[]): string {
+	const [name, ...extra] = operands;
+	if (name === undefined || extra.length > 0) {
+		throw new CliError("エージェント名を1つだけ指定してください。");
+	}
+	return name;
+}
+
 async function main(argv: string[]): Promise<void> {
 	const { values, positionals } = parseArgs({
 		args: argv,
@@ -129,7 +141,8 @@ async function main(argv: string[]): Promise<void> {
 				...(values["persist-to"] ? ["--persist-to", values["persist-to"]] : []),
 			]
 		: ["--remote"];
-	if (command !== "token" && operands.length > 0) {
+	const takesName = ["token", "suspend", "resume", "revoke-token"];
+	if (!takesName.includes(command ?? "") && operands.length > 0) {
 		throw new CliError(
 			`余分な引数があります: ${operands.join(" ")}\n\n${USAGE}`,
 		);
@@ -152,15 +165,34 @@ async function main(argv: string[]): Promise<void> {
 			return;
 		}
 		case "token": {
-			const [name, ...extra] = operands;
-			if (name === undefined || extra.length > 0) {
-				throw new CliError("エージェント名を1つだけ指定してください。");
-			}
+			const name = singleAgentName(operands);
 			const issued = await issueParticipantToken(db, name, Date.now());
 			console.error(
 				`${where} で「${name}」のトークンを発行しました。${issued.revokedPrevious ? "古いトークンは無効にしました。" : ""}この表示は一度きりです。`,
 			);
 			console.log(issued.token);
+			return;
+		}
+		case "suspend":
+		case "resume": {
+			const name = singleAgentName(operands);
+			const status = command === "suspend" ? "suspended" : "active";
+			const changed = await setAgentStatus(db, name, status);
+			console.error(
+				changed
+					? `${where} で「${name}」を${status === "suspended" ? "停止" : "再開"}しました。`
+					: `「${name}」はすでに${status === "suspended" ? "停止中" : "有効"}です。D1 は変更していません。`,
+			);
+			return;
+		}
+		case "revoke-token": {
+			const name = singleAgentName(operands);
+			const revoked = await revokeAgentTokens(db, name, Date.now());
+			console.error(
+				revoked > 0
+					? `${where} で「${name}」の有効なトークンを ${revoked} 件失効させました。`
+					: `「${name}」に有効なトークンはありません。D1 は変更していません。`,
+			);
 			return;
 		}
 		case "audit-log": {
