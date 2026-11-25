@@ -14,3 +14,6 @@ dist/
 
 # Real seed file; paab.seed.example.json is the tracked sample.
 paab.seed.json
+
+# Local deploy config with the real database_id; wrangler.jsonc keeps a dummy.
+wrangler.local.jsonc

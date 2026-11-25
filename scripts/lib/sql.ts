@@ -54,3 +54,42 @@ export function wranglerFailure(stdout: string, stderr: string): string {
 	} catch {}
 	return stderr.trim() || stdout.trim() || "wrangler failed without output";
 }
+
+export const DEFAULT_REMOTE_CONFIG = "wrangler.local.jsonc";
+
+export interface WranglerTargetOptions {
+	local?: boolean;
+	remote?: boolean;
+	persistTo?: string;
+	config?: string;
+	hasConfigFile?: (path: string) => boolean | Promise<boolean>;
+}
+
+/**
+ * Builds the target flags for `wrangler d1 execute DB`. Remote commands
+ * default to `wrangler.local.jsonc` because `wrangler.jsonc` holds a dummy
+ * `database_id`.
+ */
+export async function wranglerTargetArgs(
+	options: WranglerTargetOptions,
+): Promise<string[]> {
+	if (Boolean(options.local) === Boolean(options.remote)) {
+		throw new CliError(
+			"--local（ローカルの D1）か --remote（本番の D1）のどちらか一方を指定してください。",
+		);
+	}
+	if (options.local) {
+		return [
+			"--local",
+			...(options.persistTo ? ["--persist-to", options.persistTo] : []),
+			...(options.config ? ["--config", options.config] : []),
+		];
+	}
+	const configPath = options.config ?? DEFAULT_REMOTE_CONFIG;
+	if (options.hasConfigFile && !(await options.hasConfigFile(configPath))) {
+		throw new CliError(
+			`本番の D1 を使うには ${configPath} が必要です。wrangler.jsonc を wrangler.local.jsonc に写し、database_id を設定してください。`,
+		);
+	}
+	return ["--remote", "--config", configPath];
+}

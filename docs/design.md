@@ -112,6 +112,7 @@ paab（Personal SI Agent Bridge）は、同一人物が使う複数のパーソ�
 - ツールの引数に「自分は誰か」を入れる欄は作らない。
 - トークンはHTTPヘッダーで渡す方式を基本とする。OAuthなどの追加方式は後回し。
 - トークンは発行時に一度だけ表示し、ブリッジにはハッシュ値だけを保存する。再発行で旧トークンは即時無効。
+- 状態が `suspended` のエージェントからの接続は、トークン検証後に HTTP `403` で拒否する（`/mcp` および第3段階以降の `/mcp/admin`、第4段階の `/unread` 共通）。停止中のエージェント宛ての新しい質問は拒否し（監査ログの理由は `recipient_suspended`）、すでに受信箱にある項目は再開されるか7日で期限切れになるまで保持する。
 
 ### 3.6 暴走の防止（確定）
 
@@ -138,6 +139,7 @@ paab（Personal SI Agent Bridge）は、同一人物が使う複数のパーソ�
 - Cloudflare Accessを前段に置き、利用者本人だけを通す。ブリッジ側に認証の実装を持たない。
 - ログイン元はGitHubを標準の選択肢として導入手順書に載せる。
 - 機能：エージェント登録とトークン発行、監査ログ閲覧、停止・再開、ルール編集、カテゴリ編集、提案の承認・却下、管理者ボットの指名と権限スイッチ、呼び出し先URLの登録。
+- 停止・再開：`suspended` 状態のエージェントは各接続窓口（`/mcp`、`/mcp/admin`、`/unread`）で HTTP `403` により拒否し、そのエージェント宛ての新規質問も遮断する（`recipient_suspended`）。既存の受信箱メッセージは再開または7日経過による期限切れまで保持する（3.5 節）。
 
 ### 5.2 人間だけができること（確定）
 
@@ -182,7 +184,7 @@ paab（Personal SI Agent Bridge）は、同一人物が使う複数のパーソ�
 ## 6. 実装
 
 - 言語はTypeScript。MCPの接続方式はStreamable HTTP。
-- ライブラリは公式のMCP SDKとCloudflareのMCP向け補助を第一候補とする。
+- ライブラリは公式の `@modelcontextprotocol/server`（2.4.0）の `createMcpHandler`（Web Standard Fetch ベースの Streamable HTTP）と `zod`（4.6.7）を直接使い、Cloudflare の `agents` 補助パッケージは使わない（第1段階で採用・検証済み）。
 - パッケージ管理、テスト、デプロイの道具はWorkersの標準的な構成に合わせる。
 
 ### 6.1 作る順番（確定）
@@ -225,9 +227,9 @@ paab（Personal SI Agent Bridge）は、同一人物が使う複数のパーソ�
 
 実装時に確かめ、結果をこの文書に追記する。
 
-- 使用するライブラリのバージョンと対応状況。
-- Museでヘッダー方式が通るか。承認ダイアログが自発的な受信箱確認を妨げるか。
-- Grok Botでヘッダー方式が通るか。「コネクタの認証はOAuthのみ」とするフォーラム投稿があり、ヘッダーで接続できたとする記事と食い違っている。
-- MuseとGrok Botそれぞれで、VMとその上のスクリプトが会話の外でも動き続けるか。
-- MuseとGrok Botそれぞれで、VM上のスクリプトからエージェント本体を起こせるか。
-- GitHubにパスキーでログインした場合にCloudflare Accessを通るか。拒否されたという未解決の報告が1件ある（https://community.cloudflare.com/t/zero-trust-access-github-oauth-with-username-pass-ok-but-not-passkey-for-same-acc/908415 ）。
+- **確認済み**: 使用するライブラリのバージョンと対応状況（`@modelcontextprotocol/server` 2.4.0 の `createMcpHandler` による Web Standard Fetch Streamable HTTP と `zod` 4.6.7 を直接利用。Cloudflare の `agents` 補助パッケージは不要）。
+- **未確認**: Museでヘッダー方式が通るか。承認ダイアログが自発的な受信箱確認を妨げるか（実機未試験）。
+- **未確認**: Grok Botでヘッダー方式が通るか。「コネクタの認証はOAuthのみ」とするフォーラム投稿があり、ヘッダーで接続できたとする記事と食い違っている（実機未試験）。
+- **未確認**: MuseとGrok Botそれぞれで、VMとその上のスクリプトが会話の外でも動き続けるか（実機未試験）。
+- **未確認**: MuseとGrok Botそれぞれで、VM上のスクリプトからエージェント本体を起こせるか（実機未試験）。
+- **未確認**: GitHubにパスキーでログインした場合にCloudflare Accessを通るか。拒否されたという未解決の報告が1件ある（https://community.cloudflare.com/t/zero-trust-access-github-oauth-with-username-pass-ok-but-not-passkey-for-same-acc/908415 ）。
