@@ -217,5 +217,6 @@ curl -s http://localhost:8787/mcp \
 
 ## 補足
 
+- 対応プラン: Workers Free で動く。`check_inbox` の監査記録や定期実行の期限切れ処理は、1件ごとにクエリを発行せず25件単位の `db.batch` でまとめる。クエリ数は25件ごとのバッチ数に応じて増えるため件数無制限で一定ではないが、通常の運用では Workers Free の1呼び出しあたり50クエリの上限内に収まる。
 - コマンドは `scripts/paab.ts` を esbuild でまとめてから Node で実行する。まとめた結果は `.wrangler/tmp/paab-cli.mjs` に置かれる。
 - ローカルのD1の保存先を変えるには `--persist-to <ディレクトリ>` を付ける（`--local` のときだけ）。`wrangler dev` にも同じ値を渡す。
