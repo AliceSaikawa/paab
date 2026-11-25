@@ -1,7 +1,11 @@
 import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { grantAllowRule, queryChangeLog } from "../../../src/admin";
-import { hashToken } from "../../../src/auth";
+import {
+	grantAllowRule,
+	issueAgentToken,
+	queryChangeLog,
+} from "../../../src/admin";
+import { authenticate, hashToken } from "../../../src/auth";
 import { insertMessage, newId } from "../../../src/db";
 import { handleMcpRequest } from "../../../src/mcp";
 import {
@@ -10,6 +14,7 @@ import {
 	type JwksFetcher,
 	type UiEnv,
 } from "../../../src/ui";
+import { handleUnreadRequest } from "../../../src/unread";
 import { createTestDb } from "../../helpers/db";
 import { DAY_MS, HOUR_MS, seedCategory, T0 } from "../../helpers/fixtures";
 import { call, connect, MCP_URL } from "../../mcp/support";
@@ -796,5 +801,224 @@ describe("/admin/agents UI", () => {
 			{ fetchJwks: session.fetcher },
 		);
 		expect(noCsrf.status).toBe(403);
+	});
+
+	it("manages unread_count tokens separately from participant and admin tokens", async () => {
+		const { session } = await openAdminSession(ADMIN_EMAIL, T0);
+		await adminPost(
+			session,
+			"/admin/agents",
+			{ name: "muse", description: "a", daily_question_limit: "5" },
+			T0 + 1,
+		);
+		const museId = await findAgentIdByName("muse");
+
+		// Issue participant and admin tokens alongside unread_count to verify isolation.
+		const partIssue = await adminPost(
+			session,
+			`/admin/agents/${museId}/token`,
+			{},
+			T0 + 2,
+		);
+		const partToken = extractIssuedToken(partIssue.html);
+		const adminIssued = await issueAgentToken(db, {
+			agentId: museId,
+			purpose: "admin",
+			actor: { actorType: "owner", actorId: ADMIN_EMAIL },
+			now: T0 + 3,
+		});
+		expect(adminIssued.ok).toBe(true);
+		if (!adminIssued.ok) return;
+
+		// Before issuing unread_count, the card shows participant as valid and unread_count as not issued.
+		const beforeUnread = await adminGet(session, "/admin/agents", T0 + 4);
+		expect(beforeUnread.html).toContain("参加者トークン:");
+		expect(beforeUnread.html).toContain("件数確認トークン（/unread）:");
+		expect(beforeUnread.html).toContain("件数確認トークンを発行");
+		expect(beforeUnread.html).toContain("未発行");
+
+		// Issue unread_count token via UI.
+		const issueUnread = await adminPost(
+			session,
+			`/admin/agents/${museId}/unread-token`,
+			{},
+			T0 + 5,
+		);
+		expect(issueUnread.response.status).toBe(200);
+		expect(issueUnread.response.headers.get("Cache-Control")).toBe("no-store");
+		expect(issueUnread.html).toContain("件数確認トークンを発行しました");
+		expect(issueUnread.html).toContain("今この画面に一度だけ表示されます");
+		expect(issueUnread.html).toContain("https://paab.test/unread");
+		expect(issueUnread.html).toContain("VM 上の定期確認スクリプト");
+		expect(issueUnread.html).toContain("質問・回答の本文は取得できません");
+		expect(issueUnread.html.match(/<script>/g)).toHaveLength(1);
+
+		const unreadToken1 = extractIssuedToken(issueUnread.html);
+		expect(unreadToken1).not.toBe(partToken);
+		await assertNoTokenLeakInDb(unreadToken1);
+
+		// Verify unread_count token works on /unread, fails on /mcp, and participant/admin tokens stay valid.
+		const unreadOk = await handleUnreadRequest(
+			new Request("https://paab.test/unread", {
+				headers: { Authorization: `Bearer ${unreadToken1}` },
+			}),
+			accessEnv(),
+			T0 + 6,
+		);
+		expect(unreadOk.status).toBe(200);
+		expect(await unreadOk.json()).toEqual({ unread: 0 });
+		expect((await mcpRawPost(unreadToken1, T0 + 6)).status).toBe(401);
+		expect((await mcpRawPost(partToken, T0 + 6)).status).toBe(200);
+		expect(
+			await authenticate(db, `Bearer ${adminIssued.data.token}`, "admin"),
+		).toMatchObject({ ok: true, agent: { id: museId } });
+
+		// GET /admin/agents shows unread_count token timestamp without ever exposing plaintext.
+		const listAfterIssue = await adminGet(session, "/admin/agents", T0 + 7);
+		expect(listAfterIssue.html).not.toContain(unreadToken1);
+		expect(listAfterIssue.html).not.toContain(partToken);
+		expect(listAfterIssue.html).toContain("件数確認トークンを再発行");
+		expect(listAfterIssue.html).toContain(
+			`<time datetime="${new Date(T0 + 5).toISOString()}">`,
+		);
+
+		// Delete confirmation page reflects both active tokens.
+		const confirmDelete = await adminGet(
+			session,
+			`/admin/agents/${museId}/delete`,
+			T0 + 8,
+		);
+		expect(confirmDelete.html).toContain("件数確認トークン（/unread）:");
+		expect(confirmDelete.html).toContain(
+			"有効なトークンあり（同時に削除されます）",
+		);
+
+		// Reissue unread_count atomically revokes unreadToken1 while keeping participant & admin active.
+		const reissueUnread = await adminPost(
+			session,
+			`/admin/agents/${museId}/unread-token`,
+			{},
+			T0 + 9,
+		);
+		expect(reissueUnread.response.status).toBe(200);
+		expect(reissueUnread.response.headers.get("Cache-Control")).toBe(
+			"no-store",
+		);
+		expect(reissueUnread.html).toContain(
+			"以前の件数確認トークンは即座に無効になりました",
+		);
+		const unreadToken2 = extractIssuedToken(reissueUnread.html);
+		expect(unreadToken2).not.toBe(unreadToken1);
+		await assertNoTokenLeakInDb(unreadToken2);
+
+		expect(
+			(
+				await handleUnreadRequest(
+					new Request("https://paab.test/unread", {
+						headers: { Authorization: `Bearer ${unreadToken1}` },
+					}),
+					accessEnv(),
+					T0 + 10,
+				)
+			).status,
+		).toBe(401);
+		expect(
+			(
+				await handleUnreadRequest(
+					new Request("https://paab.test/unread", {
+						headers: { Authorization: `Bearer ${unreadToken2}` },
+					}),
+					accessEnv(),
+					T0 + 10,
+				)
+			).status,
+		).toBe(200);
+		expect((await mcpRawPost(partToken, T0 + 10)).status).toBe(200);
+		expect(
+			await authenticate(db, `Bearer ${adminIssued.data.token}`, "admin"),
+		).toMatchObject({ ok: true, agent: { id: museId } });
+
+		// Revoke unread_count invalidates unreadToken2 only.
+		const revokeUnread = await adminPost(
+			session,
+			`/admin/agents/${museId}/unread-token/revoke`,
+			{},
+			T0 + 11,
+		);
+		expect(revokeUnread.response.status).toBe(200);
+		expect(revokeUnread.html).toContain("件数確認トークンを失効させました");
+		expect(revokeUnread.html).toContain("件数確認トークンを発行");
+		expect(revokeUnread.html).toContain("参加者トークンを再発行");
+
+		expect(
+			(
+				await handleUnreadRequest(
+					new Request("https://paab.test/unread", {
+						headers: { Authorization: `Bearer ${unreadToken2}` },
+					}),
+					accessEnv(),
+					T0 + 12,
+				)
+			).status,
+		).toBe(401);
+		expect((await mcpRawPost(partToken, T0 + 12)).status).toBe(200);
+		expect(
+			await authenticate(db, `Bearer ${adminIssued.data.token}`, "admin"),
+		).toMatchObject({ ok: true, agent: { id: museId } });
+
+		// Repeating revoke writes no extra change_log entry.
+		const logsBefore = await queryChangeLog(db);
+		const revokeAgain = await adminPost(
+			session,
+			`/admin/agents/${museId}/unread-token/revoke`,
+			{},
+			T0 + 13,
+		);
+		expect(revokeAgain.response.status).toBe(200);
+		expect(revokeAgain.html).toContain(
+			"有効な件数確認トークンはありませんでした",
+		);
+		expect(await queryChangeLog(db)).toHaveLength(logsBefore.length);
+
+		// Missing agent ID returns 404 for unread-token routes too.
+		const missingId = newId();
+		expect(
+			(
+				await adminPost(
+					session,
+					`/admin/agents/${missingId}/unread-token`,
+					{},
+					T0 + 14,
+				)
+			).response.status,
+		).toBe(404);
+		expect(
+			(
+				await adminPost(
+					session,
+					`/admin/agents/${missingId}/unread-token/revoke`,
+					{},
+					T0 + 14,
+				)
+			).response.status,
+		).toBe(404);
+
+		// Change log contains token_issued and token_revoked for unread_count with owner email actor.
+		const logs = await queryChangeLog(db);
+		expect(logs.slice(0, 3).map((l) => l.action)).toEqual([
+			"token_revoked",
+			"token_issued",
+			"token_issued",
+		]);
+		for (const entry of logs.slice(0, 3)) {
+			expect(entry.actorType).toBe("owner");
+			expect(entry.actorId).toBe(ADMIN_EMAIL);
+			const meta = JSON.parse(entry.afterJson ?? entry.beforeJson ?? "null");
+			if (entry.action === "token_issued") {
+				expect(meta.purpose).toBe("unread_count");
+			} else {
+				expect(meta.tokens[0].purpose).toBe("unread_count");
+			}
+		}
 	});
 });
