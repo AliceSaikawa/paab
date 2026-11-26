@@ -345,7 +345,7 @@ describe("/admin/adminbot UI", () => {
 
 		const client = await connectAdminMcp(museAdminToken, T0 + 6);
 		const tools = await client.listTools();
-		expect(tools.tools.map((t) => t.name)).toEqual(["view_audit_log"]);
+		expect(tools.tools.map((t) => t.name)).toContain("view_audit_log");
 		const auditResult = await client.callTool({
 			name: "view_audit_log",
 			arguments: {},

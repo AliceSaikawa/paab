@@ -19,6 +19,12 @@ export { handleAdminMcpRequest } from "./handler";
 export { ADMIN_SERVER_INSTRUCTIONS } from "./instructions";
 export { createAdminMcpServer } from "./server";
 export {
+	lowerDailyLimitTool,
+	revokeAllowRuleTool,
+	suspendAgentTool,
+	TIGHTENING_TOOLS,
+} from "./tightening";
+export {
 	ADMIN_TOOLS,
 	type AdminMcpContext,
 	type AdminToolAudit,

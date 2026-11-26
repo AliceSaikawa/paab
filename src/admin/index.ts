@@ -48,3 +48,15 @@ export type {
 	UpdateAgentInput,
 	UpdateAgentResult,
 } from "./types";
+export {
+	isUndoableChangeAction,
+	listAdminBotChanges,
+	type RevertAdminBotChangeInput,
+	type RevertedChangeSummary,
+	revertAdminBotChange,
+	UNDOABLE_CHANGE_ACTIONS,
+	type UndoableChangeAction,
+	type UndoErrorCode,
+	type UndoFailure,
+	type UndoResult,
+} from "./undo";
