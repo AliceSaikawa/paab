@@ -229,3 +229,32 @@ export interface ChangeLogEntry {
 
 /** A change log entry before the database assigns its ID. */
 export type NewChangeLogEntry = Omit<ChangeLogEntry, "id">;
+
+export const PROPOSAL_KINDS = [
+	"grant_allow_rule",
+	"create_category",
+	"raise_daily_limit",
+	"resume_agent",
+] as const;
+export type ProposalKind = (typeof PROPOSAL_KINDS)[number];
+
+export const PROPOSAL_STATUSES = [
+	"pending",
+	"approved",
+	"rejected",
+	"expired",
+] as const;
+export type ProposalStatus = (typeof PROPOSAL_STATUSES)[number];
+
+export interface Proposal {
+	id: string;
+	botAgentId: string;
+	kind: ProposalKind;
+	payloadJson: string;
+	reason: string;
+	status: ProposalStatus;
+	createdAt: UnixMillis;
+	expiresAt: UnixMillis;
+	resolvedAt: UnixMillis | null;
+	resolvedBy: string | null;
+}

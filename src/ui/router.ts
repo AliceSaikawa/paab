@@ -11,6 +11,7 @@ import { auditRoutes } from "./audit";
 import { prepareCsrfGet, verifyCsrfPost } from "./csrf";
 import { html } from "./html";
 import { ADMIN_NAV_TABS, adminPageResponse } from "./layout";
+import { proposalRoutes } from "./proposals";
 import { ruleRoutes } from "./rules";
 
 export interface AdminGetContext {
@@ -105,6 +106,7 @@ const IMPLEMENTED_ROUTES: readonly AdminRoute[] = [
 	...agentRoutes(),
 	...ruleRoutes(),
 	...auditRoutes(),
+	...proposalRoutes(),
 	...adminBotRoutes(),
 ];
 const IMPLEMENTED_PATTERNS = new Set(

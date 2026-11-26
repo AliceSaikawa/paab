@@ -7,9 +7,11 @@ import {
 } from "../../src/admin";
 import {
 	clearAdminBot,
+	createProposal,
 	designateAdminBot,
 	getAdminBotConfig,
 	issueAdminBotToken,
+	listProposals,
 	revokeAdminBotToken,
 } from "../../src/adminbot";
 import { authenticate, hashToken } from "../../src/auth";
@@ -207,6 +209,75 @@ describe("admin bot config and designation", () => {
 		expect(JSON.parse(latest?.afterJson ?? "null")).toEqual(
 			switched.data.config,
 		);
+	});
+
+	it("rejects remaining pending proposals of the previous bot when switching or clearing admin bot", async () => {
+		await designateAdminBot(db, { agentId: muse.id, actor: OWNER, now: T0 });
+		const pendingOnSwitch = await createProposal(db, {
+			botAgentId: muse.id,
+			request: { kind: "create_category", name: "switch-pending" },
+			reason: "needed",
+			now: T0 + 1,
+		});
+		const approvedBeforeSwitch = await createProposal(db, {
+			botAgentId: muse.id,
+			request: { kind: "create_category", name: "already-approved" },
+			reason: "needed",
+			now: T0 + 2,
+		});
+		expect(pendingOnSwitch.ok && approvedBeforeSwitch.ok).toBe(true);
+		if (!pendingOnSwitch.ok || !approvedBeforeSwitch.ok) return;
+
+		await db
+			.prepare(
+				"UPDATE proposals SET status = 'approved', resolved_at = ?, resolved_by = ? WHERE id = ?",
+			)
+			.bind(T0 + 3, OWNER.actorId, approvedBeforeSwitch.data.proposal.id)
+			.run();
+
+		const switched = await designateAdminBot(db, {
+			agentId: grok.id,
+			actor: OWNER,
+			now: T0 + 5,
+		});
+		expect(switched.ok).toBe(true);
+
+		const afterSwitch = await listProposals(db);
+		expect(
+			afterSwitch.find((p) => p.id === pendingOnSwitch.data.proposal.id),
+		).toMatchObject({
+			status: "rejected",
+			resolvedAt: T0 + 5,
+			resolvedBy: OWNER.actorId,
+		});
+		expect(
+			afterSwitch.find((p) => p.id === approvedBeforeSwitch.data.proposal.id),
+		).toMatchObject({
+			status: "approved",
+			resolvedAt: T0 + 3,
+			resolvedBy: OWNER.actorId,
+		});
+
+		const pendingOnClear = await createProposal(db, {
+			botAgentId: grok.id,
+			request: { kind: "create_category", name: "clear-pending" },
+			reason: "needed",
+			now: T0 + 6,
+		});
+		expect(pendingOnClear.ok).toBe(true);
+		if (!pendingOnClear.ok) return;
+
+		const cleared = await clearAdminBot(db, { actor: OWNER, now: T0 + 10 });
+		expect(cleared.ok).toBe(true);
+
+		const afterClear = await listProposals(db);
+		expect(
+			afterClear.find((p) => p.id === pendingOnClear.data.proposal.id),
+		).toMatchObject({
+			status: "rejected",
+			resolvedAt: T0 + 10,
+			resolvedBy: OWNER.actorId,
+		});
 	});
 
 	it("clears designation, revokes admin tokens, resets switches, and is a no-op when already cleared", async () => {
