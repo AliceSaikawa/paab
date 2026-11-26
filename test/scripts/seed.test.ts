@@ -218,4 +218,76 @@ describe("invalid seed files", () => {
 			expect(result.errors).toHaveLength(4);
 		}
 	});
+
+	it.each([
+		[
+			"an empty agent name",
+			seedText({
+				agents: [{ name: "  \n ", description: "", dailyQuestionLimit: 5 }],
+				allowRules: [],
+			}),
+			"agents[0].name:",
+		],
+		[
+			"an oversized agent name",
+			seedText({
+				agents: [
+					{ name: "a".repeat(65), description: "", dailyQuestionLimit: 5 },
+				],
+				allowRules: [],
+			}),
+			"agents[0].name:",
+		],
+		[
+			"a category name with a comma",
+			seedText({
+				categories: ["予定", "a,b"],
+				allowRules: [],
+			}),
+			"categories[1]:",
+		],
+		[
+			"a category name with a bidi override",
+			seedText({
+				categories: ["予定", "a\u202eb"],
+				allowRules: [],
+			}),
+			"categories[1]:",
+		],
+		[
+			"an agent description with a disallowed control char",
+			seedText({
+				agents: [
+					{ name: "a", description: "bad\u0007", dailyQuestionLimit: 5 },
+				],
+				allowRules: [],
+			}),
+			"agents[0].description:",
+		],
+		[
+			"NFC-equivalent duplicate agent names",
+			seedText({
+				agents: [
+					{ name: "が", description: "", dailyQuestionLimit: 5 },
+					{ name: "か\u3099", description: "", dailyQuestionLimit: 5 },
+				],
+				allowRules: [],
+			}),
+			"agents[1].name: エージェント名「が」が重複しています（agents[0].name と同じ）",
+		],
+		[
+			"NFC-equivalent duplicate category names",
+			seedText({
+				categories: ["が", "か\u3099"],
+				allowRules: [],
+			}),
+			"categories[1]: カテゴリ「が」が重複しています（categories[0] と同じ）",
+		],
+	])(
+		"validates naming rules for %s with file path",
+		async (_, text, expected) => {
+			const message = await rejection(text);
+			expect(message).toContain(expected);
+		},
+	);
 });

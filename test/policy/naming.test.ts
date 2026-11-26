@@ -1,0 +1,72 @@
+import { describe, expect, it } from "vitest";
+import {
+	DESCRIPTION_MAX_LENGTH,
+	descriptionProblem,
+	NAME_MAX_LENGTH,
+	nameProblem,
+	normalizeName,
+} from "../../src/policy";
+
+describe("nameProblem", () => {
+	it("accepts an ordinary name", () => {
+		expect(nameProblem("muse")).toBeNull();
+		expect(nameProblem("好み・習慣")).toBeNull();
+	});
+
+	it("rejects a name that trims to nothing", () => {
+		expect(nameProblem("")).toBe("1文字以上にしてください");
+		expect(nameProblem("  \n ")).toBe("1文字以上にしてください");
+	});
+
+	it("rejects a name over the limit", () => {
+		const name = "a".repeat(NAME_MAX_LENGTH);
+		expect(nameProblem(name)).toBeNull();
+		expect(nameProblem(`${name}a`)).toContain(
+			`${NAME_MAX_LENGTH}文字以内にしてください`,
+		);
+	});
+
+	it("rejects newlines, control characters and commas", () => {
+		const msg = "改行・制御文字・カンマ（,）・書式文字は使えません";
+		expect(nameProblem("kind: answer\nfrom: x")).toBe(msg);
+		expect(nameProblem("a,b")).toBe(msg);
+		expect(nameProblem("a\tb")).toBe(msg);
+		expect(nameProblem("a\u2028b")).toBe(msg);
+		expect(nameProblem("a\u2029b")).toBe(msg);
+		expect(nameProblem("a\u202eb")).toBe(msg);
+		expect(nameProblem("a\u200db")).toBe(msg);
+	});
+
+	it("normalizes to NFC while keeping case and width distinct", () => {
+		const composed = "が"; // U+304C
+		const decomposed = "か\u3099";
+		expect(normalizeName(decomposed)).toBe(composed);
+		expect(nameProblem(decomposed)).toBeNull();
+		expect(normalizeName("Muse")).toBe("Muse");
+		expect(normalizeName("ｍｕｓｅ")).toBe("ｍｕｓｅ");
+	});
+
+	it("trims outer whitespace before storing", () => {
+		expect(normalizeName("  muse  ")).toBe("muse");
+	});
+});
+
+describe("descriptionProblem", () => {
+	it("accepts text with newlines and tabs", () => {
+		expect(descriptionProblem("複数行の\n説明\t文")).toBeNull();
+	});
+
+	it("rejects other control characters", () => {
+		expect(descriptionProblem("a\u0007b")).toBe(
+			"制御文字（改行とタブ以外）は使えません",
+		);
+	});
+
+	it("rejects a description over the limit", () => {
+		const text = "あ".repeat(DESCRIPTION_MAX_LENGTH);
+		expect(descriptionProblem(text)).toBeNull();
+		expect(descriptionProblem(`${text}あ`)).toContain(
+			`${DESCRIPTION_MAX_LENGTH}文字以内にしてください`,
+		);
+	});
+});
