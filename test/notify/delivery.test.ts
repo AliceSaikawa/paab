@@ -11,14 +11,20 @@ import {
 	suspendAgent,
 } from "../../src/admin";
 import { queryAuditLog } from "../../src/audit";
-import type { WebhookDeliveryRow } from "../../src/db";
+import {
+	insertWebhookDelivery,
+	newId,
+	type WebhookDeliveryRow,
+} from "../../src/db";
 import { runScheduledMaintenance } from "../../src/mcp";
 import type { McpEnv } from "../../src/mcp/config";
 import {
 	MAX_WEBHOOK_ATTEMPTS,
+	purgeOldWebhookDeliveries,
 	signWebhookPayload,
 	WEBHOOK_BLOCKED_DELAY_MS,
 	WEBHOOK_BODY,
+	WEBHOOK_DELIVERY_RETENTION_MS,
 	WEBHOOK_RETRY_DELAYS_MS,
 	type WebhookFetcher,
 } from "../../src/notify";
@@ -631,6 +637,178 @@ describe("webhook delivery & HMAC signing", () => {
 				attempts: 1,
 				last_error: "redirect rejected (HTTP 302)",
 			},
+		]);
+	});
+
+	it("prunes completed and abandoned webhook deliveries older than 7 days while keeping recent and pending rows", async () => {
+		expect(WEBHOOK_DELIVERY_RETENTION_MS).toBe(7 * DAY_MS);
+
+		const now = T0 + 30 * DAY_MS;
+		const cutoff = now - WEBHOOK_DELIVERY_RETENTION_MS;
+
+		const oldDeliveredId = newId();
+		const boundaryDeliveredId = newId();
+		const boundaryAbandonedId = newId();
+		const recentDeliveredId = newId();
+		const recentAbandonedId = newId();
+		const oldPendingId = newId();
+
+		await world.db.batch([
+			insertWebhookDelivery(world.db, {
+				id: oldDeliveredId,
+				agentId: world.bob.agent.id,
+				status: "delivered",
+				attempts: 1,
+				nextAttemptAt: cutoff - 10_000,
+				lastError: null,
+				createdAt: cutoff - 10_000,
+				updatedAt: cutoff - 1,
+			}),
+			insertWebhookDelivery(world.db, {
+				id: boundaryDeliveredId,
+				agentId: world.bob.agent.id,
+				status: "delivered",
+				attempts: 1,
+				nextAttemptAt: cutoff,
+				lastError: null,
+				createdAt: cutoff,
+				updatedAt: cutoff,
+			}),
+			insertWebhookDelivery(world.db, {
+				id: boundaryAbandonedId,
+				agentId: world.bob.agent.id,
+				status: "abandoned",
+				attempts: 3,
+				nextAttemptAt: cutoff,
+				lastError: "HTTP 502",
+				createdAt: cutoff - 60_000,
+				updatedAt: cutoff,
+			}),
+			insertWebhookDelivery(world.db, {
+				id: recentDeliveredId,
+				agentId: world.bob.agent.id,
+				status: "delivered",
+				attempts: 1,
+				nextAttemptAt: cutoff + 1,
+				lastError: null,
+				createdAt: cutoff + 1,
+				updatedAt: cutoff + 1,
+			}),
+			insertWebhookDelivery(world.db, {
+				id: recentAbandonedId,
+				agentId: world.bob.agent.id,
+				status: "abandoned",
+				attempts: 3,
+				nextAttemptAt: cutoff + 1,
+				lastError: "HTTP 503",
+				createdAt: cutoff + 1,
+				updatedAt: cutoff + 1,
+			}),
+			insertWebhookDelivery(world.db, {
+				id: oldPendingId,
+				agentId: world.bob.agent.id,
+				status: "pending",
+				attempts: 1,
+				nextAttemptAt: now + DAY_MS,
+				lastError: "HTTP 503",
+				createdAt: T0,
+				updatedAt: T0,
+			}),
+		]);
+
+		expect(await purgeOldWebhookDeliveries(world.db, now)).toBe(3);
+		expect(
+			(await deliveriesFor(world.bob.agent.id)).map((row) => row.id).sort(),
+		).toEqual([oldPendingId, recentAbandonedId, recentDeliveredId].sort());
+
+		// Idempotent on repeat calls, and rejects non-integer timestamps.
+		expect(await purgeOldWebhookDeliveries(world.db, now)).toBe(0);
+		await expect(
+			purgeOldWebhookDeliveries(world.db, now + 0.5),
+		).rejects.toThrow(RangeError);
+		await expect(
+			purgeOldWebhookDeliveries(world.db, Number.NaN),
+		).rejects.toThrow(RangeError);
+	});
+
+	it("prunes old delivered and abandoned webhook deliveries during runScheduledMaintenance without touching recent or pending rows", async () => {
+		await configureAgentWebhook(world.db, {
+			agentId: world.bob.agent.id,
+			url: "https://bob.example/wake",
+			actor: OWNER,
+			now: T0,
+		});
+		await configureAgentWebhook(world.db, {
+			agentId: world.alice.agent.id,
+			url: "https://alice.example/wake",
+			actor: OWNER,
+			now: T0,
+		});
+
+		const okFetch = mockFetcher(() => new Response("ok", { status: 200 }));
+		const failFetch = mockFetcher(() => new Response("down", { status: 503 }));
+
+		// Produce a real delivered row for bob at T0 + 1000.
+		const aliceOk = await connect(world.alice.token, {
+			env: mcpEnv(okFetch.fetcher),
+			now: T0 + 1000,
+		});
+		await askBob(aliceOk, "Deliver then prune");
+		expect(await deliveriesFor(world.bob.agent.id)).toMatchObject([
+			{ status: "delivered", updated_at: T0 + 1000 },
+		]);
+
+		// Produce a real abandoned row for bob at T0 + 362_000.
+		const aliceFail = await connect(world.alice.token, {
+			env: mcpEnv(failFetch.fetcher),
+			now: T0 + 2000,
+		});
+		await askBob(aliceFail, "Abandon then prune");
+		await runScheduledMaintenance(
+			mcpEnv(failFetch.fetcher),
+			T0 + 2000 + 60_000,
+		);
+		const abandonedAt = T0 + 2000 + 60_000 + 300_000;
+		await runScheduledMaintenance(mcpEnv(failFetch.fetcher), abandonedAt);
+
+		// Also insert a recent delivered row and an old pending row scheduled in the future.
+		const recentDeliveredId = newId();
+		const oldPendingId = newId();
+		await world.db.batch([
+			insertWebhookDelivery(world.db, {
+				id: recentDeliveredId,
+				agentId: world.bob.agent.id,
+				status: "delivered",
+				attempts: 1,
+				nextAttemptAt: abandonedAt + 1,
+				lastError: null,
+				createdAt: abandonedAt + 1,
+				updatedAt: abandonedAt + 1,
+			}),
+			insertWebhookDelivery(world.db, {
+				id: oldPendingId,
+				agentId: world.alice.agent.id,
+				status: "pending",
+				attempts: 1,
+				nextAttemptAt: abandonedAt + 20 * DAY_MS,
+				lastError: "HTTP 503",
+				createdAt: T0,
+				updatedAt: T0,
+			}),
+		]);
+
+		// Run maintenance right at abandonedAt + 7 days: both old bob rows are pruned,
+		// while bob's recent delivered row and alice's old pending row remain.
+		await runScheduledMaintenance(
+			mcpEnv(okFetch.fetcher),
+			abandonedAt + WEBHOOK_DELIVERY_RETENTION_MS,
+		);
+
+		expect(await deliveriesFor(world.bob.agent.id)).toMatchObject([
+			{ id: recentDeliveredId, status: "delivered" },
+		]);
+		expect(await deliveriesFor(world.alice.agent.id)).toMatchObject([
+			{ id: oldPendingId, status: "pending", updated_at: T0 },
 		]);
 	});
 });

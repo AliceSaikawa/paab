@@ -5,6 +5,7 @@ import {
 	enqueueWebhooksForAgents,
 	isLocalWebhookAllowed,
 	processDueWebhooks,
+	purgeOldWebhookDeliveries,
 } from "../notify";
 import type { UnixMillis } from "../types";
 import { auditBodyConfig, type McpEnv } from "./config";
@@ -26,7 +27,8 @@ function reportMaintenanceFailure(
 /**
  * The scheduled job: expires overdue questions, records them in the audit
  * log with one batched write per chunk, removes audit log bodies past their
- * retention, expires overdue admin bot proposals, and delivers due webhooks.
+ * retention, expires overdue admin bot proposals, delivers due webhooks, and
+ * prunes old completed or abandoned webhook delivery records.
  * Each step runs in an isolated block so a failure in one does not starve the others.
  */
 export async function runScheduledMaintenance(
@@ -82,6 +84,7 @@ export async function runScheduledMaintenance(
 			allowLocal: isLocalWebhookAllowed(env),
 			fetcher: env.webhookFetcher,
 		});
+		await purgeOldWebhookDeliveries(db, now);
 	} catch (error) {
 		reportMaintenanceFailure("webhooks", error);
 		errors.push(error);

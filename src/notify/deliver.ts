@@ -14,6 +14,7 @@ import { validateWebhookUrl } from "./url";
 export const MAX_WEBHOOK_ATTEMPTS = 3;
 export const WEBHOOK_RETRY_DELAYS_MS = [0, 60_000, 300_000] as const;
 export const WEBHOOK_BLOCKED_DELAY_MS = WEBHOOK_RETRY_DELAYS_MS[1];
+export const WEBHOOK_DELIVERY_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
 const WEBHOOK_FETCH_TIMEOUT_MS = 5000;
 const MAX_LAST_ERROR_LENGTH = 500;
@@ -498,4 +499,27 @@ export async function processDueWebhooks(
 			}
 		}
 	}
+}
+
+/**
+ * Deletes completed (`delivered`) and `abandoned` webhook delivery records
+ * whose `updated_at <= now - WEBHOOK_DELIVERY_RETENTION_MS`. Pending rows are
+ * never deleted.
+ */
+export async function purgeOldWebhookDeliveries(
+	db: D1Database,
+	now: UnixMillis,
+): Promise<number> {
+	if (!Number.isSafeInteger(now)) {
+		throw new RangeError("now must be an integer of UNIX milliseconds");
+	}
+	const cutoff = now - WEBHOOK_DELIVERY_RETENTION_MS;
+	const result = await db
+		.prepare(
+			`DELETE FROM webhook_deliveries
+			WHERE status IN ('delivered', 'abandoned') AND updated_at <= ?`,
+		)
+		.bind(cutoff)
+		.run();
+	return result.meta.changes;
 }
