@@ -1,10 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	AUDIT_BODY_RECORDING_DISABLED,
+	AUDIT_WRITE_CHUNK,
 	type AuditBodyConfig,
 	type AuditEvent,
 	queryAuditLog,
 	recordAuditEvent,
+	recordAuditEvents,
 } from "../../src/audit";
 import type { AuditLogRow } from "../../src/db";
 import { AUDIT_EVENT_TYPES } from "../../src/types";
@@ -147,6 +149,126 @@ describe("recordAuditEvent", () => {
 		expect(rows[0]?.body).toBeNull();
 	});
 
+	describe("recordAuditEvents", () => {
+		it("records every event with one batch per chunk", async () => {
+			const batch = vi.spyOn(db, "batch");
+			const events: AuditEvent[] = Array.from(
+				{ length: AUDIT_WRITE_CHUNK + 1 },
+				(_, i) => ({
+					...question,
+					occurredAt: T0 + i,
+					eventType: "question_delivered",
+					messageId: `q${i}`,
+				}),
+			);
+
+			expect(await recordAuditEvents(db, RECORDING, events)).toBe(true);
+
+			expect(batch).toHaveBeenCalledTimes(2);
+			expect(batch.mock.calls[0]?.[0]).toHaveLength(AUDIT_WRITE_CHUNK);
+			expect(batch.mock.calls[1]?.[0]).toHaveLength(1);
+			const rows = await storedRows();
+			expect(rows.map((row) => row.message_id)).toEqual(
+				events.map((event) => event.messageId),
+			);
+		});
+
+		it("writes nothing and resolves to true for an empty list", async () => {
+			const db = {
+				prepare() {
+					throw new Error("D1 is down");
+				},
+			} as unknown as D1Database;
+			expect(await recordAuditEvents(db, RECORDING, [])).toBe(true);
+		});
+
+		it("resolves to false and reports without bodies when a batch fails", async () => {
+			const error = vi.spyOn(console, "error").mockImplementation(() => {});
+			const db = {
+				prepare() {
+					throw new Error("D1 is down");
+				},
+			} as unknown as D1Database;
+
+			const result = await recordAuditEvents(db, RECORDING, [
+				{
+					...question,
+					occurredAt: T0,
+					eventType: "question_accepted",
+					body: "secret one",
+				},
+				{
+					...question,
+					occurredAt: T0 + 1,
+					eventType: "question_delivered",
+					body: "secret two",
+				},
+			]);
+
+			expect(result).toBe(false);
+			expect(error).toHaveBeenCalledTimes(1);
+			expect(error.mock.calls[0]?.[1]).toMatchObject({
+				eventTypes: ["question_accepted", "question_delivered"],
+				messageIds: ["question-1", "question-1"],
+			});
+			const report = JSON.stringify(error.mock.calls);
+			expect(report).not.toContain("secret one");
+			expect(report).not.toContain("secret two");
+		});
+
+		it("records nothing when one event is malformed", async () => {
+			const error = vi.spyOn(console, "error").mockImplementation(() => {});
+			const events: AuditEvent[] = [
+				{ ...question, occurredAt: T0, eventType: "question_accepted" },
+				{
+					...question,
+					occurredAt: T0 + 1,
+					eventType: "rule_changed",
+				} as unknown as AuditEvent,
+			];
+
+			expect(
+				await recordAuditEvents(db, AUDIT_BODY_RECORDING_DISABLED, events),
+			).toBe(false);
+			expect(await storedRows()).toEqual([]);
+			expect(error).toHaveBeenCalledTimes(1);
+		});
+
+		it("reports only unwritten chunks when a later chunk fails", async () => {
+			const error = vi.spyOn(console, "error").mockImplementation(() => {});
+			const realBatch = db.batch.bind(db);
+			let calls = 0;
+			vi.spyOn(db, "batch").mockImplementation(async (statements) => {
+				calls += 1;
+				if (calls === 2) {
+					throw new Error("chunk 2 down: secret tail");
+				}
+				return realBatch(statements);
+			});
+
+			const events: AuditEvent[] = Array.from(
+				{ length: AUDIT_WRITE_CHUNK + 2 },
+				(_, i) => ({
+					...question,
+					occurredAt: T0 + i,
+					eventType:
+						i < AUDIT_WRITE_CHUNK ? "question_delivered" : "question_expired",
+					messageId: `q${i}`,
+					body: i === AUDIT_WRITE_CHUNK ? "secret tail" : `body-${i}`,
+				}),
+			);
+
+			expect(await recordAuditEvents(db, RECORDING, events)).toBe(false);
+			expect(error).toHaveBeenCalledTimes(1);
+			expect(error.mock.calls[0]?.[1]).toMatchObject({
+				eventTypes: ["question_expired", "question_expired"],
+				messageIds: [`q${AUDIT_WRITE_CHUNK}`, `q${AUDIT_WRITE_CHUNK + 1}`],
+				error: "chunk 2 down: [body]",
+			});
+			expect((await storedRows()).length).toBe(AUDIT_WRITE_CHUNK);
+		});
+	});
+
 	it("leaves the body column empty when recording is on without a retention period", async () => {
 		await recordAuditEvent(
 			db,
@@ -181,14 +303,6 @@ describe("recordAuditEvent", () => {
 
 	describe("when the write fails", () => {
 		const SECRET_BODY = "my card number is 4111";
-
-		function failingDb(message: string): D1Database {
-			return {
-				prepare() {
-					throw new Error(message);
-				},
-			} as unknown as D1Database;
-		}
 
 		it("resolves to false instead of throwing, and reports on the console", async () => {
 			const error = vi.spyOn(console, "error").mockImplementation(() => {});
@@ -249,6 +363,14 @@ describe("recordAuditEvent", () => {
 			).toBe(false);
 			expect(error).toHaveBeenCalledTimes(1);
 		});
+
+		function failingDb(message: string): D1Database {
+			return {
+				prepare() {
+					throw new Error(message);
+				},
+			} as unknown as D1Database;
+		}
 
 		it.each([
 			["an unknown event type", { eventType: "rule_changed" }],

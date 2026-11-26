@@ -211,5 +211,6 @@ curl -s http://localhost:8787/mcp \
 
 ## 補足
 
+- 対応プラン: Workers Free で動く。`db.batch` の1回が Workers Free の上限（1呼び出しあたり50クエリ）に対して1回と数えられる前提では、`check_inbox` が使う D1 呼び出し回数は受け取るメッセージ数に依らずほぼ一定である（監査ログへの書き込みは25件ずつ `db.batch` でまとめる）。定期実行は期限切れにする質問25件あたり約3回ずつ増えるため、未回答のまま同時に期限切れになる質問が約375件を超えない限り上限に達しない（`db.batch` が文ごとに数えられるかどうかは Cloudflare の公式文書に明記がなく未確認）。
 - コマンドは `scripts/paab.ts` を esbuild でまとめてから Node で実行する。まとめた結果は `.wrangler/tmp/paab-cli.mjs` に置かれる。
 - ローカルのD1の保存先を変えるには `--persist-to <ディレクトリ>` を付ける（`--local` のときだけ）。`wrangler dev` にも同じ値を渡す。

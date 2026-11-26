@@ -1,6 +1,7 @@
 import { env } from "cloudflare:workers";
-import { beforeEach, describe, expect, it } from "vitest";
-import { queryAuditLog } from "../../src/audit";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { queryAuditLog, recordAuditEvent } from "../../src/audit";
+import { submitQuestion } from "../../src/inbox";
 import { runScheduledMaintenance } from "../../src/mcp";
 import { DAY_MS, T0 } from "../helpers/fixtures";
 import {
@@ -17,6 +18,10 @@ let world: McpWorld;
 
 beforeEach(async () => {
 	world = await createMcpWorld();
+});
+
+afterEach(() => {
+	vi.restoreAllMocks();
 });
 
 /** The boundary of the first frame in a response. */
@@ -47,6 +52,37 @@ function framedTexts(text: string): string[] {
 		from = text.indexOf(open, end + close.length);
 	}
 	return texts;
+}
+
+/**
+ * Observes `db.prepare` + `bind` + `db.batch` through the public D1 interface
+ * so tests do not rely on internal statement properties.
+ */
+function spyAuditWriteBatches(db: D1Database): () => number[] {
+	const auditStatements = new WeakSet<object>();
+	const prepare = db.prepare.bind(db);
+	vi.spyOn(db, "prepare").mockImplementation((query: string) => {
+		const statement = prepare(query);
+		if (query.includes("INSERT INTO audit_log")) {
+			auditStatements.add(statement);
+			const bind = statement.bind.bind(statement);
+			statement.bind = (...values: unknown[]) => {
+				const bound = bind(...values);
+				auditStatements.add(bound);
+				return bound;
+			};
+		}
+		return statement;
+	});
+	const batch = vi.spyOn(db, "batch");
+	return () =>
+		batch.mock.calls
+			.filter(([statements]) =>
+				(statements as object[]).some((statement) =>
+					auditStatements.has(statement),
+				),
+			)
+			.map(([statements]) => (statements as unknown[]).length);
 }
 
 /** The message blocks of a check_inbox result, keyed by kind. */
@@ -120,6 +156,28 @@ describe("check_inbox", () => {
 		expect(inboxBlocks(again.text)).toEqual([]);
 	});
 
+	it("records a long expiry backlog with batched writes", async () => {
+		for (let i = 0; i < 30; i++) {
+			await submitQuestion(world.db, {
+				fromAgentId: world.alice.agent.id,
+				toAgentId: world.bob.agent.id,
+				categoryId: world.schedule.id,
+				body: `question ${i}`,
+				now: T0,
+			});
+		}
+
+		const batchSizes = spyAuditWriteBatches(world.db);
+		await runScheduledMaintenance(env, T0 + 8 * DAY_MS);
+
+		// Two audit chunks, not one write per expired question.
+		expect(batchSizes()).toEqual([25, 5]);
+		const expired = (await queryAuditLog(world.db)).filter(
+			(row) => row.eventType === "question_expired",
+		);
+		expect(expired).toHaveLength(30);
+	});
+
 	it("shows a declined question as a rejection with nothing but IDs", async () => {
 		const alice = await connect(world.alice.token);
 		const bob = await connect(world.bob.token);
@@ -136,6 +194,24 @@ describe("check_inbox", () => {
 		expect(lines[2]).toBe(`question_id: ${questionId}`);
 		expect(text).not.toContain("bob");
 		expect(text).not.toContain("schedule");
+	});
+
+	it("records every delivery with one batched write", async () => {
+		const alice = await connect(world.alice.token);
+		const bob = await connect(world.bob.token);
+		await askBob(alice, "one");
+		await askBob(alice, "two");
+		await askBob(alice, "three");
+
+		const batchSizes = spyAuditWriteBatches(world.db);
+		const { text } = await call(bob, "check_inbox");
+
+		expect(inboxBlocks(text)).toHaveLength(3);
+		expect(batchSizes()).toEqual([3]);
+		const delivered = (await queryAuditLog(world.db)).filter(
+			(row) => row.eventType === "question_delivered",
+		);
+		expect(delivered).toHaveLength(3);
 	});
 
 	it("rejects an expired question once maintenance has run", async () => {
@@ -165,6 +241,93 @@ describe("check_inbox", () => {
 					`^kind: rejection\nmessage_id: \\S+\nquestion_id: ${questionId}$`,
 				),
 			),
+		]);
+	});
+
+	it("preserves both errors in AggregateError when expiry and audit purge both fail", async () => {
+		await recordAuditEvent(
+			world.db,
+			{ recordBodies: true, bodyRetentionDays: 30 },
+			{
+				occurredAt: T0,
+				eventType: "question_accepted",
+				fromAgentId: world.alice.agent.id,
+				toAgentId: world.bob.agent.id,
+				categoryId: world.schedule.id,
+				messageId: "q-old",
+				body: "secret",
+			},
+		);
+
+		const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
+		const prepare = world.db.prepare.bind(world.db);
+		vi.spyOn(world.db, "prepare").mockImplementation((query: string) => {
+			if (query.includes("FROM messages")) {
+				throw new Error("expiry failed");
+			}
+			if (query.includes("UPDATE audit_log")) {
+				throw new Error("purge failed");
+			}
+			return prepare(query);
+		});
+
+		const err = await runScheduledMaintenance(env, T0 + 40 * DAY_MS).catch(
+			(e: unknown) => e,
+		);
+		expect(err).toBeInstanceOf(AggregateError);
+		expect((err as AggregateError).errors).toHaveLength(2);
+		expect(errorLog).toHaveBeenCalledTimes(2);
+		expect(errorLog.mock.calls.map((c) => c[1])).toMatchObject([
+			{ step: "inbox", error: "expiry failed" },
+			{ step: "audit_purge", error: "purge failed" },
+		]);
+	});
+
+	it("purges expired audit bodies even when inbox maintenance fails", async () => {
+		const auditConfig = { recordBodies: true, bodyRetentionDays: 30 };
+		await recordAuditEvent(world.db, auditConfig, {
+			occurredAt: T0,
+			eventType: "question_accepted",
+			fromAgentId: world.alice.agent.id,
+			toAgentId: world.bob.agent.id,
+			categoryId: world.schedule.id,
+			messageId: "expired-audit-body",
+			body: "old secret",
+		});
+		await recordAuditEvent(world.db, auditConfig, {
+			occurredAt: T0 + 5 * DAY_MS,
+			eventType: "question_accepted",
+			fromAgentId: world.alice.agent.id,
+			toAgentId: world.bob.agent.id,
+			categoryId: world.schedule.id,
+			messageId: "fresh-audit-body",
+			body: "recent secret",
+		});
+
+		vi.spyOn(console, "error").mockImplementation(() => {});
+		const prepare = world.db.prepare.bind(world.db);
+		vi.spyOn(world.db, "prepare").mockImplementation((query: string) => {
+			if (query.includes("FROM messages")) {
+				throw new Error("expiry failed");
+			}
+			return prepare(query);
+		});
+
+		await expect(
+			runScheduledMaintenance(
+				{
+					...env,
+					AUDIT_RECORD_BODIES: "true",
+					AUDIT_BODY_RETENTION_DAYS: "30",
+				},
+				T0 + 30 * DAY_MS,
+			),
+		).rejects.toThrow("expiry failed");
+
+		const rows = await queryAuditLog(world.db, { includeBody: true });
+		expect(rows.map((row) => [row.messageId, row.body])).toEqual([
+			["expired-audit-body", null],
+			["fresh-audit-body", "recent secret"],
 		]);
 	});
 });

@@ -102,15 +102,24 @@ export function buildAuditLogEntry(
 	};
 }
 
+/** Bodies to keep out of console output. */
+type MaybeBody = string | null | undefined;
+
 /**
- * Describes a failure for the console without the message body. Workers Logs
- * keep console output, so nothing here may carry user content.
+ * Describes a failure for the console without the message bodies. Workers
+ * Logs keep console output, so nothing here may carry user content.
  */
-function describeFailure(error: unknown, body: unknown): string {
-	const message = error instanceof Error ? error.message : String(error);
-	return typeof body === "string" && body.length > 0
-		? message.split(body).join("[body]")
-		: message;
+function describeFailure(
+	error: unknown,
+	bodies: MaybeBody | MaybeBody[],
+): string {
+	let message = error instanceof Error ? error.message : String(error);
+	for (const body of Array.isArray(bodies) ? bodies : [bodies]) {
+		if (typeof body === "string" && body.length > 0) {
+			message = message.split(body).join("[body]");
+		}
+	}
+	return message;
 }
 
 /**
@@ -136,6 +145,61 @@ export async function recordAuditEvent(
 				eventType: String(event?.eventType),
 				messageId: event?.messageId ?? null,
 				error: describeFailure(error, event?.body),
+			});
+		} catch {
+			// Reporting must not throw either.
+		}
+		return false;
+	}
+}
+
+/**
+ * Events written per `db.batch` call, so that one call stays a single
+ * statement batch even for a long backlog. Matches the chunk the expiry
+ * sweep closes questions with.
+ */
+export const AUDIT_WRITE_CHUNK = 25;
+
+/**
+ * Records several events with one `db.batch` per `AUDIT_WRITE_CHUNK` events,
+ * instead of one statement per event. D1 caps the statements a Worker
+ * invocation may run (50 on Workers Free), so per-event writes let a full
+ * inbox or a long expiry backlog push a request over the limit.
+ *
+ * The same contract as `recordAuditEvent`: never throws or rejects, a
+ * failed write is reported on the console and as a `false` return value,
+ * and the batch never shares a `db.batch` with the operation it describes.
+ * The events of one call share a fate: when a batch fails, its remaining
+ * events are not written.
+ */
+export async function recordAuditEvents(
+	db: D1Database,
+	config: AuditBodyConfig,
+	events: AuditEvent[],
+): Promise<boolean> {
+	if (events.length === 0) {
+		return true;
+	}
+	let failedFrom = 0;
+	try {
+		const statements = events.map((event) =>
+			insertAuditLogEntry(db, buildAuditLogEntry(config, event)),
+		);
+		for (let i = 0; i < statements.length; i += AUDIT_WRITE_CHUNK) {
+			failedFrom = i;
+			await db.batch(statements.slice(i, i + AUDIT_WRITE_CHUNK));
+		}
+		return true;
+	} catch (error) {
+		const unwritten = events.slice(failedFrom);
+		try {
+			console.error("audit log write failed", {
+				eventTypes: unwritten.map((event) => String(event?.eventType)),
+				messageIds: unwritten.map((event) => event?.messageId ?? null),
+				error: describeFailure(
+					error,
+					unwritten.map((event) => event?.body),
+				),
 			});
 		} catch {
 			// Reporting must not throw either.
