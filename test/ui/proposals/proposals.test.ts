@@ -523,7 +523,10 @@ describe("/admin/proposals UI", () => {
 			"/admin/proposals",
 			afterExpiryNow,
 		);
-		expect(expiredView.html).toContain("期限切れ");
+		expect(expiredView.html).toContain("期限切れ（却下扱い）");
+		expect(expiredView.html).toContain(
+			"未処理の提案は14日で期限切れ（却下扱い）になります",
+		);
 		expect(expiredView.html).toContain("カテゴリを追加: 「期限切れカテゴリ」");
 
 		const expiredApproveRes = await adminPost(
@@ -552,5 +555,42 @@ describe("/admin/proposals UI", () => {
 			{ fetchJwks: session.fetcher },
 		);
 		expect(noCsrf.status).toBe(403);
+	});
+
+	it("renders overdue proposals as 期限切れ（却下扱い） in recent history and excludes them from pending before cron runs", async () => {
+		const created = await createProposal(db, {
+			botAgentId: bot.id,
+			request: { kind: "create_category", name: "未スイープ期限切れ" },
+			reason: "overdue before cron",
+			now: T0,
+		});
+		expect(created.ok).toBe(true);
+		if (!created.ok) return;
+
+		const afterExpiryNow = T0 + PROPOSAL_TTL_MS;
+		const jwt = await signAccessJwt(OWNER_EMAIL, afterExpiryNow);
+		const response = await handleAdminRequest(
+			new Request("https://paab.test/admin/proposals", {
+				method: "GET",
+				headers: { "Cf-Access-Jwt-Assertion": jwt },
+			}),
+			accessEnv(),
+			afterExpiryNow,
+			{ fetchJwks: jwksFetcher() },
+		);
+		const html = await response.text();
+		expect(response.status).toBe(200);
+		expect(html).toContain(
+			"未処理の提案は14日で期限切れ（却下扱い）になります",
+		);
+		expect(html).toContain("現在、承認待ちの提案はありません。");
+		expect(html).toContain(
+			'<span class="badge badge-dev">期限切れ（却下扱い）</span>',
+		);
+		expect(html).toContain("カテゴリを追加: 「未スイープ期限切れ」");
+		expect(html).toContain("期限: ");
+		expect(html).not.toContain(
+			`/admin/proposals/${encodeURIComponent(created.data.proposal.id)}/approve`,
+		);
 	});
 });

@@ -35,7 +35,7 @@ function statusBadge(
 	if (status === "rejected") {
 		return html`<span class="badge badge-danger">却下</span>`;
 	}
-	return html`<span class="badge badge-dev">期限切れ</span>`;
+	return html`<span class="badge badge-dev">期限切れ（却下扱い）</span>`;
 }
 
 function proposalActionPath(id: string, action: "approve" | "reject"): string {
@@ -120,13 +120,14 @@ function renderRecentSection(
 								</thead>
 								<tbody>
 									${recent.map((proposal) => {
-										const isOverdue =
-											proposal.status === "pending" &&
-											proposal.expiresAt <= now;
+										const isExpired =
+											proposal.status === "expired" ||
+											(proposal.status === "pending" &&
+												proposal.expiresAt <= now);
 										return html`
 											<tr>
 												<td>${formatTimestamp(proposal.createdAt)}</td>
-												<td>${statusBadge(proposal.status, isOverdue)}</td>
+												<td>${statusBadge(proposal.status, isExpired)}</td>
 												<td>${KIND_LABELS[proposal.kind]}</td>
 												<td>${proposal.botAgentName}</td>
 												<td>${describeProposalEffect(proposal)}</td>
@@ -140,7 +141,7 @@ function renderRecentSection(
 													${
 														proposal.resolvedAt !== null
 															? html`<div class="muted">${formatTimestamp(proposal.resolvedAt)}</div>`
-															: isOverdue
+															: isExpired
 																? html`<div class="muted">期限: ${formatTimestamp(proposal.expiresAt)}</div>`
 																: "-"
 													}
@@ -168,7 +169,7 @@ export function renderProposalsPageBody(data: ProposalsPageData): SafeHtml {
 			</div>
 
 			<div class="banner banner-info" role="note">
-				「<strong>ブリッジが生成した変更内容</strong>」は提案の種別と対象からブリッジが機械的に生成しています。「<strong>管理者ボットが書いた理由</strong>」とは別に表示し、理由文の内容が変更内容を書き換えることはありません。保留中: <strong>${data.pending.length} / ${MAX_PENDING_PROPOSALS}</strong> 件（未処理の提案は14日で期限切れになります）。
+				「<strong>ブリッジが生成した変更内容</strong>」は提案の種別と対象からブリッジが機械的に生成しています。「<strong>管理者ボットが書いた理由</strong>」とは別に表示し、理由文の内容が変更内容を書き換えることはありません。保留中: <strong>${data.pending.length} / ${MAX_PENDING_PROPOSALS}</strong> 件（未処理の提案は14日で期限切れ（却下扱い）になります）。
 			</div>
 
 			<section class="stack">

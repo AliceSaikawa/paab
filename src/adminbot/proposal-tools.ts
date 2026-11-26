@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { renderFramed } from "../mcp/frame";
+import { type Frame, renderFramed } from "../mcp/frame";
 import { PROPOSAL_STATUSES } from "../types";
 import { isSuperadminActive } from "./config";
 import {
@@ -43,12 +43,14 @@ async function runLooseningTool(
 				: adminToolFail(result.message);
 		}
 		return adminToolOk(
-			[
-				`change_id: ${result.data.changeId}`,
-				`kind: ${result.data.kind}`,
-				"status: executed",
-				`effect: ${result.data.effect}`,
-			].join("\n"),
+			renderFramed((frame) =>
+				[
+					`change_id: ${result.data.changeId}`,
+					`kind: ${result.data.kind}`,
+					"status: executed",
+					`effect:\n${frame(result.data.effect)}`,
+				].join("\n"),
+			),
 			result.data.audit,
 		);
 	}
@@ -63,14 +65,17 @@ async function runLooseningTool(
 			: adminToolFail(result.message);
 	}
 	const { proposal } = result.data;
+	const effect = describeProposalEffect(proposal);
 	return adminToolOk(
-		[
-			`proposal_id: ${proposal.id}`,
-			`kind: ${proposal.kind}`,
-			`status: ${proposal.status}`,
-			`expires_at: ${new Date(proposal.expiresAt).toISOString()}`,
-			`effect: ${describeProposalEffect(proposal)}`,
-		].join("\n"),
+		renderFramed((frame) =>
+			[
+				`proposal_id: ${proposal.id}`,
+				`kind: ${proposal.kind}`,
+				`status: ${proposal.status}`,
+				`expires_at: ${new Date(proposal.expiresAt).toISOString()}`,
+				`effect:\n${frame(effect)}`,
+			].join("\n"),
+		),
 		{ messageId: proposal.id },
 	);
 }
@@ -164,10 +169,7 @@ const proposeResumeAgent = defineAdminTool({
 	},
 });
 
-function renderProposalEntry(
-	proposal: ProposalView,
-	frame: (text: string) => string,
-): string {
+function renderProposalEntry(proposal: ProposalView, frame: Frame): string {
 	return [
 		`id: ${proposal.id}`,
 		`kind: ${proposal.kind}`,
@@ -176,9 +178,8 @@ function renderProposalEntry(
 		`expires_at: ${new Date(proposal.expiresAt).toISOString()}`,
 		`resolved_at: ${proposal.resolvedAt !== null ? new Date(proposal.resolvedAt).toISOString() : "-"}`,
 		`resolved_by: ${proposal.resolvedBy ?? "-"}`,
-		`effect: ${describeProposalEffect(proposal)}`,
-		"reason:",
-		frame(proposal.reason),
+		`effect:\n${frame(describeProposalEffect(proposal))}`,
+		`reason:\n${frame(proposal.reason)}`,
 	].join("\n");
 }
 
@@ -193,7 +194,10 @@ const listProposalsTool = defineAdminTool({
 			.describe("Optional filter: pending, approved, rejected, or expired."),
 	}),
 	async run(ctx, args) {
-		const proposals = await listProposals(ctx.db, { status: args.status });
+		const proposals = await listProposals(ctx.db, {
+			status: args.status,
+			now: ctx.now,
+		});
 		if (proposals.length === 0) {
 			return adminToolOk("no matching proposals");
 		}

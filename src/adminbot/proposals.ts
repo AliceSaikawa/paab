@@ -102,6 +102,7 @@ export interface ProposalView extends Proposal {
 
 export interface ListProposalsOptions {
 	status?: ProposalStatus;
+	now?: UnixMillis;
 	limit?: number;
 }
 
@@ -1370,11 +1371,18 @@ interface ProposalJoinRow extends ProposalRow {
 
 /**
  * Lists proposals ordered newest-first, optionally filtered by status.
+ *
+ * When `options.now` is provided, `pending` proposals whose
+ * `expires_at <= options.now` are treated as `expired` on read (both in SQL
+ * status filtering and in the returned `ProposalView.status`).
  */
 export async function listProposals(
 	db: D1Database,
 	options: ListProposalsOptions = {},
 ): Promise<ProposalView[]> {
+	if (options.now !== undefined && !Number.isSafeInteger(options.now)) {
+		throw new RangeError("now must be an integer of UNIX milliseconds");
+	}
 	const where: string[] = [];
 	const params: (string | number)[] = [];
 	if (options.status !== undefined) {
@@ -1383,8 +1391,18 @@ export async function listProposals(
 				`status must be one of: ${PROPOSAL_STATUSES.join(", ")}`,
 			);
 		}
-		where.push("p.status = ?");
-		params.push(options.status);
+		if (options.now !== undefined && options.status === "pending") {
+			where.push("p.status = 'pending' AND p.expires_at > ?");
+			params.push(options.now);
+		} else if (options.now !== undefined && options.status === "expired") {
+			where.push(
+				"(p.status = 'expired' OR (p.status = 'pending' AND p.expires_at <= ?))",
+			);
+			params.push(options.now);
+		} else {
+			where.push("p.status = ?");
+			params.push(options.status);
+		}
 	}
 	const limit = options.limit ?? DEFAULT_LIST_PROPOSALS_LIMIT;
 	if (!Number.isSafeInteger(limit) || limit < 1) {
@@ -1406,8 +1424,18 @@ export async function listProposals(
 		.bind(...params)
 		.all<ProposalJoinRow>();
 
-	return results.map((row) => ({
-		...proposalFromRow(row),
-		botAgentName: row.bot_agent_name,
-	}));
+	return results.map((row) => {
+		const proposal = proposalFromRow(row);
+		const status: ProposalStatus =
+			proposal.status === "pending" &&
+			options.now !== undefined &&
+			proposal.expiresAt <= options.now
+				? "expired"
+				: proposal.status;
+		return {
+			...proposal,
+			status,
+			botAgentName: row.bot_agent_name,
+		};
+	});
 }

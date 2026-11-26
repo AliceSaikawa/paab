@@ -2,6 +2,7 @@ import { z } from "zod";
 import { revokeAllowRule, suspendAgent, updateAgent } from "../admin";
 import { type AgentRow, agentFromRow } from "../db";
 import { type Frame, renderFramed } from "../mcp/frame";
+import { normalizeName } from "../policy";
 import type {
 	AdminMcpContext,
 	AdminToolAudit,
@@ -60,10 +61,7 @@ export const suspendAgentTool: AdminToolDefinition<
 			return fail(nameCheck.error);
 		}
 
-		const row = await ctx.db
-			.prepare("SELECT * FROM agents WHERE name = ?")
-			.bind(nameCheck.value)
-			.first<AgentRow>();
+		const row = await findAgentByName(ctx.db, nameCheck.value);
 		if (row === null) {
 			return fail("agent not found");
 		}
@@ -167,12 +165,24 @@ export const revokeAllowRuleTool: AdminToolDefinition<
 	},
 };
 
+function findAgentByName(
+	db: D1Database,
+	raw: string,
+): Promise<AgentRow | null> {
+	return db
+		.prepare("SELECT * FROM agents WHERE name = ? OR name = ?")
+		.bind(raw, normalizeName(raw))
+		.first<AgentRow>();
+}
+
 function dbNameLookup(
 	db: D1Database,
 	table: "agents" | "categories",
 	name: string,
 ): D1PreparedStatement {
-	return db.prepare(`SELECT id, name FROM ${table} WHERE name = ?`).bind(name);
+	return db
+		.prepare(`SELECT id, name FROM ${table} WHERE name = ? OR name = ?`)
+		.bind(name, normalizeName(name));
 }
 
 export const lowerDailyLimitTool: AdminToolDefinition<
@@ -203,10 +213,7 @@ export const lowerDailyLimitTool: AdminToolDefinition<
 			return fail("new_limit must be a non-negative integer");
 		}
 
-		const row = await ctx.db
-			.prepare("SELECT * FROM agents WHERE name = ?")
-			.bind(nameCheck.value)
-			.first<AgentRow>();
+		const row = await findAgentByName(ctx.db, nameCheck.value);
 		if (row === null) {
 			return fail("agent not found");
 		}

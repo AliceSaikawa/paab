@@ -3,7 +3,6 @@ import {
 	describeProposalEffect,
 	listProposals,
 	type ProposalErrorCode,
-	type ProposalView,
 	rejectProposal,
 } from "../../adminbot";
 import { adminPageResponse, type FlashMessage } from "../layout";
@@ -38,28 +37,12 @@ async function renderProposalsScreen(
 	ctx: AdminGetContext,
 	options: { status?: number; flash?: FlashMessage } = {},
 ): Promise<Response> {
-	const [pendingRows, recentRows] = await Promise.all([
-		listProposals(ctx.env.DB, { status: "pending", limit: 100 }),
-		listProposals(ctx.env.DB, { limit: 50 }),
+	const [pending, recentRows] = await Promise.all([
+		listProposals(ctx.env.DB, { status: "pending", now: ctx.now, limit: 100 }),
+		listProposals(ctx.env.DB, { now: ctx.now, limit: 50 }),
 	]);
 
-	const pending = pendingRows.filter((row) => row.expiresAt > ctx.now);
-	const recentMap = new Map<string, ProposalView>();
-	for (const row of pendingRows) {
-		if (row.expiresAt <= ctx.now) {
-			recentMap.set(row.id, row);
-		}
-	}
-	for (const row of recentRows) {
-		if (row.status !== "pending" || row.expiresAt <= ctx.now) {
-			recentMap.set(row.id, row);
-		}
-	}
-	const recent = [...recentMap.values()].sort((a, b) =>
-		b.createdAt !== a.createdAt
-			? b.createdAt - a.createdAt
-			: b.id.localeCompare(a.id),
-	);
+	const recent = recentRows.filter((row) => row.status !== "pending");
 
 	return adminPageResponse(
 		{

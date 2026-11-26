@@ -482,3 +482,81 @@ describe("lower_daily_limit tool", () => {
 		);
 	});
 });
+
+describe("tightening tool name normalization", () => {
+	it("resolves NFC-equivalent, whitespace-padded, and legacy raw names across suspend_agent, revoke_allow_rule, and lower_daily_limit", async () => {
+		const nfcAgent = await seedAgent(db, {
+			name: "エージェントが",
+			dailyQuestionLimit: 10,
+		});
+		const legacyRawAgent = await seedAgent(db, {
+			name: " legacy-raw ",
+			dailyQuestionLimit: 8,
+		});
+		const nfcCategory = await seedCategory(db, { name: "予定が" });
+
+		await grantAllowRule(db, {
+			fromAgentId: carol.id,
+			toAgentId: nfcAgent.id,
+			categoryId: nfcCategory.id,
+			actor: OWNER,
+			now: T0,
+		});
+
+		const adminClient = await connectAdmin(adminToken, { now: T0 + 60 });
+
+		// lower_daily_limit with NFD + whitespace-padded input resolves NFC agent.
+		const lowerNfd = await call(adminClient, "lower_daily_limit", {
+			agent: " エーシ\u3099ェントか\u3099 ",
+			new_limit: 3,
+		});
+		expect(lowerNfd.isError).toBe(false);
+		expect(lowerNfd.text).toContain(`agent_id: ${nfcAgent.id}`);
+		expect((await loadAgent(nfcAgent.id)).dailyQuestionLimit).toBe(3);
+
+		// lower_daily_limit with whitespace-padded ASCII input resolves trimmed agent.
+		const lowerPadded = await call(adminClient, "lower_daily_limit", {
+			agent: "  grok  ",
+			new_limit: 4,
+		});
+		expect(lowerPadded.isError).toBe(false);
+		expect(lowerPadded.text).toContain(`agent_id: ${grok.id}`);
+		expect((await loadAgent(grok.id)).dailyQuestionLimit).toBe(4);
+
+		// revoke_allow_rule resolves whitespace-padded and NFD names for from, to, and category.
+		const revokeRes = await call(adminClient, "revoke_allow_rule", {
+			from: " carol ",
+			to: " エーシ\u3099ェントか\u3099 ",
+			category: " 予定か\u3099 ",
+		});
+		expect(revokeRes.isError).toBe(false);
+		expect(revokeRes.text).toContain("status: revoked");
+
+		const remainingRules = await db
+			.prepare(
+				"SELECT 1 FROM allow_rules WHERE from_agent_id = ? AND to_agent_id = ? AND category_id = ?",
+			)
+			.bind(carol.id, nfcAgent.id, nfcCategory.id)
+			.first();
+		expect(remainingRules).toBeNull();
+
+		// suspend_agent resolves NFD + padded, ASCII padded, and legacy exact raw names.
+		const suspendNfd = await call(adminClient, "suspend_agent", {
+			agent: " エーシ\u3099ェントか\u3099 ",
+		});
+		expect(suspendNfd.isError).toBe(false);
+		expect((await loadAgent(nfcAgent.id)).status).toBe("suspended");
+
+		const suspendPadded = await call(adminClient, "suspend_agent", {
+			agent: " grok ",
+		});
+		expect(suspendPadded.isError).toBe(false);
+		expect((await loadAgent(grok.id)).status).toBe("suspended");
+
+		const suspendLegacy = await call(adminClient, "suspend_agent", {
+			agent: " legacy-raw ",
+		});
+		expect(suspendLegacy.isError).toBe(false);
+		expect((await loadAgent(legacyRawAgent.id)).status).toBe("suspended");
+	});
+});
