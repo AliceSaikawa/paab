@@ -8,12 +8,16 @@ import {
 import {
 	clearAdminBot,
 	createProposal,
+	DEFAULT_SUPERADMIN_MODE,
 	designateAdminBot,
 	getAdminBotConfig,
+	isSuperadminActive,
 	issueAdminBotToken,
 	listProposals,
 	revokeAdminBotToken,
+	SUPERADMIN_UNLIMITED,
 	setAdminBotReadBodies,
+	setAdminBotSuperadmin,
 } from "../../src/adminbot";
 import { authenticate, hashToken } from "../../src/auth";
 import { newId } from "../../src/db";
@@ -600,5 +604,220 @@ describe("setAdminBotReadBodies", () => {
 			now: T0 + 3,
 		});
 		expect((await getAdminBotConfig(db)).readBodies).toBe(false);
+	});
+});
+
+describe("isSuperadminActive and setAdminBotSuperadmin", () => {
+	it("evaluates finite expiry boundaries and -1 unlimited sentinel", () => {
+		expect(isSuperadminActive({ superadminUntil: null }, T0)).toBe(false);
+		expect(
+			isSuperadminActive({ superadminUntil: SUPERADMIN_UNLIMITED }, T0),
+		).toBe(true);
+		expect(
+			isSuperadminActive(
+				{ superadminUntil: SUPERADMIN_UNLIMITED },
+				T0 + 3650 * DAY_MS,
+			),
+		).toBe(true);
+
+		const until = T0 + DAY_MS;
+		expect(isSuperadminActive({ superadminUntil: until }, until - 1)).toBe(
+			true,
+		);
+		expect(isSuperadminActive({ superadminUntil: until }, until)).toBe(false);
+		expect(isSuperadminActive({ superadminUntil: until }, until + 1)).toBe(
+			false,
+		);
+	});
+
+	it("refuses when no admin bot is designated and rejects invalid modes without writing change_log", async () => {
+		const unset = await setAdminBotSuperadmin(db, {
+			mode: DEFAULT_SUPERADMIN_MODE,
+			actor: OWNER,
+			now: T0,
+		});
+		expect(unset).toMatchObject({ ok: false, code: "not_admin_bot" });
+		expect(await queryChangeLog(db)).toHaveLength(0);
+
+		await designateAdminBot(db, { agentId: muse.id, actor: OWNER, now: T0 });
+		const invalid = await setAdminBotSuperadmin(db, {
+			mode: "99d" as unknown as "7d",
+			actor: OWNER,
+			now: T0 + 1,
+		});
+		expect(invalid).toMatchObject({ ok: false, code: "invalid_input" });
+		expect(await queryChangeLog(db)).toHaveLength(1);
+	});
+
+	it("sets 1d, 7d, 30d, unlimited (-1), and off (null), preserves readBodies, is idempotent, and resets on re-designation/clear", async () => {
+		expect(DEFAULT_SUPERADMIN_MODE).toBe("7d");
+		expect(SUPERADMIN_UNLIMITED).toBe(-1);
+
+		await designateAdminBot(db, { agentId: muse.id, actor: OWNER, now: T0 });
+		await setAdminBotReadBodies(db, {
+			enabled: true,
+			actor: OWNER,
+			now: T0 + 1,
+		});
+
+		const noopOff = await setAdminBotSuperadmin(db, {
+			mode: "off",
+			actor: OWNER,
+			now: T0 + 2,
+		});
+		expect(noopOff).toEqual({
+			ok: true,
+			data: {
+				config: {
+					agentId: muse.id,
+					readBodies: true,
+					superadminUntil: null,
+					updatedAt: T0 + 1,
+				},
+				changed: false,
+			},
+			changeId: null,
+		});
+
+		const oneDay = await setAdminBotSuperadmin(db, {
+			mode: "1d",
+			actor: OWNER,
+			now: T0 + 10,
+		});
+		expect(oneDay).toMatchObject({
+			ok: true,
+			data: {
+				config: {
+					agentId: muse.id,
+					readBodies: true,
+					superadminUntil: T0 + 10 + DAY_MS,
+					updatedAt: T0 + 10,
+				},
+				changed: true,
+			},
+		});
+
+		const sevenDays = await setAdminBotSuperadmin(db, {
+			mode: "7d",
+			actor: OWNER,
+			now: T0 + 20,
+		});
+		expect(sevenDays).toMatchObject({
+			ok: true,
+			data: {
+				config: {
+					superadminUntil: T0 + 20 + 7 * DAY_MS,
+				},
+				changed: true,
+			},
+		});
+
+		const thirtyDays = await setAdminBotSuperadmin(db, {
+			mode: "30d",
+			actor: OWNER,
+			now: T0 + 30,
+		});
+		expect(thirtyDays).toMatchObject({
+			ok: true,
+			data: {
+				config: {
+					superadminUntil: T0 + 30 + 30 * DAY_MS,
+				},
+				changed: true,
+			},
+		});
+
+		const unlimited = await setAdminBotSuperadmin(db, {
+			mode: "unlimited",
+			actor: OWNER,
+			now: T0 + 40,
+		});
+		expect(unlimited).toMatchObject({
+			ok: true,
+			data: {
+				config: {
+					agentId: muse.id,
+					readBodies: true,
+					superadminUntil: -1,
+					updatedAt: T0 + 40,
+				},
+				changed: true,
+			},
+		});
+
+		const noopUnlimited = await setAdminBotSuperadmin(db, {
+			mode: "unlimited",
+			actor: OWNER,
+			now: T0 + 50,
+		});
+		expect(noopUnlimited).toEqual({
+			ok: true,
+			data: {
+				config: {
+					agentId: muse.id,
+					readBodies: true,
+					superadminUntil: -1,
+					updatedAt: T0 + 40,
+				},
+				changed: false,
+			},
+			changeId: null,
+		});
+
+		const turnedOff = await setAdminBotSuperadmin(db, {
+			mode: "off",
+			actor: OWNER,
+			now: T0 + 60,
+		});
+		expect(turnedOff).toMatchObject({
+			ok: true,
+			data: {
+				config: {
+					agentId: muse.id,
+					readBodies: true,
+					superadminUntil: null,
+					updatedAt: T0 + 60,
+				},
+				changed: true,
+			},
+		});
+
+		const logs = await queryChangeLog(db);
+		const switchLogs = logs.filter(
+			(entry) => entry.action === "admin_bot_switches_updated",
+		);
+		expect(switchLogs).toHaveLength(6);
+		expect(switchLogs[0]).toMatchObject({
+			actorType: "owner",
+			actorId: OWNER.actorId,
+			targetType: "admin_bot",
+			targetId: muse.id,
+		});
+		expect(JSON.parse(switchLogs[0]?.beforeJson ?? "null")).toMatchObject({
+			superadminUntil: -1,
+		});
+		expect(JSON.parse(switchLogs[0]?.afterJson ?? "null")).toMatchObject({
+			superadminUntil: null,
+		});
+
+		await setAdminBotSuperadmin(db, {
+			mode: "7d",
+			actor: OWNER,
+			now: T0 + 70,
+		});
+		await designateAdminBot(db, {
+			agentId: grok.id,
+			actor: OWNER,
+			now: T0 + 80,
+		});
+		expect((await getAdminBotConfig(db)).superadminUntil).toBeNull();
+
+		await setAdminBotSuperadmin(db, {
+			mode: "unlimited",
+			actor: OWNER,
+			now: T0 + 90,
+		});
+		await clearAdminBot(db, { actor: OWNER, now: T0 + 100 });
+		expect((await getAdminBotConfig(db)).superadminUntil).toBeNull();
 	});
 });

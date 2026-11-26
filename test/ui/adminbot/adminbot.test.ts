@@ -4,10 +4,16 @@ import {
 	StreamableHTTPClientTransport,
 } from "@modelcontextprotocol/client";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { queryChangeLog, registerAgent } from "../../../src/admin";
+import {
+	queryChangeLog,
+	registerAgent,
+	suspendAgent,
+} from "../../../src/admin";
 import {
 	getAdminBotConfig,
 	handleAdminMcpRequest,
+	SUPERADMIN_UNLIMITED,
+	setAdminBotSuperadmin,
 } from "../../../src/adminbot";
 import { queryAuditLog, recordAuditEvent } from "../../../src/audit";
 import { hashToken } from "../../../src/auth";
@@ -19,7 +25,7 @@ import {
 	type UiEnv,
 } from "../../../src/ui";
 import { createTestDb } from "../../helpers/db";
-import { DAY_MS, seedCategory, T0 } from "../../helpers/fixtures";
+import { DAY_MS, HOUR_MS, seedCategory, T0 } from "../../helpers/fixtures";
 
 const TEAM_DOMAIN = "paab-team.cloudflareaccess.com";
 const TEST_AUD = "adminbot-ui-aud";
@@ -774,5 +780,404 @@ describe("/admin/adminbot UI", () => {
 			{ fetchJwks: session.fetcher },
 		);
 		expect(noCsrf.status).toBe(403);
+	});
+
+	it("manages superadmin switch, duration presets, remaining time, disable, errors, and CSRF", async () => {
+		const reg = await registerAgent(db, {
+			name: "muse",
+			dailyQuestionLimit: 10,
+			actor: { actorType: "owner", actorId: ADMIN_EMAIL },
+			now: T0,
+		});
+		if (!reg.ok) throw new Error("Expected agent");
+		const museId = reg.data.agent.id;
+
+		const { session } = await openAdminBotSession(ADMIN_EMAIL, T0 + 1);
+
+		expect(
+			(await adminGet(session, "/admin/adminbot/superadmin", T0 + 2)).response
+				.status,
+		).toBe(405);
+
+		expect(
+			(
+				await adminPost(
+					session,
+					"/admin/adminbot/superadmin",
+					{ mode: "7d" },
+					T0 + 3,
+				)
+			).response.status,
+		).toBe(409);
+
+		await adminPost(
+			session,
+			"/admin/adminbot/designate",
+			{ agent_id: museId },
+			T0 + 4,
+		);
+
+		const initialPage = await adminGet(session, "/admin/adminbot", T0 + 5);
+		expect(initialPage.html).toContain('action="/admin/adminbot/superadmin"');
+		expect(initialPage.html).toContain('<option value="1d">1日</option>');
+		expect(initialPage.html).toContain(
+			'<option value="7d" selected>7日（既定）</option>',
+		);
+		expect(initialPage.html).toContain('<option value="30d">30日</option>');
+		expect(initialPage.html).toContain(
+			'<option value="unlimited">無期限</option>',
+		);
+		expect(initialPage.html).toContain("プロンプトインジェクション");
+		expect(initialPage.html).not.toContain(
+			'<input type="hidden" name="mode" value="off">',
+		);
+		expect(initialPage.html.match(/<script>/g)).toHaveLength(1);
+
+		const badMode = await adminPost(
+			session,
+			"/admin/adminbot/superadmin",
+			{ mode: "2d" },
+			T0 + 6,
+		);
+		expect(badMode.response.status).toBe(400);
+
+		const enabled7d = await adminPost(
+			session,
+			"/admin/adminbot/superadmin",
+			{ mode: "7d" },
+			T0 + 10,
+		);
+		expect(enabled7d.response.status).toBe(200);
+		expect(enabled7d.html).toContain(
+			"管理者ボットの最高管理者権限をオンにしました（7日）",
+		);
+		expect(enabled7d.html).toContain("残り 7日");
+		expect(enabled7d.html).toContain(
+			`datetime="${new Date(T0 + 10 + 7 * DAY_MS).toISOString()}"`,
+		);
+		expect(enabled7d.html).toContain(
+			'<input type="hidden" name="mode" value="off">',
+		);
+		expect((await getAdminBotConfig(db)).superadminUntil).toBe(
+			T0 + 10 + 7 * DAY_MS,
+		);
+
+		const halfwayNow = T0 + 10 + 6 * DAY_MS + 12 * HOUR_MS;
+		const halfwayPage = await adminGet(
+			{ ...session, jwt: await signAccessJwt(ADMIN_EMAIL, halfwayNow) },
+			"/admin/adminbot",
+			halfwayNow,
+		);
+		expect(halfwayPage.html).toContain("残り 12時間");
+
+		const expiredNow = T0 + 10 + 7 * DAY_MS;
+		const expiredPage = await adminGet(
+			{ ...session, jwt: await signAccessJwt(ADMIN_EMAIL, expiredNow) },
+			"/admin/adminbot",
+			expiredNow,
+		);
+		expect(expiredPage.html).toContain("有効期限切れ");
+		expect(expiredPage.html).not.toContain(
+			'<input type="hidden" name="mode" value="off">',
+		);
+
+		const enabledUnlimited = await adminPost(
+			session,
+			"/admin/adminbot/superadmin",
+			{ mode: "unlimited" },
+			T0 + 20,
+		);
+		expect(enabledUnlimited.response.status).toBe(200);
+		expect(enabledUnlimited.html).toContain(
+			"管理者ボットの最高管理者権限をオンにしました（無期限）",
+		);
+		expect(enabledUnlimited.html).toContain("無期限");
+		expect(enabledUnlimited.html).toContain(
+			'<input type="hidden" name="mode" value="off">',
+		);
+		expect((await getAdminBotConfig(db)).superadminUntil).toBe(
+			SUPERADMIN_UNLIMITED,
+		);
+
+		const disabled = await adminPost(
+			session,
+			"/admin/adminbot/superadmin",
+			{ mode: "off" },
+			T0 + 30,
+		);
+		expect(disabled.response.status).toBe(200);
+		expect(disabled.html).toContain(
+			"管理者ボットの最高管理者権限をオフにしました",
+		);
+		expect((await getAdminBotConfig(db)).superadminUntil).toBeNull();
+		expect(disabled.html).not.toContain(
+			'<input type="hidden" name="mode" value="off">',
+		);
+
+		const idempotentOff = await adminPost(
+			session,
+			"/admin/adminbot/superadmin",
+			{ mode: "off" },
+			T0 + 31,
+		);
+		expect(idempotentOff.response.status).toBe(200);
+		expect(idempotentOff.html).toContain("最高管理者権限はすでにオフです");
+
+		const rulesPage = await adminGet(session, "/admin/rules", T0 + 32);
+		expect(rulesPage.html).toContain("最高管理者=無期限");
+		expect(rulesPage.html).toContain(
+			`最高管理者=有効（期限: ${new Date(T0 + 10 + 7 * DAY_MS).toISOString()}）`,
+		);
+
+		const noCsrf = await handleAdminRequest(
+			new Request("https://paab.test/admin/adminbot/superadmin", {
+				method: "POST",
+				headers: {
+					Cookie: session.cookie,
+					Origin: "https://paab.test",
+					"Cf-Access-Jwt-Assertion": session.jwt,
+				},
+				body: new URLSearchParams({ mode: "1d" }),
+			}),
+			accessEnv(),
+			T0 + 33,
+			{ fetchJwks: session.fetcher },
+		);
+		expect(noCsrf.status).toBe(403);
+	});
+
+	it("enforces combined-risk confirmation in both directions including unlimited (-1) and skips when expired or turning off", async () => {
+		const reg = await registerAgent(db, {
+			name: "muse",
+			dailyQuestionLimit: 10,
+			actor: { actorType: "owner", actorId: ADMIN_EMAIL },
+			now: T0,
+		});
+		if (!reg.ok) throw new Error("Expected agent");
+		const museId = reg.data.agent.id;
+
+		const { session } = await openAdminBotSession(ADMIN_EMAIL, T0 + 1);
+		await adminPost(
+			session,
+			"/admin/adminbot/designate",
+			{ agent_id: museId },
+			T0 + 2,
+		);
+
+		// Direction 1 (Case B): read_bodies ON -> enabling superadmin prompts confirmation.
+		const readOn = await adminPost(
+			session,
+			"/admin/adminbot/read-bodies",
+			{ enabled: "1" },
+			T0 + 3,
+		);
+		expect(readOn.response.status).toBe(200);
+		expect((await getAdminBotConfig(db)).readBodies).toBe(true);
+
+		const confirmSuper = await adminPost(
+			session,
+			"/admin/adminbot/superadmin",
+			{ mode: "7d" },
+			T0 + 4,
+		);
+		expect(confirmSuper.response.status).toBe(200);
+		expect(confirmSuper.html).toContain("最高管理者権限の有効化確認");
+		expect(confirmSuper.html).toContain('name="mode" value="7d"');
+		expect(confirmSuper.html).toContain('name="confirm" value="1"');
+		expect(confirmSuper.html).toContain("プロンプトインジェクション");
+		expect(confirmSuper.html.match(/<script>/g)).toHaveLength(1);
+		expect((await getAdminBotConfig(db)).superadminUntil).toBeNull();
+
+		const confirmedSuper = await adminPost(
+			session,
+			"/admin/adminbot/superadmin",
+			{ mode: "7d", confirm: "1" },
+			T0 + 5,
+		);
+		expect(confirmedSuper.response.status).toBe(200);
+		expect(confirmedSuper.html).toContain(
+			"管理者ボットの最高管理者権限をオンにしました（7日）",
+		);
+		expect((await getAdminBotConfig(db)).superadminUntil).toBe(
+			T0 + 5 + 7 * DAY_MS,
+		);
+
+		// Turning OFF either switch proceeds immediately without confirmation.
+		const readOff = await adminPost(
+			session,
+			"/admin/adminbot/read-bodies",
+			{ enabled: "0" },
+			T0 + 6,
+		);
+		expect(readOff.response.status).toBe(200);
+		expect(readOff.html).toContain("管理者ボットの本文閲覧をオフにしました");
+
+		// Direction 2 (Case A) with unlimited (-1): superadmin unlimited -> enabling read_bodies prompts with 無期限.
+		await adminPost(
+			session,
+			"/admin/adminbot/superadmin",
+			{ mode: "unlimited" },
+			T0 + 7,
+		);
+		const confirmReadUnlimited = await adminPost(
+			session,
+			"/admin/adminbot/read-bodies",
+			{ enabled: "1" },
+			T0 + 8,
+		);
+		expect(confirmReadUnlimited.response.status).toBe(200);
+		expect(confirmReadUnlimited.html).toContain("本文閲覧の有効化確認");
+		expect(confirmReadUnlimited.html).toContain("有効期限: 無期限");
+		expect(confirmReadUnlimited.html).not.toContain("1969-12-31");
+		expect((await getAdminBotConfig(db)).readBodies).toBe(false);
+
+		const confirmedReadUnlimited = await adminPost(
+			session,
+			"/admin/adminbot/read-bodies",
+			{ enabled: "1", confirm: "1" },
+			T0 + 9,
+		);
+		expect(confirmedReadUnlimited.response.status).toBe(200);
+		expect((await getAdminBotConfig(db)).readBodies).toBe(true);
+
+		// Turning superadmin OFF while read_bodies is ON proceeds immediately.
+		const superOff = await adminPost(
+			session,
+			"/admin/adminbot/superadmin",
+			{ mode: "off" },
+			T0 + 10,
+		);
+		expect(superOff.response.status).toBe(200);
+		expect(superOff.html).toContain(
+			"管理者ボットの最高管理者権限をオフにしました",
+		);
+
+		// Expired superadmin does not trigger Case A confirmation.
+		await adminPost(
+			session,
+			"/admin/adminbot/read-bodies",
+			{ enabled: "0" },
+			T0 + 11,
+		);
+		await adminPost(
+			session,
+			"/admin/adminbot/superadmin",
+			{ mode: "1d" },
+			T0 + 12,
+		);
+		const expiryCheckNow = T0 + 12 + DAY_MS;
+		const readOnAfterExpiry = await adminPost(
+			{ ...session, jwt: await signAccessJwt(ADMIN_EMAIL, expiryCheckNow) },
+			"/admin/adminbot/read-bodies",
+			{ enabled: "1" },
+			expiryCheckNow,
+		);
+		expect(readOnAfterExpiry.response.status).toBe(200);
+		expect(readOnAfterExpiry.html).toContain(
+			"管理者ボットの本文閲覧をオンにしました",
+		);
+		expect(readOnAfterExpiry.html).not.toContain("本文閲覧の有効化確認");
+		expect((await getAdminBotConfig(db)).readBodies).toBe(true);
+	});
+
+	it("shows direct superadmin executions in /admin/adminbot change history and reverts them in 1 click", async () => {
+		const museReg = await registerAgent(db, {
+			name: "muse",
+			dailyQuestionLimit: 20,
+			actor: { actorType: "owner", actorId: ADMIN_EMAIL },
+			now: T0,
+		});
+		const aliceReg = await registerAgent(db, {
+			name: "alice",
+			dailyQuestionLimit: 5,
+			actor: { actorType: "owner", actorId: ADMIN_EMAIL },
+			now: T0 + 1,
+		});
+		const bobReg = await registerAgent(db, {
+			name: "bob",
+			dailyQuestionLimit: 10,
+			actor: { actorType: "owner", actorId: ADMIN_EMAIL },
+			now: T0 + 2,
+		});
+		if (!museReg.ok || !aliceReg.ok || !bobReg.ok) {
+			throw new Error("Expected agents");
+		}
+		await suspendAgent(db, {
+			agentId: bobReg.data.agent.id,
+			actor: { actorType: "owner", actorId: ADMIN_EMAIL },
+			now: T0 + 3,
+		});
+
+		const { session } = await openAdminBotSession(ADMIN_EMAIL, T0 + 4);
+		await adminPost(
+			session,
+			"/admin/adminbot/designate",
+			{ agent_id: museReg.data.agent.id },
+			T0 + 5,
+		);
+		const tokenRes = await adminPost(
+			session,
+			"/admin/adminbot/token",
+			{},
+			T0 + 6,
+		);
+		const adminToken = extractIssuedToken(tokenRes.html);
+
+		await setAdminBotSuperadmin(db, {
+			mode: "7d",
+			actor: { actorType: "owner", actorId: ADMIN_EMAIL },
+			now: T0 + 7,
+		});
+
+		const client = await connectAdminMcp(adminToken, T0 + 10);
+		const catRes = await client.callTool({
+			name: "propose_category",
+			arguments: { name: "研究", reason: "direct superadmin" },
+		});
+		expect(catRes.isError).toBeFalsy();
+		const ruleRes = await client.callTool({
+			name: "propose_allow_rule",
+			arguments: {
+				from: "alice",
+				to: "bob",
+				category: "研究",
+				reason: "direct superadmin",
+			},
+		});
+		expect(ruleRes.isError).toBeFalsy();
+
+		const botChanges = await queryChangeLog(db, { actorType: "admin_bot" });
+		expect(botChanges).toHaveLength(2);
+		for (const entry of botChanges) {
+			expect(entry.approverId).toBeNull();
+		}
+		const [ruleChange, catChange] = botChanges;
+		if (!ruleChange || !catChange) throw new Error("Expected 2 bot changes");
+
+		const historyPage = await adminGet(session, "/admin/adminbot", T0 + 20);
+		expect(historyPage.html).toContain(
+			`/admin/adminbot/changes/${ruleChange.id}/revert`,
+		);
+		expect(historyPage.html).toContain(
+			`/admin/adminbot/changes/${catChange.id}/revert`,
+		);
+
+		const revertRule = await adminPost(
+			session,
+			`/admin/adminbot/changes/${ruleChange.id}/revert`,
+			{},
+			T0 + 21,
+		);
+		expect(revertRule.response.status).toBe(200);
+		expect(revertRule.html).toContain("元に戻しました");
+
+		const revertCat = await adminPost(
+			session,
+			`/admin/adminbot/changes/${catChange.id}/revert`,
+			{},
+			T0 + 22,
+		);
+		expect(revertCat.response.status).toBe(200);
+		expect(revertCat.html).toContain("元に戻しました");
 	});
 });
