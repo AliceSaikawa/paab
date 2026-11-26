@@ -7,7 +7,7 @@
 // esbuild before running it.
 
 import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -25,6 +25,7 @@ import {
 	type D1Client,
 	parseWranglerRows,
 	wranglerFailure,
+	wranglerTargetArgs,
 } from "./lib/sql";
 import { issueParticipantToken } from "./lib/token";
 
@@ -39,7 +40,8 @@ const USAGE = `使い方:
   npm run resume -- (--local | --remote) <エージェント名>
   npm run revoke-token -- (--local | --remote) <エージェント名>
 
-共通: --persist-to <ディレクトリ> でローカル D1 の保存先を変えられます（--local のときだけ）。
+共通: [--config パス] で Wrangler の設定ファイルを指定できます（--remote 時の既定は wrangler.local.jsonc）。
+      --persist-to <ディレクトリ> でローカル D1 の保存先を変えられます（--local のときだけ）。
 詳しくは docs/setup.md を参照してください。`;
 
 const WRANGLER = join(
@@ -102,6 +104,7 @@ async function main(argv: string[]): Promise<void> {
 			local: { type: "boolean" },
 			remote: { type: "boolean" },
 			"persist-to": { type: "string" },
+			config: { type: "string" },
 			file: { type: "string" },
 			since: { type: "string" },
 			before: { type: "string" },
@@ -122,17 +125,17 @@ async function main(argv: string[]): Promise<void> {
 		console.log(USAGE);
 		return;
 	}
-	if (values.local === values.remote) {
-		throw new CliError(
-			"--local（ローカルの D1）か --remote（本番の D1）のどちらか一方を指定してください。",
-		);
-	}
-	const target = values.local
-		? [
-				"--local",
-				...(values["persist-to"] ? ["--persist-to", values["persist-to"]] : []),
-			]
-		: ["--remote"];
+	const target = await wranglerTargetArgs({
+		local: values.local,
+		remote: values.remote,
+		persistTo: values["persist-to"],
+		config: values.config,
+		hasConfigFile: (path) =>
+			access(path).then(
+				() => true,
+				() => false,
+			),
+	});
 	const takesName = ["token", "suspend", "resume", "revoke-token"];
 	if (!takesName.includes(command ?? "") && operands.length > 0) {
 		throw new CliError(
