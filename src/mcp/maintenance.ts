@@ -1,11 +1,17 @@
 import { expireOverdueProposals } from "../adminbot";
 import { purgeExpiredAuditBodies, recordAuditEvents } from "../audit";
 import { runInboxMaintenance } from "../inbox";
+import {
+	enqueueWebhooksForAgents,
+	isLocalWebhookAllowed,
+	processDueWebhooks,
+	purgeOldWebhookDeliveries,
+} from "../notify";
 import type { UnixMillis } from "../types";
 import { auditBodyConfig, type McpEnv } from "./config";
 
 function reportMaintenanceFailure(
-	step: "inbox" | "audit_purge" | "proposals",
+	step: "inbox" | "audit_purge" | "proposals" | "webhooks",
 	error: unknown,
 ): void {
 	try {
@@ -21,8 +27,9 @@ function reportMaintenanceFailure(
 /**
  * The scheduled job: expires overdue questions, records them in the audit
  * log with one batched write per chunk, removes audit log bodies past their
- * retention, and expires overdue admin bot proposals. Each step runs in an
- * isolated block so a failure in one does not starve the others.
+ * retention, expires overdue admin bot proposals, delivers due webhooks, and
+ * prunes old completed or abandoned webhook delivery records.
+ * Each step runs in an isolated block so a failure in one does not starve the others.
  */
 export async function runScheduledMaintenance(
 	env: McpEnv,
@@ -31,9 +38,11 @@ export async function runScheduledMaintenance(
 	const db = env.DB;
 	const audit = auditBodyConfig(env);
 	const errors: unknown[] = [];
+	let expiredAskerIds: string[] = [];
 
 	try {
 		const { expiredQuestions } = await runInboxMaintenance(db, now);
+		expiredAskerIds = expiredQuestions.map((question) => question.fromAgentId);
 		await recordAuditEvents(
 			db,
 			audit,
@@ -62,6 +71,22 @@ export async function runScheduledMaintenance(
 		await expireOverdueProposals(db, now);
 	} catch (error) {
 		reportMaintenanceFailure("proposals", error);
+		errors.push(error);
+	}
+
+	try {
+		if (expiredAskerIds.length > 0) {
+			await enqueueWebhooksForAgents(db, expiredAskerIds, now);
+		}
+		await processDueWebhooks(db, {
+			now,
+			audit,
+			allowLocal: isLocalWebhookAllowed(env),
+			fetcher: env.webhookFetcher,
+		});
+		await purgeOldWebhookDeliveries(db, now);
+	} catch (error) {
+		reportMaintenanceFailure("webhooks", error);
 		errors.push(error);
 	}
 

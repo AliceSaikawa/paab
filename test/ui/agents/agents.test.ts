@@ -1,13 +1,25 @@
 import { env } from "cloudflare:workers";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+	configureAgentWebhook,
+	deleteAgentWebhook,
 	grantAllowRule,
 	issueAgentToken,
 	queryChangeLog,
 } from "../../../src/admin";
+import {
+	createProposal,
+	designateAdminBot,
+	issueAdminBotToken,
+} from "../../../src/adminbot";
 import { authenticate, hashToken } from "../../../src/auth";
 import { insertMessage, newId } from "../../../src/db";
 import { handleMcpRequest } from "../../../src/mcp";
+import {
+	signWebhookPayload,
+	WEBHOOK_BODY,
+	type WebhookFetcher,
+} from "../../../src/notify";
 import {
 	handleAdminRequest,
 	type JwkKey,
@@ -1021,4 +1033,417 @@ describe("/admin/agents UI", () => {
 			}
 		}
 	});
+
+	it("configures, rotates, and deletes agent webhooks in the human UI only without leaking signing_secret", async () => {
+		const { session } = await openAdminSession(ADMIN_EMAIL, T0);
+		await adminPost(
+			session,
+			"/admin/agents",
+			{ name: "muse", description: "a", daily_question_limit: "10" },
+			T0 + 1,
+		);
+		await adminPost(
+			session,
+			"/admin/agents",
+			{ name: "grok", description: "b", daily_question_limit: "10" },
+			T0 + 2,
+		);
+		const museId = await findAgentIdByName("muse");
+		const grokId = await findAgentIdByName("grok");
+
+		// Invalid/SSRF URLs are rejected with 400 and leave DB and change_log clean.
+		for (const badUrl of [
+			"http://agent.example/wake",
+			"https://localhost/wake",
+			"https://127.0.0.1/wake",
+			"https://169.254.169.254/latest",
+			"https://user:pass@agent.example/wake",
+		]) {
+			const invalid = await adminPost(
+				session,
+				`/admin/agents/${museId}/webhook`,
+				{ url: badUrl },
+				T0 + 3,
+			);
+			expect(invalid.response.status).toBe(400);
+		}
+		expect(
+			await db
+				.prepare("SELECT COUNT(*) AS n FROM agent_webhooks")
+				.first<{ n: number }>(),
+		).toEqual({ n: 0 });
+
+		// Valid HTTPS URL returns one-time signing_secret with Cache-Control: no-store and no extra <script>.
+		const configured = await adminPost(
+			session,
+			`/admin/agents/${grokId}/webhook`,
+			{ url: "https://grok.example/wake" },
+			T0 + 10,
+		);
+		expect(configured.response.status).toBe(200);
+		expect(configured.response.headers.get("Cache-Control")).toBe("no-store");
+		expect(configured.html.match(/<script>/g)).toHaveLength(1);
+		expect(configured.html).toContain("https://grok.example/wake");
+		expect(configured.html).toContain("X-Paab-Signature");
+		expect(configured.html).toContain("X-Paab-Timestamp");
+		const secret1 = extractIssuedToken(configured.html);
+		expect(secret1).toMatch(/^paab_whsec_[A-Za-z0-9_-]{43}$/);
+
+		// Subsequent GET /admin/agents shows configured state, URL, timestamp, and NEVER exposes signing_secret.
+		const afterConfigGet = await adminGet(session, "/admin/agents", T0 + 11);
+		expect(afterConfigGet.response.status).toBe(200);
+		expect(afterConfigGet.html).toContain("設定済み");
+		expect(afterConfigGet.html).toContain("https://grok.example/wake");
+		expect(afterConfigGet.html).not.toContain(secret1);
+
+		// change_log stores { url } only, never signing_secret.
+		const logsAfterConfig = await queryChangeLog(db);
+		expect(logsAfterConfig[0]).toMatchObject({
+			action: "webhook_configured",
+			targetType: "agent",
+			targetId: grokId,
+			beforeJson: null,
+			afterJson: JSON.stringify({ url: "https://grok.example/wake" }),
+		});
+		expect(JSON.stringify(logsAfterConfig)).not.toContain(secret1);
+
+		// /admin/rules change_log table renders Webhook設定 cleanly without leaking secret.
+		const rulesView = await adminGet(session, "/admin/rules", T0 + 12);
+		expect(rulesView.html).toContain("Webhook設定");
+		expect(rulesView.html).toContain("URL=https://grok.example/wake");
+		expect(rulesView.html).not.toContain(secret1);
+
+		// Update URL & rotate signing_secret.
+		const rotated = await adminPost(
+			session,
+			`/admin/agents/${grokId}/webhook`,
+			{ url: "https://grok-v2.example/wake" },
+			T0 + 20,
+		);
+		expect(rotated.response.status).toBe(200);
+		expect(rotated.response.headers.get("Cache-Control")).toBe("no-store");
+		expect(rotated.html).toContain("以前の署名鍵は即座に無効になりました");
+		const secret2 = extractIssuedToken(rotated.html);
+		expect(secret2).toMatch(/^paab_whsec_[A-Za-z0-9_-]{43}$/);
+		expect(secret2).not.toBe(secret1);
+
+		// End-to-end: UI-configured webhook fires with secret2 when muse asks grok over /mcp.
+		const cat = await seedCategory(db, { name: "予定" });
+		await grantAllowRule(db, {
+			fromAgentId: museId,
+			toAgentId: grokId,
+			categoryId: cat.id,
+			actor: { actorType: "owner", actorId: ADMIN_EMAIL },
+			now: T0 + 21,
+		});
+		const museIssue = await adminPost(
+			session,
+			`/admin/agents/${museId}/token`,
+			{},
+			T0 + 22,
+		);
+		const museToken = extractIssuedToken(museIssue.html);
+		const captured: {
+			url: string;
+			ts: string | null;
+			sig: string | null;
+			body: string;
+		}[] = [];
+		const webhookFetcher: WebhookFetcher = async (input, init) => {
+			const h = new Headers(init?.headers);
+			captured.push({
+				url: String(input),
+				ts: h.get("X-Paab-Timestamp"),
+				sig: h.get("X-Paab-Signature"),
+				body: String(init?.body ?? ""),
+			});
+			return new Response("ok", { status: 200 });
+		};
+		const museClient = await connect(museToken, {
+			env: { ...accessEnv(), webhookFetcher },
+			now: T0 + 25,
+		});
+		await call(museClient, "ask", {
+			to: "grok",
+			category: "予定",
+			question: "確認です",
+		});
+		expect(captured).toHaveLength(1);
+		expect(captured[0]?.url).toBe("https://grok-v2.example/wake");
+		expect(captured[0]?.body).toBe(WEBHOOK_BODY);
+		expect(captured[0]?.sig).toBe(
+			await signWebhookPayload(secret2, captured[0]?.ts ?? "", WEBHOOK_BODY),
+		);
+
+		// Delete webhook via UI.
+		const deleted = await adminPost(
+			session,
+			`/admin/agents/${grokId}/webhook/delete`,
+			{},
+			T0 + 30,
+		);
+		expect(deleted.response.status).toBe(200);
+		expect(deleted.html).toContain("Webhook を削除しました");
+		expect(deleted.html).not.toContain(secret2);
+
+		// Repeating delete is a clean no-op without adding a change_log row.
+		const logsBeforeRepeat = await queryChangeLog(db);
+		const deletedAgain = await adminPost(
+			session,
+			`/admin/agents/${grokId}/webhook/delete`,
+			{},
+			T0 + 31,
+		);
+		expect(deletedAgain.response.status).toBe(200);
+		expect(deletedAgain.html).toContain("Webhook は設定されていませんでした");
+		expect(await queryChangeLog(db)).toHaveLength(logsBeforeRepeat.length);
+
+		// Missing agent returns 404; missing CSRF returns 403.
+		const missingWebhookId = newId();
+		expect(
+			(
+				await adminPost(
+					session,
+					`/admin/agents/${missingWebhookId}/webhook`,
+					{ url: "https://ok.example/wake" },
+					T0 + 32,
+				)
+			).response.status,
+		).toBe(404);
+		expect(
+			(
+				await adminPost(
+					session,
+					`/admin/agents/${missingWebhookId}/webhook/delete`,
+					{},
+					T0 + 32,
+				)
+			).response.status,
+		).toBe(404);
+		const noCsrfWebhook = await handleAdminRequest(
+			new Request(`https://paab.test/admin/agents/${grokId}/webhook`, {
+				method: "POST",
+				headers: {
+					Cookie: session.cookie,
+					Origin: "https://paab.test",
+					"Cf-Access-Jwt-Assertion": session.jwt,
+				},
+				body: new URLSearchParams({ url: "https://ok.example/wake" }),
+			}),
+			accessEnv(),
+			T0 + 33,
+			{ fetchJwks: session.fetcher },
+		);
+		expect(noCsrfWebhook.status).toBe(403);
+
+		// Admin bot cannot call configureAgentWebhook or deleteAgentWebhook, and neither /mcp nor /mcp/admin exposes webhook tools.
+		expect(
+			await configureAgentWebhook(db, {
+				agentId: grokId,
+				url: "https://ok.example/wake",
+				actor: { actorType: "admin_bot", actorId: museId },
+				now: T0 + 34,
+			}),
+		).toMatchObject({ ok: false, code: "invalid_input" });
+		expect(
+			await deleteAgentWebhook(db, {
+				agentId: grokId,
+				actor: { actorType: "admin_bot", actorId: museId },
+				now: T0 + 34,
+			}),
+		).toMatchObject({ ok: false, code: "invalid_input" });
+
+		const participantTools = (await museClient.listTools()).tools.map(
+			(t) => t.name,
+		);
+		for (const name of participantTools) {
+			expect(name).not.toMatch(/webhook|secret/i);
+		}
+		await designateAdminBot(db, {
+			agentId: museId,
+			actor: { actorType: "owner", actorId: ADMIN_EMAIL },
+			now: T0 + 35,
+		});
+		const adminTok = await issueAdminBotToken(db, {
+			agentId: museId,
+			actor: { actorType: "owner", actorId: ADMIN_EMAIL },
+			now: T0 + 36,
+		});
+		expect(adminTok.ok).toBe(true);
+		if (!adminTok.ok) return;
+		const adminTools = await listAdminMcpTools(adminTok.data.token, T0 + 37);
+		expect(adminTools).toContain("view_audit_log");
+		for (const name of adminTools) {
+			expect(name).not.toMatch(/webhook|secret/i);
+		}
+	});
+
+	it("shows full cascade impact on GET /admin/agents/:id/delete when admin bot, admin token, webhook, proposals, and pending description are present", async () => {
+		const { session } = await openAdminSession(ADMIN_EMAIL, T0);
+		await adminPost(
+			session,
+			"/admin/agents",
+			{ name: "muse", description: "original", daily_question_limit: "10" },
+			T0 + 1,
+		);
+		await adminPost(
+			session,
+			"/admin/agents",
+			{ name: "grok", description: "plain", daily_question_limit: "10" },
+			T0 + 2,
+		);
+		const museId = await findAgentIdByName("muse");
+		const grokId = await findAgentIdByName("grok");
+
+		// Plain agent without extra cascade targets shows baseline labels.
+		const plainConfirm = await adminGet(
+			session,
+			`/admin/agents/${grokId}/delete`,
+			T0 + 3,
+		);
+		expect(plainConfirm.response.status).toBe(200);
+		expect(plainConfirm.html).toContain("指名されていません");
+		expect(plainConfirm.html).toContain("<strong>Webhook 通知:</strong>");
+		expect(plainConfirm.html).toContain("未設定");
+		expect(plainConfirm.html).toContain(
+			"<strong>管理者ボットの提案:</strong>\n\t\t\t\t\tなし",
+		);
+		expect(plainConfirm.html).toContain(
+			"<strong>承認待ちの説明文:</strong>\n\t\t\t\t\tなし",
+		);
+
+		// Give muse: participant token + pending description + admin bot designation + admin token + webhook + proposal.
+		const partIssue = await adminPost(
+			session,
+			`/admin/agents/${museId}/token`,
+			{},
+			T0 + 4,
+		);
+		const musePartToken = extractIssuedToken(partIssue.html);
+		const museClient = await connect(musePartToken, {
+			env: accessEnv(),
+			now: T0 + 5,
+		});
+		const submitRes = await call(museClient, "submit_description", {
+			description: "新しい説明文の案",
+		});
+		expect(submitRes.isError).toBe(false);
+
+		const designated = await designateAdminBot(db, {
+			agentId: museId,
+			actor: { actorType: "owner", actorId: ADMIN_EMAIL },
+			now: T0 + 6,
+		});
+		expect(designated.ok).toBe(true);
+
+		const adminTok = await issueAdminBotToken(db, {
+			agentId: museId,
+			actor: { actorType: "owner", actorId: ADMIN_EMAIL },
+			now: T0 + 7,
+		});
+		expect(adminTok.ok).toBe(true);
+
+		const hook = await configureAgentWebhook(db, {
+			agentId: museId,
+			url: "https://muse.example/wake?a=1&b=2",
+			actor: { actorType: "owner", actorId: ADMIN_EMAIL },
+			now: T0 + 8,
+		});
+		expect(hook.ok).toBe(true);
+		if (!hook.ok) return;
+
+		const prop = await createProposal(db, {
+			botAgentId: museId,
+			request: { kind: "create_category", name: "旅" },
+			reason: "旅行の相談用にカテゴリを追加したい",
+			now: T0 + 9,
+		});
+		expect(prop.ok).toBe(true);
+
+		// GET delete confirm renders every cascade impact cleanly and never leaks signing_secret or tokens.
+		const confirm = await adminGet(
+			session,
+			`/admin/agents/${museId}/delete`,
+			T0 + 10,
+		);
+		expect(confirm.response.status).toBe(200);
+		expect(confirm.html).toContain("指名中");
+		expect(confirm.html).toContain(
+			"削除すると管理者ボットの指名が解除され、本文閲覧・最高管理者権限の設定もオフにリセットされます",
+		);
+		expect(confirm.html).toContain(
+			"<strong>管理者トークン（/mcp/admin）:</strong>",
+		);
+		expect(confirm.html).toContain("有効なトークンあり（同時に削除されます）");
+		expect(confirm.html).toContain("https://muse.example/wake?a=1&amp;b=2");
+		expect(confirm.html).toContain("署名鍵と配信キューも同時に削除されます");
+		expect(confirm.html).toContain(
+			"1件（うち承認待ち 1件。同時に削除されます）",
+		);
+		expect(confirm.html).toContain(
+			"<strong>承認待ちの説明文:</strong>\n\t\t\t\t\tあり（同時に削除されます）",
+		);
+		expect(confirm.html).not.toContain(hook.data.signingSecret);
+		if (adminTok.ok) {
+			expect(confirm.html).not.toContain(adminTok.data.token);
+		}
+
+		// Confirming deletion clears admin_bot_config and cascades proposals, pending_descriptions, webhooks, and tokens.
+		const deleted = await adminPost(
+			session,
+			`/admin/agents/${museId}/delete`,
+			{},
+			T0 + 11,
+		);
+		expect(deleted.response.status).toBe(200);
+		const [botCfg, proposalsLeft, descsLeft, hooksLeft, tokensLeft] =
+			await db.batch([
+				db.prepare("SELECT agent_id FROM admin_bot_config WHERE id = 1"),
+				db
+					.prepare("SELECT COUNT(*) AS n FROM proposals WHERE bot_agent_id = ?")
+					.bind(museId),
+				db
+					.prepare(
+						"SELECT COUNT(*) AS n FROM pending_descriptions WHERE agent_id = ?",
+					)
+					.bind(museId),
+				db
+					.prepare(
+						"SELECT COUNT(*) AS n FROM agent_webhooks WHERE agent_id = ?",
+					)
+					.bind(museId),
+				db
+					.prepare("SELECT COUNT(*) AS n FROM tokens WHERE agent_id = ?")
+					.bind(museId),
+			]);
+		expect(botCfg?.results[0]).toEqual({ agent_id: null });
+		expect(proposalsLeft?.results[0]).toEqual({ n: 0 });
+		expect(descsLeft?.results[0]).toEqual({ n: 0 });
+		expect(hooksLeft?.results[0]).toEqual({ n: 0 });
+		expect(tokensLeft?.results[0]).toEqual({ n: 0 });
+	});
 });
+
+async function listAdminMcpTools(
+	token: string,
+	now: number,
+): Promise<string[]> {
+	const { Client, StreamableHTTPClientTransport } = await import(
+		"@modelcontextprotocol/client"
+	);
+	const { handleAdminMcpRequest } = await import("../../../src/adminbot");
+	const client = new Client({ name: "paab-admin-test", version: "0.0.0" });
+	const transport = new StreamableHTTPClientTransport(
+		new URL("https://paab.test/mcp/admin"),
+		{
+			fetch: (input, init) =>
+				handleAdminMcpRequest(new Request(input, init), accessEnv(), now),
+			requestInit: {
+				headers: { Authorization: `Bearer ${token}` },
+			},
+		},
+	);
+	await client.connect(transport);
+	const { tools } = await client.listTools();
+	return tools.map((tool) => tool.name);
+}

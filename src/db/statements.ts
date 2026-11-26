@@ -6,6 +6,7 @@ import type {
 	NewAuditLogEntry,
 	NewChangeLogEntry,
 	Token,
+	WebhookDelivery,
 } from "../types";
 
 /*
@@ -146,5 +147,27 @@ export function insertChangeLogEntry(
 			entry.beforeJson,
 			entry.afterJson,
 			entry.revertedAt,
+		);
+}
+
+export function insertWebhookDelivery(
+	db: D1Database,
+	delivery: WebhookDelivery,
+): D1PreparedStatement {
+	return db
+		.prepare(
+			`INSERT INTO webhook_deliveries
+				(id, agent_id, status, attempts, next_attempt_at, last_error, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		)
+		.bind(
+			delivery.id,
+			delivery.agentId,
+			delivery.status,
+			delivery.attempts,
+			delivery.nextAttemptAt,
+			delivery.lastError,
+			delivery.createdAt,
+			delivery.updatedAt,
 		);
 }

@@ -1,4 +1,5 @@
 import type { AgentWithStatus } from "../../admin";
+import type { AgentWebhookSummary } from "../../types";
 import { csrfInput } from "../csrf";
 import { html, type SafeHtml } from "../html";
 import { formatTimestamp } from "../layout";
@@ -87,6 +88,22 @@ export interface IssuedTokenView {
 	endpointUrl: string;
 }
 
+export interface ConfiguredWebhookView {
+	agentName: string;
+	url: string;
+	signingSecret: string;
+	replacedPrevious: boolean;
+}
+
+export interface AgentDeleteImpact {
+	isAdminBot: boolean;
+	hasActiveAdminToken: boolean;
+	webhookUrl: string | null;
+	proposalCount: number;
+	pendingProposalCount: number;
+	hasPendingDescription: boolean;
+}
+
 function agentActionPath(agentId: string, suffix = ""): string {
 	return `/admin/agents/${encodeURIComponent(agentId)}${suffix}`;
 }
@@ -153,7 +170,85 @@ function renderAgentTokenSection(
 	`;
 }
 
-function renderAgentCard(entry: AgentWithStatus, csrfToken: string): SafeHtml {
+function renderWebhookSection(
+	agent: AgentWithStatus["agent"],
+	webhook: AgentWebhookSummary | null,
+	csrfToken: string,
+): SafeHtml {
+	const urlInputId = `agent-webhook-url-${agent.id}`;
+
+	if (webhook === null) {
+		return html`
+			<div class="stack">
+				<div>
+					<strong>Webhook 通知:</strong>
+					<span class="badge">未設定</span>
+				</div>
+				<form method="POST" action="${agentActionPath(agent.id, "/webhook")}">
+					${csrfInput(csrfToken)}
+					<div class="field">
+						<label for="${urlInputId}">呼び出し先 URL</label>
+						<input
+							id="${urlInputId}"
+							type="url"
+							name="url"
+							maxlength="2048"
+							placeholder="https://agent.example/webhook"
+							required
+						>
+						<div class="muted">
+							新着時に本文を含まない署名付き通知を送信します（HTTPS のみ、ローカル・内部宛先不可）。
+						</div>
+					</div>
+					<button type="submit" class="btn btn-primary">Webhook を登録</button>
+				</form>
+			</div>
+		`;
+	}
+
+	return html`
+		<div class="stack">
+			<div>
+				<strong>Webhook 通知:</strong>
+				<span class="badge badge-ok">設定済み</span>
+				<span class="muted">（更新日時: ${formatTimestamp(webhook.updatedAt)}）</span>
+			</div>
+			<div class="muted">
+				呼び出し先 URL: <code>${webhook.url}</code>
+			</div>
+			<div class="banner banner-warning" role="note">
+				注意: URL の更新または署名鍵の再発行を行うと、現在有効な署名鍵は即座に無効になります。
+			</div>
+			<form method="POST" action="${agentActionPath(agent.id, "/webhook")}">
+				${csrfInput(csrfToken)}
+				<div class="field">
+					<label for="${urlInputId}">呼び出し先 URL</label>
+					<input
+						id="${urlInputId}"
+						type="url"
+						name="url"
+						maxlength="2048"
+						value="${webhook.url}"
+						required
+					>
+				</div>
+				<div class="actions">
+					<button type="submit" class="btn btn-primary">URL を更新・署名鍵を再発行</button>
+				</div>
+			</form>
+			<form class="inline-form" method="POST" action="${agentActionPath(agent.id, "/webhook/delete")}">
+				${csrfInput(csrfToken)}
+				<button type="submit" class="btn btn-danger">Webhook を削除</button>
+			</form>
+		</div>
+	`;
+}
+
+function renderAgentCard(
+	entry: AgentWithStatus,
+	webhook: AgentWebhookSummary | null,
+	csrfToken: string,
+): SafeHtml {
 	const { agent, todayQuestionCount } = entry;
 	const descInputId = `agent-description-${agent.id}`;
 	const limitInputId = `agent-limit-${agent.id}`;
@@ -213,6 +308,8 @@ function renderAgentCard(entry: AgentWithStatus, csrfToken: string): SafeHtml {
 				renderAgentTokenSection(entry, purpose, csrfToken),
 			)}
 
+			${renderWebhookSection(agent, webhook, csrfToken)}
+
 			<div class="actions">
 				${statusForm}
 				<a class="btn btn-danger" href="${agentActionPath(agent.id, "/delete")}">削除…</a>
@@ -223,6 +320,7 @@ function renderAgentCard(entry: AgentWithStatus, csrfToken: string): SafeHtml {
 
 export function renderAgentsPageBody(options: {
 	agents: readonly AgentWithStatus[];
+	webhooks?: ReadonlyMap<string, AgentWebhookSummary>;
 	defaultOwnerId: string;
 	csrfToken: string;
 	registerDraft?: RegisterFormDraft;
@@ -242,7 +340,11 @@ export function renderAgentsPageBody(options: {
 				</section>
 			`
 			: options.agents.map((entry) =>
-					renderAgentCard(entry, options.csrfToken),
+					renderAgentCard(
+						entry,
+						options.webhooks?.get(entry.agent.id) ?? null,
+						options.csrfToken,
+					),
 				);
 
 	return html`
@@ -315,9 +417,18 @@ export function renderAgentsPageBody(options: {
 
 export function renderDeleteConfirmBody(options: {
 	entry: AgentWithStatus;
+	impact: AgentDeleteImpact;
 	csrfToken: string;
 }): SafeHtml {
 	const { agent, activeTokens } = options.entry;
+	const { impact } = options;
+
+	const proposalSummary =
+		impact.proposalCount === 0
+			? "なし"
+			: impact.pendingProposalCount > 0
+				? `${impact.proposalCount}件（うち承認待ち ${impact.pendingProposalCount}件。同時に削除されます）`
+				: `${impact.proposalCount}件（同時に削除されます）`;
 
 	return html`
 		<div class="stack">
@@ -327,7 +438,7 @@ export function renderDeleteConfirmBody(options: {
 			</div>
 
 			<div class="banner banner-warning" role="alert">
-				エージェント「${agent.name}」を削除すると、紐づくトークン・許可ルール・メッセージも削除されます（監査ログと変更履歴の記録は保持されます）。
+				エージェント「${agent.name}」を削除すると、紐づくトークン・許可ルール・メッセージ・Webhook・提案・承認待ちの説明文も削除され、管理者ボットに指名中であれば指名と権限設定も解除されます（監査ログと変更履歴の記録は保持されます）。
 			</div>
 
 			<section class="card stack">
@@ -343,6 +454,34 @@ export function renderDeleteConfirmBody(options: {
 						</div>
 					`,
 				)}
+				<div>
+					<strong>管理者ボット指名:</strong>
+					${
+						impact.isAdminBot
+							? html`<span class="badge badge-danger">指名中</span> 削除すると管理者ボットの指名が解除され、本文閲覧・最高管理者権限の設定もオフにリセットされます`
+							: "指名されていません"
+					}
+				</div>
+				<div>
+					<strong>管理者トークン（/mcp/admin）:</strong>
+					${impact.hasActiveAdminToken ? "有効なトークンあり（同時に削除されます）" : "未発行"}
+				</div>
+				<div>
+					<strong>Webhook 通知:</strong>
+					${
+						impact.webhookUrl !== null
+							? html`設定済み（<code>${impact.webhookUrl}</code>・署名鍵と配信キューも同時に削除されます）`
+							: "未設定"
+					}
+				</div>
+				<div>
+					<strong>管理者ボットの提案:</strong>
+					${proposalSummary}
+				</div>
+				<div>
+					<strong>承認待ちの説明文:</strong>
+					${impact.hasPendingDescription ? "あり（同時に削除されます）" : "なし"}
+				</div>
 				<div class="actions">
 					<form class="inline-form" method="POST" action="${agentActionPath(agent.id, "/delete")}">
 						${csrfInput(options.csrfToken)}
@@ -409,6 +548,74 @@ export function renderIssuedTokenBody(view: IssuedTokenView): SafeHtml {
 				</div>
 				<div class="token-box">${view.token}</div>
 				${renderUsageInstructions(view)}
+				<div class="actions">
+					<a class="btn btn-primary" href="/admin/agents">エージェント一覧へ戻る</a>
+				</div>
+			</section>
+		</div>
+	`;
+}
+
+const HMAC_VERIFICATION_SNIPPET = `import { createHmac, timingSafeEqual } from "node:crypto";
+
+export function verifyPaabWebhook(
+	rawBody: string,
+	timestampHeader: string,
+	signatureHeader: string,
+	signingSecret: string,
+): boolean {
+	const ts = Number(timestampHeader);
+	if (!Number.isInteger(ts) || Math.abs(Date.now() / 1000 - ts) > 300) {
+		return false;
+	}
+	const expected = "sha256=" + createHmac("sha256", signingSecret)
+		.update(\`\${timestampHeader}.\${rawBody}\`)
+		.digest("hex");
+	const a = Buffer.from(signatureHeader);
+	const b = Buffer.from(expected);
+	return a.length === b.length && timingSafeEqual(a, b);
+}`;
+
+export function renderConfiguredWebhookBody(
+	view: ConfiguredWebhookView,
+): SafeHtml {
+	return html`
+		<div class="stack">
+			<div>
+				<h1>Webhook を設定しました</h1>
+				<p class="muted">対象エージェント: <strong>${view.agentName}</strong></p>
+			</div>
+
+			${
+				view.replacedPrevious
+					? html`
+						<div class="banner banner-warning" role="status">
+							以前の署名鍵は即座に無効になりました。受信側エンドポイントの検証用シークレットを新しい値へ差し替えてください。
+						</div>
+					`
+					: false
+			}
+
+			<section class="card stack">
+				<div class="banner banner-info">
+					この署名鍵（signing_secret）の平文はセキュリティ上、今この画面に一度だけ表示されます。サーバーでは再表示できないため、この場で控えてください。
+				</div>
+				<div>
+					<strong>呼び出し先 URL:</strong>
+					<code>${view.url}</code>
+				</div>
+				<div class="token-box">${view.signingSecret}</div>
+				<div>
+					<p>
+						新着時、paab は次の固定 JSON を <code>POST</code> し、<code>X-Paab-Timestamp</code> と <code>X-Paab-Signature</code> で署名します。本文やメッセージ ID は含みません。
+					</p>
+					<ul>
+						<li>送信ボディ（固定）: <code>{"event":"inbox_wake"}</code></li>
+						<li><code>X-Paab-Timestamp</code>: UNIX 秒の文字列</li>
+						<li><code>X-Paab-Signature</code>: <code>sha256=&lt;HMAC-SHA256 hex(&quot;&lt;timestamp&gt;.&lt;body&gt;&quot;)&gt;</code></li>
+					</ul>
+					<pre class="token-box"><code>${HMAC_VERIFICATION_SNIPPET}</code></pre>
+				</div>
 				<div class="actions">
 					<a class="btn btn-primary" href="/admin/agents">エージェント一覧へ戻る</a>
 				</div>

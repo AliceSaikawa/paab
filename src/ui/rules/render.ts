@@ -53,6 +53,8 @@ export const CHANGE_ACTION_LABELS: Record<ChangeAction, string> = {
 	change_reverted: "変更取消",
 	description_approved: "説明文承認",
 	description_rejected: "説明文却下",
+	webhook_configured: "Webhook設定",
+	webhook_deleted: "Webhook削除",
 };
 
 function parseJsonRecord(raw: string | null): Record<string, unknown> | null {
@@ -324,6 +326,11 @@ function describeSnapshot(
 		case "description_approved":
 		case "description_rejected":
 			return describeDescriptionSnapshot(record, raw);
+		case "webhook_configured":
+		case "webhook_deleted": {
+			const url = readString(record, "url");
+			return url !== null ? `URL=${url}` : raw;
+		}
 	}
 }
 
