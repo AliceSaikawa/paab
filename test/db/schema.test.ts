@@ -1,3 +1,4 @@
+import { applyD1Migrations } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
 	type AgentRow,
@@ -28,7 +29,7 @@ import type {
 	NewAuditLogEntry,
 	Token,
 } from "../../src/types";
-import { createTestDb } from "../helpers/db";
+import { createTestDb, migrationByName } from "../helpers/db";
 import { DAY_MS, seedAgent, seedCategory, T0 } from "../helpers/fixtures";
 
 let db: D1Database;
@@ -483,6 +484,91 @@ describe("audit_log", () => {
 	});
 });
 
+describe("deletion", () => {
+	let a: Agent;
+	let b: Agent;
+	let categoryId: string;
+
+	beforeEach(async () => {
+		a = await seedAgent(db, { name: "a" });
+		b = await seedAgent(db, { name: "b" });
+		categoryId = (await seedCategory(db, { name: "schedule" })).id;
+	});
+
+	async function messageCount(): Promise<number> {
+		const row = await db
+			.prepare("SELECT COUNT(*) AS n FROM messages")
+			.first<{ n: number }>();
+		return row?.n ?? -1;
+	}
+
+	it("deletes an agent that has messages, taking their messages and replies", async () => {
+		const asked = question(a, b, categoryId);
+		const answer = reply(asked);
+		const received = question(b, a, categoryId);
+		await db.batch([asked, answer, received].map((m) => insertMessage(db, m)));
+		await insertAuditLogEntry(db, {
+			occurredAt: T0,
+			eventType: "question_accepted",
+			fromAgentId: a.id,
+			toAgentId: b.id,
+			categoryId,
+			outcome: "ok",
+			reasonCode: null,
+			messageId: asked.id,
+			body: null,
+		}).run();
+		expect(await messageCount()).toBe(3);
+
+		await db.prepare("DELETE FROM agents WHERE id = ?").bind(a.id).run();
+
+		expect(await messageCount()).toBe(0);
+		// The audit log survives, by design without foreign keys.
+		const audit = await db
+			.prepare("SELECT COUNT(*) AS n FROM audit_log")
+			.first<{ n: number }>();
+		expect(audit?.n).toBe(1);
+		// The other agent is untouched.
+		const survivors = await db
+			.prepare("SELECT COUNT(*) AS n FROM agents")
+			.first<{ n: number }>();
+		expect(survivors?.n).toBe(1);
+	});
+
+	it("removes a bridge rejection with the question it refers to", async () => {
+		const asked = question(b, a, categoryId);
+		const rejection = reply(asked, {
+			kind: "rejection",
+			fromAgentId: null,
+			body: null,
+		});
+		await db.batch([asked, rejection].map((m) => insertMessage(db, m)));
+
+		// The rejection names neither the deleted agent nor its category;
+		// only in_reply_to ties it to the deleted question.
+		await db.prepare("DELETE FROM agents WHERE id = ?").bind(a.id).run();
+
+		expect(await messageCount()).toBe(0);
+	});
+
+	it("deletes a category that has messages", async () => {
+		const asked = question(a, b, categoryId);
+		const expired = question(a, b, categoryId, { status: "expired" });
+		await db.batch([asked, expired].map((m) => insertMessage(db, m)));
+
+		await db
+			.prepare("DELETE FROM categories WHERE id = ?")
+			.bind(categoryId)
+			.run();
+
+		expect(await messageCount()).toBe(0);
+		const agents = await db
+			.prepare("SELECT COUNT(*) AS n FROM agents")
+			.first<{ n: number }>();
+		expect(agents?.n).toBe(2);
+	});
+});
+
 describe("row conversion", () => {
 	it("throws on a stored value outside the known set", async () => {
 		await db
@@ -497,5 +583,71 @@ describe("row conversion", () => {
 		expect(() => auditLogEntryFromRow(row as AuditLogRow)).toThrow(
 			/audit_log\.event_type/,
 		);
+	});
+});
+
+describe("migration 0002 on populated data", () => {
+	it("preserves existing answers and rejections when upgrading from 0001", async () => {
+		const m0001 = migrationByName("0001_initial_schema.sql");
+		const m0002 = migrationByName("0002_cascade_message_references.sql");
+
+		for (const table of [
+			"audit_log",
+			"messages",
+			"allow_rules",
+			"tokens",
+			"categories",
+			"agents",
+			"d1_migrations",
+		]) {
+			await db.prepare(`DROP TABLE IF EXISTS ${table}`).run();
+		}
+
+		await applyD1Migrations(db, [m0001]);
+
+		const a = await seedAgent(db, { name: "a" });
+		const b = await seedAgent(db, { name: "b" });
+		const cat = await seedCategory(db, { name: "schedule" });
+		const q1 = question(a, b, cat.id, { status: "answered" });
+		const r1 = reply(q1, { body: "confirmed" });
+		const q2 = question(b, a, cat.id, { status: "declined" });
+		const r2 = reply(q2, {
+			kind: "rejection",
+			fromAgentId: null,
+			body: null,
+		});
+		await db.batch([q1, r1, q2, r2].map((m) => insertMessage(db, m)));
+
+		await applyD1Migrations(db, [m0001, m0002]);
+
+		const { results } = await db
+			.prepare("SELECT id, kind, in_reply_to, body FROM messages ORDER BY id")
+			.all<{
+				id: string;
+				kind: string;
+				in_reply_to: string | null;
+				body: string | null;
+			}>();
+		expect(results.map((r) => r.id).sort()).toEqual(
+			[q1.id, r1.id, q2.id, r2.id].sort(),
+		);
+		expect(results.find((r) => r.id === r1.id)).toMatchObject({
+			kind: "answer",
+			in_reply_to: q1.id,
+			body: "confirmed",
+		});
+		expect(results.find((r) => r.id === r2.id)).toMatchObject({
+			kind: "rejection",
+			in_reply_to: q2.id,
+			body: null,
+		});
+		const fkCheck = await db.prepare("PRAGMA foreign_key_check").all();
+		expect(fkCheck.results).toEqual([]);
+
+		await db.prepare("DELETE FROM agents WHERE id = ?").bind(a.id).run();
+		const remaining = await db
+			.prepare("SELECT COUNT(*) AS n FROM messages")
+			.first<{ n: number }>();
+		expect(remaining?.n).toBe(0);
 	});
 });

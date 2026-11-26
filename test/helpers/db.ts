@@ -32,6 +32,15 @@ const migrations: D1Migration[] = Object.entries(migrationFiles)
 	}))
 	.sort((a, b) => a.name.localeCompare(b.name));
 
+/** Returns one parsed migration by filename for migration regression tests. */
+export function migrationByName(name: string): D1Migration {
+	const migration = migrations.find((item) => item.name === name);
+	if (migration === undefined) {
+		throw new Error(`Missing migration ${name}`);
+	}
+	return migration;
+}
+
 // Children before parents, so that foreign keys hold while emptying.
 const TABLES = [
 	"audit_log",
