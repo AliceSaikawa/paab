@@ -4,12 +4,12 @@ export type Row = Record<string, unknown>;
 
 /**
  * The commands talk to D1 only through this, so tests can back it with the
- * test D1 and the CLI with `wrangler d1 execute`. Reads and writes are apart
- * because remote D1 returns rows only for `--command`, and runs a `--file`
- * as one unit that rolls back on failure.
+ * test D1 and the CLI with `wrangler d1 execute`. Single statements that
+ * return rows (including `UPDATE ... RETURNING`) use `--command`, and
+ * multi-statement writes use `--file` as one unit that rolls back on failure.
  */
 export interface D1Client {
-	/** Runs one read-only statement and returns its rows. */
+	/** Runs one statement and returns its rows. */
 	query(statement: string): Promise<Row[]>;
 	/** Runs the statements as one transaction. */
 	execute(statements: string[]): Promise<void>;

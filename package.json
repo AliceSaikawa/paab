@@ -19,7 +19,10 @@
 		"cli:build": "esbuild scripts/paab.ts --bundle --platform=node --format=esm --packages=external --log-level=warning --outfile=.wrangler/tmp/paab-cli.mjs",
 		"seed": "npm run -s cli:build && node .wrangler/tmp/paab-cli.mjs seed",
 		"token": "npm run -s cli:build && node .wrangler/tmp/paab-cli.mjs token",
-		"audit-log": "npm run -s cli:build && node .wrangler/tmp/paab-cli.mjs audit-log"
+		"audit-log": "npm run -s cli:build && node .wrangler/tmp/paab-cli.mjs audit-log",
+		"suspend": "npm run -s cli:build && node .wrangler/tmp/paab-cli.mjs suspend",
+		"resume": "npm run -s cli:build && node .wrangler/tmp/paab-cli.mjs resume",
+		"revoke-token": "npm run -s cli:build && node .wrangler/tmp/paab-cli.mjs revoke-token"
 	},
 	"devDependencies": {
 		"@biomejs/biome": "2.6.8",
