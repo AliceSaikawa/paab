@@ -5,6 +5,7 @@ import {
 	type UiEnv,
 	verifyAccessRequest,
 } from "./access";
+import { adminBotRoutes } from "./adminbot";
 import { agentRoutes } from "./agents";
 import { auditRoutes } from "./audit";
 import { prepareCsrfGet, verifyCsrfPost } from "./csrf";
@@ -104,6 +105,7 @@ const IMPLEMENTED_ROUTES: readonly AdminRoute[] = [
 	...agentRoutes(),
 	...ruleRoutes(),
 	...auditRoutes(),
+	...adminBotRoutes(),
 ];
 const IMPLEMENTED_PATTERNS = new Set(
 	IMPLEMENTED_ROUTES.map((route) => route.pattern),

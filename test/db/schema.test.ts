@@ -1,9 +1,11 @@
 import { applyD1Migrations } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
+	type AdminBotConfigRow,
 	type AgentRow,
 	type AllowRuleRow,
 	type AuditLogRow,
+	adminBotConfigFromRow,
 	agentFromRow,
 	allowRuleFromRow,
 	auditLogEntryFromRow,
@@ -100,6 +102,7 @@ describe("test database helper", () => {
 			.all<{ name: string }>();
 		const tables = results.map((row) => row.name);
 		expect(tables).toEqual([
+			"admin_bot_config",
 			"agents",
 			"allow_rules",
 			"audit_log",
@@ -670,6 +673,7 @@ describe("migrations", () => {
 
 	it("preserves all existing tables when migrating a populated database from 0002 to 0003 and enforces change_log constraints", async () => {
 		await db.batch([
+			db.prepare("DROP TABLE IF EXISTS admin_bot_config"),
 			db.prepare("DROP TABLE IF EXISTS change_log"),
 			db.prepare("DROP TABLE IF EXISTS audit_log"),
 			db.prepare("DROP TABLE IF EXISTS messages"),
@@ -819,6 +823,176 @@ describe("migrations", () => {
 				.run(),
 		).rejects.toThrow(/NOT NULL/);
 	});
+
+	it("preserves all existing tables when migrating a populated database from 0003 to 0004 and enforces admin_bot_config constraints", async () => {
+		await db.batch([
+			db.prepare("DROP TABLE IF EXISTS admin_bot_config"),
+			db.prepare("DROP TABLE IF EXISTS change_log"),
+			db.prepare("DROP TABLE IF EXISTS audit_log"),
+			db.prepare("DROP TABLE IF EXISTS messages"),
+			db.prepare("DROP TABLE IF EXISTS allow_rules"),
+			db.prepare("DROP TABLE IF EXISTS tokens"),
+			db.prepare("DROP TABLE IF EXISTS categories"),
+			db.prepare("DROP TABLE IF EXISTS agents"),
+			db.prepare("DROP TABLE IF EXISTS d1_migrations"),
+		]);
+
+		const m1 = migration("0001_initial_schema.sql");
+		const m2 = migration("0002_cascade_message_references.sql");
+		const m3 = migration("0003_change_log.sql");
+		const m4 = migration("0004_admin_bot.sql");
+		await applyD1Migrations(db, [m1, m2, m3]);
+
+		const a = await seedAgent(db, { name: "a" });
+		const b = await seedAgent(db, { name: "b" });
+		const category = await seedCategory(db, { name: "schedule" });
+		const rule: AllowRule = {
+			fromAgentId: a.id,
+			toAgentId: b.id,
+			categoryId: category.id,
+			createdAt: T0,
+		};
+		const tok: Token = {
+			id: newId(),
+			agentId: a.id,
+			tokenHash: `hash-${newId()}`,
+			purpose: "participant",
+			createdAt: T0,
+			revokedAt: null,
+		};
+		const msg = question(a, b, category.id);
+		const audit: NewAuditLogEntry = {
+			occurredAt: T0,
+			eventType: "question_accepted",
+			fromAgentId: a.id,
+			toAgentId: b.id,
+			categoryId: category.id,
+			outcome: "ok",
+			reasonCode: null,
+			messageId: msg.id,
+			body: null,
+		};
+		const change: NewChangeLogEntry = {
+			occurredAt: T0,
+			actorType: "owner",
+			actorId: "me",
+			approverId: null,
+			action: "agent_registered",
+			targetType: "agent",
+			targetId: a.id,
+			beforeJson: null,
+			afterJson: JSON.stringify(a),
+			revertedAt: null,
+		};
+		await db.batch([
+			insertAllowRule(db, rule),
+			insertToken(db, tok),
+			insertMessage(db, msg),
+			insertAuditLogEntry(db, audit),
+			insertChangeLogEntry(db, change),
+		]);
+
+		await applyD1Migrations(db, [m1, m2, m3, m4]);
+
+		const fkViolations = await db.prepare("PRAGMA foreign_key_check").all();
+		expect(fkViolations.results).toEqual([]);
+
+		expect(
+			(
+				await db.prepare("SELECT * FROM agents ORDER BY name").all<AgentRow>()
+			).results.map(agentFromRow),
+		).toEqual([a, b]);
+		expect(
+			(
+				await db.prepare("SELECT * FROM categories").all<CategoryRow>()
+			).results.map(categoryFromRow),
+		).toEqual([category]);
+		expect(
+			(
+				await db.prepare("SELECT * FROM allow_rules").all<AllowRuleRow>()
+			).results.map(allowRuleFromRow),
+		).toEqual([rule]);
+		expect(
+			(await db.prepare("SELECT * FROM tokens").all<TokenRow>()).results.map(
+				tokenFromRow,
+			),
+		).toEqual([tok]);
+		expect(
+			(
+				await db.prepare("SELECT * FROM messages").all<MessageRow>()
+			).results.map(messageFromRow),
+		).toEqual([msg]);
+		const auditRows = (
+			await db.prepare("SELECT * FROM audit_log").all<AuditLogRow>()
+		).results.map(auditLogEntryFromRow);
+		expect(auditRows.map(({ id: _id, ...rest }) => rest)).toEqual([audit]);
+		const changeRows = (
+			await db.prepare("SELECT * FROM change_log").all<ChangeLogRow>()
+		).results.map(changeLogEntryFromRow);
+		expect(changeRows.map(({ id: _id, ...rest }) => rest)).toEqual([change]);
+
+		await db
+			.prepare(
+				`INSERT INTO admin_bot_config (id, agent_id, read_bodies, superadmin_until, updated_at)
+				VALUES (1, ?, 1, ?, ?)`,
+			)
+			.bind(a.id, T0 + 1000, T0 + 10)
+			.run();
+		const configRow = await db
+			.prepare("SELECT * FROM admin_bot_config WHERE id = 1")
+			.first<AdminBotConfigRow>();
+		expect(configRow && adminBotConfigFromRow(configRow)).toEqual({
+			agentId: a.id,
+			readBodies: true,
+			superadminUntil: T0 + 1000,
+			updatedAt: T0 + 10,
+		});
+
+		await db.prepare("DELETE FROM agents WHERE id = ?").bind(a.id).run();
+		const afterAgentDelete = await db
+			.prepare("SELECT * FROM admin_bot_config WHERE id = 1")
+			.first<AdminBotConfigRow>();
+		expect(afterAgentDelete?.agent_id).toBeNull();
+		expect(afterAgentDelete && adminBotConfigFromRow(afterAgentDelete)).toEqual(
+			{
+				agentId: null,
+				readBodies: false,
+				superadminUntil: null,
+				updatedAt: T0 + 10,
+			},
+		);
+
+		await expect(
+			db
+				.prepare(
+					`INSERT INTO admin_bot_config (id, agent_id, read_bodies, superadmin_until, updated_at)
+					VALUES (2, NULL, 0, NULL, ?)`,
+				)
+				.bind(T0)
+				.run(),
+		).rejects.toThrow(/CHECK/);
+
+		await expect(
+			db
+				.prepare(`UPDATE admin_bot_config SET read_bodies = 2 WHERE id = 1`)
+				.run(),
+		).rejects.toThrow(/CHECK/);
+
+		await expect(
+			db
+				.prepare(
+					`UPDATE admin_bot_config SET updated_at = 'bad-int' WHERE id = 1`,
+				)
+				.run(),
+		).rejects.toThrow(/STRICT|datatype/i);
+
+		await expect(
+			db
+				.prepare(`UPDATE admin_bot_config SET agent_id = ? WHERE id = 1`)
+				.bind(newId())
+				.run(),
+		).rejects.toThrow(/FOREIGN KEY/);
+	});
 });
 
 describe("row conversion", () => {
@@ -853,6 +1027,18 @@ describe("row conversion", () => {
 			/change_log\.action/,
 		);
 	});
+
+	it("throws on invalid admin_bot_config.read_bodies value", () => {
+		expect(() =>
+			adminBotConfigFromRow({
+				id: 1,
+				agent_id: "a1",
+				read_bodies: 2,
+				superadmin_until: null,
+				updated_at: T0,
+			}),
+		).toThrow(/admin_bot_config\.read_bodies/);
+	});
 });
 
 describe("migration 0002 on populated data", () => {
@@ -861,6 +1047,7 @@ describe("migration 0002 on populated data", () => {
 		const m0002 = migrationByName("0002_cascade_message_references.sql");
 
 		for (const table of [
+			"admin_bot_config",
 			"change_log",
 			"audit_log",
 			"messages",
