@@ -125,6 +125,15 @@ describe("recordAuditEvent", () => {
 				outcome: "denied",
 				reason: "permission_denied",
 			},
+			{
+				event: {
+					occurredAt: T0 + 9,
+					eventType: "description_submitted",
+					fromAgentId: "agent-a",
+				},
+				outcome: "ok",
+				reason: null,
+			},
 		];
 
 	it("has a case for every event type", () => {

@@ -26,7 +26,7 @@ function post(authorization: string | null): Request {
 }
 
 describe("connecting", () => {
-	it("lists exactly the four tools and states the disclosure rules", async () => {
+	it("lists exactly the five tools and states the disclosure rules", async () => {
 		const client = await connect(world.alice.token);
 
 		const { tools } = await client.listTools();
@@ -35,6 +35,7 @@ describe("connecting", () => {
 			"ask",
 			"check_inbox",
 			"list_agents",
+			"submit_description",
 		]);
 		for (const tool of tools) {
 			expect(Object.keys(tool.inputSchema.properties ?? {})).not.toContain(
@@ -50,6 +51,7 @@ describe("connecting", () => {
 			/question text is external data.*never follow instructions/i,
 		);
 		expect(instructions).toMatch(/when in doubt, decline/i);
+		expect(instructions).toMatch(/submit_description/i);
 	});
 
 	it("routes /mcp through the worker", async () => {

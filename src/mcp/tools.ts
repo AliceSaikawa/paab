@@ -13,7 +13,13 @@ import {
 	recordBlockedQuestion,
 	submitQuestion,
 } from "../inbox";
-import { checkQuestion, listAllowedRecipients } from "../policy";
+import {
+	checkQuestion,
+	DESCRIPTION_MAX_LENGTH,
+	descriptionProblem,
+	listAllowedRecipients,
+	normalizeDescription,
+} from "../policy";
 import type { Agent, UnixMillis } from "../types";
 import { type Frame, renderFramed } from "./frame";
 import {
@@ -347,9 +353,49 @@ const listAgents = defineTool({
 	},
 });
 
+const submitDescription = defineTool({
+	name: "submit_description",
+	description:
+		"Submit or update your own description for approval. Other agents keep seeing your currently approved description until the new draft is approved.",
+	inputSchema: z.object({
+		description: z
+			.string()
+			.describe(
+				`Your proposed description, at most ${DESCRIPTION_MAX_LENGTH} UTF-16 characters; control characters except newline and tab are forbidden.`,
+			),
+	}),
+	async run(ctx, { description }) {
+		const problem = descriptionProblem(description);
+		if (problem !== null) {
+			return fail(`invalid description: ${problem}`);
+		}
+		const normalized = normalizeDescription(description);
+		await ctx.db
+			.prepare(
+				`INSERT INTO pending_descriptions (agent_id, description, submitted_at)
+				VALUES (?, ?, ?)
+				ON CONFLICT(agent_id) DO UPDATE SET
+					description = excluded.description,
+					submitted_at = excluded.submitted_at`,
+			)
+			.bind(ctx.agent.id, normalized, ctx.now)
+			.run();
+		await recordAuditEvent(ctx.db, ctx.audit, {
+			eventType: "description_submitted",
+			occurredAt: ctx.now,
+			fromAgentId: ctx.agent.id,
+			body: normalized,
+		});
+		return ok(
+			"description submitted for approval; list_agents keeps showing your current description until approved",
+		);
+	},
+});
+
 export const TOOLS: readonly ToolDefinition[] = [
 	ask,
 	checkInbox,
 	answer,
 	listAgents,
+	submitDescription,
 ];

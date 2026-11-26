@@ -31,6 +31,8 @@ export const UNDOABLE_CHANGE_ACTIONS = [
 	"allow_rule_revoked",
 	"allow_rule_granted",
 	"category_created",
+	"description_approved",
+	"description_rejected",
 ] as const satisfies readonly ChangeAction[];
 
 export type UndoableChangeAction = (typeof UNDOABLE_CHANGE_ACTIONS)[number];
@@ -167,6 +169,8 @@ export function changedAgentFields(
 			return new Set<AgentField>(["status"]);
 		case "agent_deleted":
 			return new Set<AgentField>(ALL_AGENT_FIELDS);
+		case "description_approved":
+			return new Set<AgentField>(["description"]);
 		case "agent_updated": {
 			const before = parseJsonRecord(entry.beforeJson);
 			const after = parseJsonRecord(entry.afterJson);
@@ -201,6 +205,7 @@ export function changedAgentFields(
 		case "admin_bot_cleared":
 		case "admin_bot_switches_updated":
 		case "change_reverted":
+		case "description_rejected":
 			return EMPTY_AGENT_FIELDS;
 	}
 }
@@ -372,6 +377,114 @@ async function prepareAgentRestore(
 		statement: db
 			.prepare(`UPDATE agents SET ${setClauses.join(", ")} WHERE id = ?`)
 			.bind(...binds, current.id),
+	};
+}
+
+async function prepareDescriptionRestore(
+	db: D1Database,
+	entry: ChangeLogEntry,
+): Promise<PreparedRestore> {
+	const snapshot = parseJsonRecord(entry.beforeJson);
+	if (snapshot === null) {
+		return undoFail("invalid_input", "変更前スナップショットが不正です");
+	}
+	const agentId = readNonEmptyString(snapshot, "agentId");
+	if (agentId === null || agentId !== entry.targetId) {
+		return undoFail("invalid_input", "説明文のスナップショットが不正です");
+	}
+	const rawDescription = snapshot.description;
+	if (typeof rawDescription !== "string") {
+		return undoFail("invalid_input", "変更前の説明文が不正です");
+	}
+
+	if (entry.action === "description_approved") {
+		const [newerResult, agentResult] = await db.batch([
+			newerAgentRelatedChangesQuery(db, entry.targetId, entry.id),
+			db.prepare("SELECT * FROM agents WHERE id = ?").bind(entry.targetId),
+		]);
+		const newerEntries = ((newerResult?.results ?? []) as ChangeLogRow[]).map(
+			changeLogEntryFromRow,
+		);
+		if (
+			newerEntries.some((newer) => changedAgentFields(newer).has("description"))
+		) {
+			return undoFail(
+				"conflict_newer_change",
+				"対象エージェントの説明文に新しい変更があるため元に戻せません",
+			);
+		}
+		const agentRow = (agentResult?.results[0] ?? null) as AgentRow | null;
+		if (agentRow === null) {
+			return undoFail("not_found", "対象のエージェントが見つかりません");
+		}
+		const current = agentFromRow(agentRow);
+		const nextDescription =
+			rawDescription === current.description
+				? current.description
+				: (() => {
+						const check = validateDescription(rawDescription);
+						return check.ok ? check.value : null;
+					})();
+		if (nextDescription === null) {
+			return undoFail("invalid_input", "変更前の説明文が不正です");
+		}
+		return {
+			ok: true,
+			statement: db
+				.prepare("UPDATE agents SET description = ? WHERE id = ?")
+				.bind(nextDescription, current.id),
+		};
+	}
+
+	const descCheck = validateDescription(rawDescription);
+	if (!descCheck.ok) {
+		return undoFail("invalid_input", descCheck.message);
+	}
+	const submittedAt = snapshot.submittedAt;
+	if (typeof submittedAt !== "number" || !Number.isSafeInteger(submittedAt)) {
+		return undoFail("invalid_input", "説明文の提出日時が不正です");
+	}
+
+	const [newerResult, agentResult, pendingResult] = await db.batch([
+		newerAgentRelatedChangesQuery(db, entry.targetId, entry.id),
+		db.prepare("SELECT id FROM agents WHERE id = ?").bind(entry.targetId),
+		db
+			.prepare("SELECT 1 AS found FROM pending_descriptions WHERE agent_id = ?")
+			.bind(entry.targetId),
+	]);
+	const newerEntries = ((newerResult?.results ?? []) as ChangeLogRow[]).map(
+		changeLogEntryFromRow,
+	);
+	if (
+		newerEntries.some(
+			(newer) =>
+				newer.action === "agent_deleted" ||
+				newer.action === "description_approved" ||
+				newer.action === "description_rejected",
+		)
+	) {
+		return undoFail(
+			"conflict_newer_change",
+			"対象エージェントの説明文に新しい変更があるため元に戻せません",
+		);
+	}
+	if ((pendingResult?.results.length ?? 0) > 0) {
+		return undoFail(
+			"conflict_newer_change",
+			"対象エージェントに新しい承認待ち説明文があるため元に戻せません",
+		);
+	}
+	if ((agentResult?.results.length ?? 0) === 0) {
+		return undoFail("not_found", "対象のエージェントが見つかりません");
+	}
+
+	return {
+		ok: true,
+		statement: db
+			.prepare(
+				"INSERT INTO pending_descriptions (agent_id, description, submitted_at) VALUES (?, ?, ?)",
+			)
+			.bind(entry.targetId, descCheck.value, submittedAt),
 	};
 }
 
@@ -569,6 +682,10 @@ export async function revertAdminBotChange(
 			break;
 		case "category_created":
 			prepared = await prepareCategoryRestore(db, entry);
+			break;
+		case "description_approved":
+		case "description_rejected":
+			prepared = await prepareDescriptionRestore(db, entry);
 			break;
 	}
 	if (!prepared.ok) {

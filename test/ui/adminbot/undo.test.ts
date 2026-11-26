@@ -12,10 +12,14 @@ import {
 	updateAgent,
 } from "../../../src/admin";
 import {
+	approveProposal,
+	createProposal,
 	designateAdminBot,
 	handleAdminMcpRequest,
 	issueAdminBotToken,
 } from "../../../src/adminbot";
+import { listPendingDescriptions } from "../../../src/adminbot/descriptions";
+import { issueToken } from "../../../src/auth";
 import { type AgentRow, agentFromRow } from "../../../src/db";
 import { checkQuestion } from "../../../src/policy";
 import {
@@ -26,7 +30,7 @@ import {
 } from "../../../src/ui";
 import { createTestDb } from "../../helpers/db";
 import { seedCategory, T0 } from "../../helpers/fixtures";
-import { call } from "../../mcp/support";
+import { call, connect } from "../../mcp/support";
 
 const TEAM_DOMAIN = "paab-team.cloudflareaccess.com";
 const TEST_AUD = "adminbot-undo-ui-aud";
@@ -494,5 +498,234 @@ describe("/admin/adminbot 1-click Undo UI", () => {
 			{ fetchJwks: session.fetcher },
 		);
 		expect(noCsrf.status).toBe(403);
+	});
+
+	it("supports 1-click undo of description_approved and description_rejected, preserves approved description on lower_daily_limit undo, shows approverId, and renders agent names & readable description snapshots on /admin/rules", async () => {
+		const owner = { actorType: "owner" as const, actorId: ADMIN_EMAIL };
+		const museReg = await registerAgent(db, {
+			name: "muse",
+			dailyQuestionLimit: 20,
+			actor: owner,
+			now: T0,
+		});
+		const grokReg = await registerAgent(db, {
+			name: "grok",
+			description: "",
+			dailyQuestionLimit: 15,
+			actor: owner,
+			now: T0 + 1,
+		});
+		const bobReg = await registerAgent(db, {
+			name: "bob",
+			description: "bob v1",
+			dailyQuestionLimit: 10,
+			actor: owner,
+			now: T0 + 2,
+		});
+		if (!museReg.ok || !grokReg.ok || !bobReg.ok) {
+			throw new Error("register failed");
+		}
+		const muse = museReg.data.agent;
+		const grok = grokReg.data.agent;
+		const bob = bobReg.data.agent;
+
+		await designateAdminBot(db, {
+			agentId: muse.id,
+			actor: owner,
+			now: T0 + 3,
+		});
+		const adminTok = await issueAdminBotToken(db, {
+			agentId: muse.id,
+			actor: owner,
+			now: T0 + 4,
+		});
+		if (!adminTok.ok) throw new Error("admin token failed");
+
+		const grokPartTok = await issueToken(db, {
+			agentId: grok.id,
+			purpose: "participant",
+			now: T0 + 5,
+		});
+		const bobPartTok = await issueToken(db, {
+			agentId: bob.id,
+			purpose: "participant",
+			now: T0 + 6,
+		});
+
+		const grokMcp = await connect(grokPartTok.token, { now: T0 + 10 });
+		const bobMcp = await connect(bobPartTok.token, { now: T0 + 11 });
+		const adminMcp = await connectAdminMcp(adminTok.data.token, T0 + 12);
+
+		// 1. Bot lowers grok's limit, then grok submits description and bot approves it.
+		expect(
+			(
+				await call(adminMcp, "lower_daily_limit", {
+					agent: "grok",
+					new_limit: 5,
+				})
+			).isError,
+		).toBe(false);
+		expect(
+			(
+				await call(grokMcp, "submit_description", {
+					description: "grok approved bio",
+				})
+			).isError,
+		).toBe(false);
+		expect(
+			(
+				await call(adminMcp, "review_description", {
+					agent: "grok",
+					action: "approve",
+				})
+			).isError,
+		).toBe(false);
+
+		// 2. Bob submits a draft and bot rejects it.
+		expect(
+			(
+				await call(bobMcp, "submit_description", {
+					description: "bob rejected draft",
+				})
+			).isError,
+		).toBe(false);
+		expect(
+			(
+				await call(adminMcp, "review_description", {
+					agent: "bob",
+					action: "reject",
+				})
+			).isError,
+		).toBe(false);
+
+		// 3. Create and approve a proposal so an admin_bot change with approverId exists.
+		const proposal = await createProposal(db, {
+			botAgentId: muse.id,
+			request: { kind: "create_category", name: "travel" },
+			reason: "needed for travel questions",
+			now: T0 + 15,
+		});
+		if (!proposal.ok) throw new Error("createProposal failed");
+		const approvedProposal = await approveProposal(db, {
+			proposalId: proposal.data.proposal.id,
+			approverEmail: ADMIN_EMAIL,
+			now: T0 + 16,
+		});
+		if (!approvedProposal.ok) throw new Error("approveProposal failed");
+
+		const botChanges = await queryChangeLog(db, { actorType: "admin_bot" });
+		const lowerChange = botChanges.find((e) => e.action === "agent_updated");
+		const approveChange = botChanges.find(
+			(e) => e.action === "description_approved",
+		);
+		const rejectChange = botChanges.find(
+			(e) => e.action === "description_rejected",
+		);
+		const proposalChange = botChanges.find(
+			(e) => e.action === "category_created",
+		);
+		if (!lowerChange || !approveChange || !rejectChange || !proposalChange) {
+			throw new Error("Expected all 4 bot change_log entries");
+		}
+
+		// Verify /admin/adminbot renders Undo buttons for description actions, approverId on proposal, and zero extra scripts.
+		const { session, html } = await openAdminBotSession(T0 + 20);
+		expect(html.match(/<script\b/g)).toHaveLength(1);
+		expect(html).toContain(
+			`/admin/adminbot/changes/${approveChange.id}/revert`,
+		);
+		expect(html).toContain(`/admin/adminbot/changes/${rejectChange.id}/revert`);
+		expect(html).toContain("説明文承認");
+		expect(html).toContain("説明文却下");
+		expect(html).toContain(`（承認: ${ADMIN_EMAIL}）`);
+		// Only the single approved proposal row carries approverId; autonomous rows must not.
+		expect(html.match(new RegExp(`承認: ${ADMIN_EMAIL}`, "g"))).toHaveLength(1);
+
+		// Undo lower_daily_limit AFTER description_approved -> restores limit to 15 without clobbering description!
+		const undoLower = await adminPost(
+			session,
+			`/admin/adminbot/changes/${lowerChange.id}/revert`,
+			{},
+			T0 + 21,
+		);
+		expect(undoLower.response.status).toBe(200);
+		const grokAfterLowerUndo = await loadAgent(grok.id);
+		expect(grokAfterLowerUndo.dailyQuestionLimit).toBe(15);
+		expect(grokAfterLowerUndo.description).toBe("grok approved bio");
+
+		// Undo description_approved -> restores prior empty description "".
+		const undoApprove = await adminPost(
+			session,
+			`/admin/adminbot/changes/${approveChange.id}/revert`,
+			{},
+			T0 + 22,
+		);
+		expect(undoApprove.response.status).toBe(200);
+		expect(undoApprove.html).toContain(
+			`変更 #${approveChange.id}（説明文承認）を元に戻しました`,
+		);
+		expect((await loadAgent(grok.id)).description).toBe("");
+
+		// Undo description_rejected -> restores bob's draft in pending_descriptions with original submittedAt.
+		const undoReject = await adminPost(
+			session,
+			`/admin/adminbot/changes/${rejectChange.id}/revert`,
+			{},
+			T0 + 23,
+		);
+		expect(undoReject.response.status).toBe(200);
+		expect(undoReject.html).toContain(
+			`変更 #${rejectChange.id}（説明文却下）を元に戻しました`,
+		);
+		const restoredPending = await listPendingDescriptions(db);
+		expect(restoredPending).toHaveLength(1);
+		expect(restoredPending[0]).toMatchObject({
+			agentId: bob.id,
+			pendingDescription: "bob rejected draft",
+			submittedAt: T0 + 11,
+		});
+
+		// Re-reject bob's draft and have bob submit a new draft -> undo must return 409 conflict.
+		expect(
+			(
+				await call(adminMcp, "review_description", {
+					agent: "bob",
+					action: "reject",
+				})
+			).isError,
+		).toBe(false);
+		const [secondReject] = (
+			await queryChangeLog(db, { actorType: "admin_bot" })
+		).filter((e) => e.action === "description_rejected");
+		if (!secondReject) throw new Error("Expected second description_rejected");
+		expect(
+			(
+				await call(bobMcp, "submit_description", {
+					description: "bob newer draft",
+				})
+			).isError,
+		).toBe(false);
+		const conflictRejectUndo = await adminPost(
+			session,
+			`/admin/adminbot/changes/${secondReject.id}/revert`,
+			{},
+			T0 + 24,
+		);
+		expect(conflictRejectUndo.response.status).toBe(409);
+
+		// Verify /admin/rules renders admin_bot actor name (not raw UUID) and human-readable reverted description snapshots.
+		const rulesPage = await adminGet(session, "/admin/rules", T0 + 30);
+		expect(rulesPage.response.status).toBe(200);
+		const historySection =
+			rulesPage.html.split("変更履歴（change_log）")[1] ?? "";
+		expect(historySection).toContain("管理者ボット: muse");
+		expect(historySection).not.toContain(`管理者ボット: ${muse.id}`);
+		expect(historySection).toContain(
+			"変更前: grok approved bio / 変更後: （空）",
+		);
+		expect(historySection).toContain(
+			"変更前: なし / 変更後: bob rejected draft",
+		);
+		expect(historySection).not.toContain("&quot;agentId&quot;");
 	});
 });
