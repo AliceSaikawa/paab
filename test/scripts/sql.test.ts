@@ -59,6 +59,9 @@ describe("wranglerTargetArgs", () => {
 		}).catch((error: unknown) => error);
 		expect(defaultError).toBeInstanceOf(CliError);
 		expect((defaultError as Error).message).toContain("wrangler.local.jsonc");
+		expect((defaultError as Error).message).toContain(
+			"wrangler.jsonc を wrangler.local.jsonc に写し",
+		);
 
 		const customError = await wranglerTargetArgs({
 			remote: true,
@@ -67,6 +70,9 @@ describe("wranglerTargetArgs", () => {
 		}).catch((error: unknown) => error);
 		expect(customError).toBeInstanceOf(CliError);
 		expect((customError as Error).message).toContain("missing.jsonc");
+		expect((customError as Error).message).not.toContain(
+			"wrangler.local.jsonc",
+		);
 	});
 
 	it("throws CliError when --local and --remote are both set or both omitted", async () => {

@@ -1,4 +1,4 @@
-import { applyD1Migrations, type D1Migration } from "cloudflare:test";
+import { applyD1Migrations } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
 	type AdminBotConfigRow,
@@ -42,7 +42,7 @@ import type {
 	NewChangeLogEntry,
 	Token,
 } from "../../src/types";
-import { createTestDb } from "../helpers/db";
+import { createTestDb, migrationByName, migrationsBefore } from "../helpers/db";
 import { DAY_MS, seedAgent, seedCategory, T0 } from "../helpers/fixtures";
 
 let db: D1Database;
@@ -679,37 +679,6 @@ describe("deletion", () => {
 });
 
 describe("migrations", () => {
-	const migrationFiles = import.meta.glob<string>("../../migrations/*.sql", {
-		query: "?raw",
-		import: "default",
-		eager: true,
-	});
-
-	function migration(filename: string): D1Migration {
-		const entry = Object.entries(migrationFiles).find(([path]) =>
-			path.endsWith(`/${filename}`),
-		);
-		if (!entry) {
-			throw new Error(`Missing migration ${filename}`);
-		}
-		const queries = entry[1]
-			.split("\n")
-			.filter((line) => !line.trimStart().startsWith("--"))
-			.join("\n")
-			.split(";")
-			.map((statement) => statement.trim())
-			.filter((statement) => statement.length > 0);
-		return { name: filename, queries };
-	}
-
-	function migrationsBefore(prefix: string): D1Migration[] {
-		return Object.keys(migrationFiles)
-			.map((path) => path.slice(path.lastIndexOf("/") + 1))
-			.filter((name) => name < prefix)
-			.sort()
-			.map((name) => migration(name));
-	}
-
 	async function dropAllTables(): Promise<void> {
 		const { results } = await db
 			.prepare(
@@ -749,8 +718,8 @@ describe("migrations", () => {
 	it("preserves questions and replies when migrating a populated database to 0002", async () => {
 		await dropAllTables();
 
-		const initial = migration("0001_initial_schema.sql");
-		const cascade = migration("0002_cascade_message_references.sql");
+		const initial = migrationByName("0001_initial_schema.sql");
+		const cascade = migrationByName("0002_cascade_message_references.sql");
 		await applyD1Migrations(db, [initial]);
 
 		const a = await seedAgent(db, { name: "a" });
@@ -818,9 +787,9 @@ describe("migrations", () => {
 	it("preserves all existing tables when migrating a populated database from 0002 to 0003 and enforces change_log constraints", async () => {
 		await dropAllTables();
 
-		const m1 = migration("0001_initial_schema.sql");
-		const m2 = migration("0002_cascade_message_references.sql");
-		const m3 = migration("0003_change_log.sql");
+		const m1 = migrationByName("0001_initial_schema.sql");
+		const m2 = migrationByName("0002_cascade_message_references.sql");
+		const m3 = migrationByName("0003_change_log.sql");
 		await applyD1Migrations(db, [m1, m2]);
 
 		const a = await seedAgent(db, { name: "a" });
@@ -961,10 +930,10 @@ describe("migrations", () => {
 	it("preserves all existing tables when migrating a populated database from 0003 to 0004 and enforces admin_bot_config constraints", async () => {
 		await dropAllTables();
 
-		const m1 = migration("0001_initial_schema.sql");
-		const m2 = migration("0002_cascade_message_references.sql");
-		const m3 = migration("0003_change_log.sql");
-		const m4 = migration("0004_admin_bot.sql");
+		const m1 = migrationByName("0001_initial_schema.sql");
+		const m2 = migrationByName("0002_cascade_message_references.sql");
+		const m3 = migrationByName("0003_change_log.sql");
+		const m4 = migrationByName("0004_admin_bot.sql");
 		await applyD1Migrations(db, [m1, m2, m3]);
 
 		const a = await seedAgent(db, { name: "a" });
@@ -1121,11 +1090,11 @@ describe("migrations", () => {
 	it("preserves all existing tables when migrating a populated database from 0004 to 0005 and enforces proposals constraints", async () => {
 		await dropAllTables();
 
-		const m1 = migration("0001_initial_schema.sql");
-		const m2 = migration("0002_cascade_message_references.sql");
-		const m3 = migration("0003_change_log.sql");
-		const m4 = migration("0004_admin_bot.sql");
-		const m5 = migration("0005_proposals.sql");
+		const m1 = migrationByName("0001_initial_schema.sql");
+		const m2 = migrationByName("0002_cascade_message_references.sql");
+		const m3 = migrationByName("0003_change_log.sql");
+		const m4 = migrationByName("0004_admin_bot.sql");
+		const m5 = migrationByName("0005_proposals.sql");
 		await applyD1Migrations(db, [m1, m2, m3, m4]);
 
 		const a = await seedAgent(db, { name: "a" });
@@ -1313,7 +1282,7 @@ describe("migrations", () => {
 		await dropAllTables();
 
 		const prior = migrationsBefore("0006_");
-		const m6 = migration("0006_pending_descriptions.sql");
+		const m6 = migrationByName("0006_pending_descriptions.sql");
 		await applyD1Migrations(db, prior);
 
 		const a = await seedAgent(db, { name: "a", description: "initial a" });
@@ -1423,7 +1392,7 @@ describe("migrations", () => {
 		await dropAllTables();
 
 		const prior = migrationsBefore("0007_");
-		const m7 = migration("0007_webhooks.sql");
+		const m7 = migrationByName("0007_webhooks.sql");
 		await applyD1Migrations(db, prior);
 
 		const a = await seedAgent(db, { name: "a" });

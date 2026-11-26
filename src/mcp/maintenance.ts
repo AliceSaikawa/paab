@@ -9,6 +9,20 @@ import {
 import type { UnixMillis } from "../types";
 import { auditBodyConfig, type McpEnv } from "./config";
 
+function reportMaintenanceFailure(
+	step: "inbox" | "audit_purge" | "proposals" | "webhooks",
+	error: unknown,
+): void {
+	try {
+		console.error("scheduled maintenance step failed", {
+			step,
+			error: error instanceof Error ? error.message : String(error),
+		});
+	} catch {
+		// Logging failures must not hide the underlying step error.
+	}
+}
+
 /**
  * The scheduled job: expires overdue questions, records them in the audit
  * log with one batched write per chunk, removes audit log bodies past their
@@ -40,18 +54,21 @@ export async function runScheduledMaintenance(
 			})),
 		);
 	} catch (error) {
+		reportMaintenanceFailure("inbox", error);
 		errors.push(error);
 	}
 
 	try {
 		await purgeExpiredAuditBodies(db, audit, now);
 	} catch (error) {
+		reportMaintenanceFailure("audit_purge", error);
 		errors.push(error);
 	}
 
 	try {
 		await expireOverdueProposals(db, now);
 	} catch (error) {
+		reportMaintenanceFailure("proposals", error);
 		errors.push(error);
 	}
 
@@ -66,6 +83,7 @@ export async function runScheduledMaintenance(
 			fetcher: env.webhookFetcher,
 		});
 	} catch (error) {
+		reportMaintenanceFailure("webhooks", error);
 		errors.push(error);
 	}
 

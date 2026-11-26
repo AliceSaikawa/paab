@@ -372,6 +372,7 @@ describe("runScheduledMaintenance", () => {
 			},
 		);
 
+		const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
 		const prepare = world.db.prepare.bind(world.db);
 		vi.spyOn(world.db, "prepare").mockImplementation((query: string) => {
 			if (query.includes("FROM messages")) {
@@ -388,5 +389,10 @@ describe("runScheduledMaintenance", () => {
 		);
 		expect(err).toBeInstanceOf(AggregateError);
 		expect((err as AggregateError).errors).toHaveLength(2);
+		expect(errorLog).toHaveBeenCalledTimes(2);
+		expect(errorLog.mock.calls.map((c) => c[1])).toMatchObject([
+			{ step: "inbox", error: "expiry failed" },
+			{ step: "audit_purge", error: "purge failed" },
+		]);
 	});
 });
