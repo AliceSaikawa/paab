@@ -21,13 +21,19 @@
    npx wrangler d1 create paab-db
    ```
 
-   表示された `database_id` を `wrangler.jsonc` の `d1_databases` に書く。リポジトリの値（`00000000-...`）はダミーである。
+   `wrangler.jsonc` を `wrangler.local.jsonc` に写し、表示された `database_id` を写した方の `d1_databases` に書く。リポジトリの `wrangler.jsonc` の値（`00000000-...`）はダミーである。
+
+   ```sh
+   cp wrangler.jsonc wrangler.local.jsonc
+   ```
+
+   `wrangler.local.jsonc` は git の管理外である。作業ツリーの `wrangler.jsonc` を直接書き換えると、更新の取り込みで衝突し、誤ってコミットするおそれもある。本番へのデプロイと本番 D1 へのコマンドには必ず `wrangler.local.jsonc` を使う（「本番へのデプロイ」と「新しい版への更新」を参照）。
 
 3. マイグレーションを適用する。
 
    ```sh
-   npx wrangler d1 migrations apply DB --local    # ローカル
-   npx wrangler d1 migrations apply DB --remote   # 本番
+   npx wrangler d1 migrations apply DB --local                              # ローカル
+   npx wrangler d1 migrations apply DB --remote --config wrangler.local.jsonc  # 本番
    ```
 
 ## 1. 初期値ファイルを作る
@@ -112,7 +118,7 @@ npm run -s revoke-token -- --local muse  # 有効なトークンをすべて失�
 - `suspend` はエージェントの `status` を `suspended` に変える。停止中は `check_inbox` や `answer` を含め、そのエージェントのリクエストをすべて断る。
 - `revoke-token` は `participant` 以外の用途のトークンも含め、そのエージェントの有効なトークンをすべて失効させる。再発行は `npm run token` で行う。
 - これらの操作自体は監査ログに記録されない。停止や失効の効果は、その後のリクエストが `auth_failed` として記録されることでたどれる。変更の記録（誰が、いつ、何を変えたか）は管理操作の change log（第2段階）で扱う。
-- エージェントの追加・質問数上限の変更・許可ルールやカテゴリの変更は、第2段階の管理画面までコマンドを用意しない。それまでは `npx wrangler d1 execute DB --local --command "..."`（本番は `--remote` に変える）で SQL を直接実行する。直接SQLでは記録が残らないので、変えた内容は利用者が控えておく。
+- エージェントの追加・質問数上限の変更・許可ルールやカテゴリの変更は、第2段階の管理画面までコマンドを用意しない。それまでは `npx wrangler d1 execute DB --local --command "..."`（本番は `--remote --config wrangler.local.jsonc` に変える）で SQL を直接実行する。直接SQLでは記録が残らないので、変えた内容は利用者が控えておく。
 
 ## 4. 監査ログを見る
 
@@ -232,6 +238,49 @@ curl -s http://localhost:8787/mcp \
 - **他人宛の質問への回答**: 手順5の `answer` を `$MUSE_TOKEN` で呼ぶ。エラーになり、質問は開いたまま残る。
 - **期限切れ**: 7日を過ぎた質問は回答できない。期限切れの処理は1時間ごとの定期実行が行う。ローカルでは定期実行が自動で動かないので、`curl "http://localhost:8787/cdn-cgi/local/scheduled"` で起動する。7日待たずに確かめるには `test/e2e/` のテストを使う。
 
+## 本番へのデプロイ
+
+準備で作った `wrangler.local.jsonc` を使って、自分の Cloudflare アカウントに Worker をデプロイする。
+
+```sh
+npm run deploy
+```
+
+`npm run deploy` は `wrangler deploy --config wrangler.local.jsonc` を実行する。終わると `https://paab.<サブドメイン>.workers.dev` のような URL が表示される。
+
+動いていることは `/health` で確かめる。`ok` が返ればよい。
+
+```sh
+curl -s https://paab.<サブドメイン>.workers.dev/health
+```
+
+エージェントに設定する接続先は `https://paab.<サブドメイン>.workers.dev/mcp` である。トークンは「3. トークンを発行する」のコマンドに `--remote` を付けて発行する（`seed`、`token`、`audit-log`、`suspend`、`resume`、`revoke-token` に `--remote` を付けたときは既定で `wrangler.local.jsonc` を読み、`--config <パス>` で変えられる）。
+
+### 設定値
+
+`wrangler.local.jsonc` の `vars` にある。変えたら `npm run deploy` で反映する。
+
+| 設定値 | 内容 | 既定 |
+| --- | --- | --- |
+| `AUDIT_RECORD_BODIES` | `"true"` なら監査ログに質問と回答の本文を記録する。`"false"` なら記録しない | `"false"` |
+| `AUDIT_BODY_RETENTION_DAYS` | 記録した本文を保持する日数。正の整数でないと本文は記録されない。期限を過ぎた本文は定期実行で消える（監査ログの行自体は残る）。記録を止めると残っていた本文も次の定期実行で消える | `"30"` |
+
+### 新しい版への更新
+
+新しい版を取り込むときは、更新された `wrangler.jsonc` との差分（`compatibility_date`、bindings、`vars`、`triggers.crons` の追加など）を先に `wrangler.local.jsonc` へ反映し、`database_id` と自分の `vars` を保ったままマイグレーションを適用してデプロイする。
+
+```sh
+git pull
+diff -u wrangler.jsonc wrangler.local.jsonc
+npm ci
+npx wrangler d1 migrations apply DB --remote --config wrangler.local.jsonc
+npm run deploy
+```
+
+### 定期実行
+
+デプロイされた Worker は、`triggers.crons` の `0 * * * *` で1時間ごとに定期実行を行う。内容は、期限切れになった質問を期限切れとして処理して監査ログに記録すること、受け取りから24時間を過ぎたメッセージ本文および一度も受け取られずに期限切れになった質問の本文を消すこと（設計書 4 節）、ならびに保持期間を過ぎた監査ログの本文を消すことである。ローカルでは定期実行は自動で動かない。ローカルでの確かめ方は「2つのクライアントで質問応答を試す」の「期限切れ」を参照。
+
 ## 依存と Actions の更新
 
 - npm の依存と GitHub Actions の更新は Dependabot が週1回 PR にする。Actions はコミットで固定しているため、更新 PR が新しいコミットを指す。
@@ -243,3 +292,4 @@ curl -s http://localhost:8787/mcp \
 - 対応プラン: Workers Free で動く。`db.batch` の1回が Workers Free の上限（1呼び出しあたり50クエリ）に対して1回と数えられる前提では、`check_inbox` が使う D1 呼び出し回数は受け取るメッセージ数に依らずほぼ一定である（監査ログへの書き込みは25件ずつ `db.batch` でまとめる）。定期実行は期限切れにする質問25件あたり約3回ずつ増えるため、未回答のまま同時に期限切れになる質問が約375件を超えない限り上限に達しない（`db.batch` が文ごとに数えられるかどうかは Cloudflare の公式文書に明記がなく未確認）。
 - コマンドは `scripts/paab.ts` を esbuild でまとめてから Node で実行する。まとめた結果は `.wrangler/tmp/paab-cli.mjs` に置かれる。
 - ローカルのD1の保存先を変えるには `--persist-to <ディレクトリ>` を付ける（`--local` のときだけ）。`wrangler dev` にも同じ値を渡す。
+- 本番向け（`--remote`）の管理コマンドは既定で `wrangler.local.jsonc` を使う。別の設定ファイルを使う場合は `--config <パス>` を付ける。

@@ -10,6 +10,7 @@ import {
 	CliError,
 	parseWranglerRows,
 	wranglerFailure,
+	wranglerTargetArgs,
 } from "../../scripts/lib/sql";
 import { queryAuditLog, recordAuditEvent } from "../../src/audit";
 import type { Agent, Category } from "../../src/types";
@@ -208,5 +209,71 @@ describe("wrangler output", () => {
 			"no such table: agents: SQLITE_ERROR",
 		);
 		expect(wranglerFailure("", "Not logged in.\n")).toBe("Not logged in.");
+	});
+});
+
+describe("wranglerTargetArgs", () => {
+	it("requires exactly one of local or remote", async () => {
+		await expect(wranglerTargetArgs({})).rejects.toBeInstanceOf(CliError);
+		await expect(
+			wranglerTargetArgs({ local: true, remote: true }),
+		).rejects.toBeInstanceOf(CliError);
+	});
+
+	it("passes local options without requiring wrangler.local.jsonc", async () => {
+		await expect(wranglerTargetArgs({ local: true })).resolves.toEqual([
+			"--local",
+		]);
+		await expect(
+			wranglerTargetArgs({
+				local: true,
+				persistTo: ".tmp/db",
+				config: "custom.jsonc",
+			}),
+		).resolves.toEqual([
+			"--local",
+			"--persist-to",
+			".tmp/db",
+			"--config",
+			"custom.jsonc",
+		]);
+	});
+
+	it("uses wrangler.local.jsonc on remote by default and errors when missing", async () => {
+		await expect(
+			wranglerTargetArgs({
+				remote: true,
+				hasConfigFile: async (path) => path === "wrangler.local.jsonc",
+			}),
+		).resolves.toEqual(["--remote", "--config", "wrangler.local.jsonc"]);
+
+		await expect(
+			wranglerTargetArgs({
+				remote: true,
+				config: "prod.jsonc",
+				hasConfigFile: async (path) => path === "prod.jsonc",
+			}),
+		).resolves.toEqual(["--remote", "--config", "prod.jsonc"]);
+
+		const defaultError = await wranglerTargetArgs({
+			remote: true,
+			hasConfigFile: async () => false,
+		}).catch((error: unknown) => error);
+		expect(defaultError).toBeInstanceOf(CliError);
+		expect((defaultError as Error).message).toContain("wrangler.local.jsonc");
+		expect((defaultError as Error).message).toContain(
+			"wrangler.jsonc を wrangler.local.jsonc に写し",
+		);
+
+		const customError = await wranglerTargetArgs({
+			remote: true,
+			config: "nope.jsonc",
+			hasConfigFile: async () => false,
+		}).catch((error: unknown) => error);
+		expect(customError).toBeInstanceOf(CliError);
+		expect((customError as Error).message).toContain("nope.jsonc");
+		expect((customError as Error).message).not.toContain(
+			"wrangler.local.jsonc",
+		);
 	});
 });
