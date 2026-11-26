@@ -1,5 +1,6 @@
 import { createToken } from "../../src/auth/token";
 import type { UnixMillis } from "../../src/types";
+import { insertChangeLogSql } from "./admin";
 import { CliError, type D1Client, sql } from "./sql";
 
 export interface IssuedToken {
@@ -22,10 +23,11 @@ export async function issueParticipantToken(
 ): Promise<IssuedToken> {
 	const [agent] = await db.query(
 		sql(
-			`SELECT a.id,
-				(SELECT count(*) FROM tokens t
+			`SELECT a.id AS agent_id,
+				(SELECT t.id FROM tokens t
 					WHERE t.agent_id = a.id AND t.purpose = 'participant'
-					AND t.revoked_at IS NULL) AS active_tokens
+					AND t.revoked_at IS NULL
+					LIMIT 1) AS active_token_id
 			FROM agents a WHERE a.name = ?`,
 			agentName,
 		),
@@ -36,8 +38,11 @@ export async function issueParticipantToken(
 		);
 	}
 
+	const agentId = String(agent.agent_id);
+	const prevTokenId =
+		typeof agent.active_token_id === "string" ? agent.active_token_id : null;
 	const { token, record } = await createToken({
-		agentId: String(agent.id),
+		agentId,
 		purpose: "participant",
 		now,
 	});
@@ -56,6 +61,29 @@ export async function issueParticipantToken(
 			record.tokenHash,
 			record.createdAt,
 		),
+		insertChangeLogSql({
+			occurredAt: now,
+			actorType: "owner",
+			actorId: "cli",
+			approverId: null,
+			action: "token_issued",
+			targetType: "token",
+			targetId: record.id,
+			beforeJson:
+				prevTokenId !== null
+					? JSON.stringify({
+							id: prevTokenId,
+							purpose: "participant",
+							agentId,
+						})
+					: null,
+			afterJson: JSON.stringify({
+				id: record.id,
+				purpose: "participant",
+				agentId: record.agentId,
+			}),
+			revertedAt: null,
+		}),
 	]);
-	return { token, revokedPrevious: agent.active_tokens !== 0 };
+	return { token, revokedPrevious: prevTokenId !== null };
 }

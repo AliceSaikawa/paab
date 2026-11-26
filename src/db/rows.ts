@@ -6,6 +6,10 @@ import {
 	AUDIT_OUTCOMES,
 	type AuditLogEntry,
 	type Category,
+	CHANGE_ACTIONS,
+	CHANGE_ACTOR_TYPES,
+	CHANGE_TARGET_TYPES,
+	type ChangeLogEntry,
 	MESSAGE_KINDS,
 	MESSAGE_STATUSES,
 	type Message,
@@ -83,8 +87,22 @@ export interface AuditLogRow {
 	body: string | null;
 }
 
+export interface ChangeLogRow {
+	id: number;
+	occurred_at: number;
+	actor_type: string;
+	actor_id: string;
+	approver_id: string | null;
+	action: string;
+	target_type: string;
+	target_id: string;
+	before_json: string | null;
+	after_json: string | null;
+	reverted_at: number | null;
+}
+
 /** Narrows a stored string to one of the known values, or throws. */
-function oneOf<T extends string>(
+export function oneOf<T extends string>(
 	allowed: readonly T[],
 	value: string,
 	column: string,
@@ -163,5 +181,29 @@ export function auditLogEntryFromRow(row: AuditLogRow): AuditLogEntry {
 				: oneOf(REASON_CODES, row.reason_code, "audit_log.reason_code"),
 		messageId: row.message_id,
 		body: row.body,
+	};
+}
+
+export function changeLogEntryFromRow(row: ChangeLogRow): ChangeLogEntry {
+	return {
+		id: row.id,
+		occurredAt: row.occurred_at,
+		actorType: oneOf(
+			CHANGE_ACTOR_TYPES,
+			row.actor_type,
+			"change_log.actor_type",
+		),
+		actorId: row.actor_id,
+		approverId: row.approver_id,
+		action: oneOf(CHANGE_ACTIONS, row.action, "change_log.action"),
+		targetType: oneOf(
+			CHANGE_TARGET_TYPES,
+			row.target_type,
+			"change_log.target_type",
+		),
+		targetId: row.target_id,
+		beforeJson: row.before_json,
+		afterJson: row.after_json,
+		revertedAt: row.reverted_at,
 	};
 }

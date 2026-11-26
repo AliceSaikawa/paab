@@ -169,3 +169,48 @@ export interface AuditLogEntry {
 
 /** An audit log entry before the database assigns its ID. */
 export type NewAuditLogEntry = Omit<AuditLogEntry, "id">;
+
+export const CHANGE_ACTOR_TYPES = ["owner", "admin_bot"] as const;
+export type ChangeActorType = (typeof CHANGE_ACTOR_TYPES)[number];
+
+export const CHANGE_TARGET_TYPES = [
+	"agent",
+	"token",
+	"category",
+	"allow_rule",
+	"admin_bot",
+	"description",
+] as const;
+export type ChangeTargetType = (typeof CHANGE_TARGET_TYPES)[number];
+
+export const CHANGE_ACTIONS = [
+	"agent_registered",
+	"agent_updated",
+	"agent_deleted",
+	"agent_suspended",
+	"agent_resumed",
+	"token_issued",
+	"token_revoked",
+	"category_created",
+	"category_deleted",
+	"allow_rule_granted",
+	"allow_rule_revoked",
+] as const;
+export type ChangeAction = (typeof CHANGE_ACTIONS)[number];
+
+export interface ChangeLogEntry {
+	id: number;
+	occurredAt: UnixMillis;
+	actorType: ChangeActorType;
+	actorId: string;
+	approverId: string | null;
+	action: ChangeAction;
+	targetType: ChangeTargetType;
+	targetId: string;
+	beforeJson: string | null;
+	afterJson: string | null;
+	revertedAt: UnixMillis | null;
+}
+
+/** A change log entry before the database assigns its ID. */
+export type NewChangeLogEntry = Omit<ChangeLogEntry, "id">;
