@@ -15,7 +15,9 @@
 	],
 	"vars": {
 		"AUDIT_RECORD_BODIES": "false",
-		"AUDIT_BODY_RETENTION_DAYS": "30"
+		"AUDIT_BODY_RETENTION_DAYS": "30",
+		"CF_ACCESS_TEAM_DOMAIN": "",
+		"CF_ACCESS_AUD": ""
 	},
 	"triggers": {
 		"crons": ["0 * * * *"]
