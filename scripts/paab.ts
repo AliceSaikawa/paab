@@ -12,6 +12,10 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { parseArgs, promisify } from "node:util";
+import {
+	DEFAULT_AUDIT_QUERY_LIMIT,
+	MAX_AUDIT_QUERY_LIMIT,
+} from "../src/audit/query";
 import { newId } from "../src/db/client";
 import { auditLogFilter, formatAuditLog, readAuditLog } from "./lib/audit";
 import { loadSeed } from "./lib/seed";
@@ -29,6 +33,7 @@ const USAGE = `使い方:
   npm run audit-log -- (--local | --remote) [--since 日時] [--before 日時]
       [--from 送信元] [--to 宛先] [--category カテゴリ]
       [--outcome ok|denied|expired] [--limit 件数] [--body]
+      [--oldest] [--after-id ID] [--before-id ID]
 
 共通: --persist-to <ディレクトリ> でローカル D1 の保存先を変えられます（--local のときだけ）。
 詳しくは docs/setup.md を参照してください。`;
@@ -102,6 +107,9 @@ async function main(argv: string[]): Promise<void> {
 			outcome: { type: "string" },
 			limit: { type: "string" },
 			body: { type: "boolean" },
+			oldest: { type: "boolean" },
+			"after-id": { type: "string" },
+			"before-id": { type: "string" },
 			help: { type: "boolean" },
 		},
 	});
@@ -160,6 +168,20 @@ async function main(argv: string[]): Promise<void> {
 			const entries = await readAuditLog(db, filter);
 			console.log(formatAuditLog(entries, filter.includeBody === true));
 			console.error(`${entries.length} 件`);
+			const limit = Math.min(
+				filter.limit ?? DEFAULT_AUDIT_QUERY_LIMIT,
+				MAX_AUDIT_QUERY_LIMIT,
+			);
+			const last = entries.at(-1);
+			if (entries.length === limit && last !== undefined) {
+				const cursor =
+					filter.order === "asc"
+						? `--after-id ${last.id}`
+						: `--before-id ${last.id}`;
+				console.error(
+					`表示は最大 ${limit} 件までです。続きがある可能性があります。続きを読むには ${cursor} を付けてください。`,
+				);
+			}
 			return;
 		}
 		default:

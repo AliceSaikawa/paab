@@ -19,6 +19,9 @@ export interface AuditLogOptions {
 	outcome?: string;
 	limit?: string;
 	body?: boolean;
+	oldest?: boolean;
+	afterId?: string;
+	beforeId?: string;
 }
 
 const DATE_ONLY = /^(\d{4})-(\d{2})-(\d{2})$/;
@@ -45,6 +48,22 @@ export function parseTime(value: string, option: string): number {
 	return millis;
 }
 
+function parseIdOption(
+	value: string | undefined,
+	option: string,
+): number | undefined {
+	if (value === undefined) {
+		return undefined;
+	}
+	const id = Number(value);
+	if (!Number.isSafeInteger(id) || id < 0) {
+		throw new CliError(
+			`--${option} には 0 以上の整数を指定してください: ${value}`,
+		);
+	}
+	return id;
+}
+
 /** Turns command line options into the filter `#6` reads the log with. */
 export function auditLogFilter(options: AuditLogOptions): AuditLogFilter {
 	const filter: AuditLogFilter = {
@@ -52,6 +71,9 @@ export function auditLogFilter(options: AuditLogOptions): AuditLogFilter {
 		toAgentName: options.to,
 		categoryName: options.category,
 		includeBody: options.body === true,
+		order: options.oldest === true ? "asc" : "desc",
+		afterId: parseIdOption(options.afterId, "after-id"),
+		beforeId: parseIdOption(options.beforeId, "before-id"),
 	};
 	if (options.since !== undefined) {
 		filter.occurredFrom = parseTime(options.since, "since");
@@ -103,14 +125,16 @@ export function formatTime(millis: number): string {
 
 /**
  * Renders entries as tab-separated lines under a header, so the output both
- * reads in a terminal and pipes into other tools. Agents and categories show
- * by name, or by ID once they no longer exist.
+ * reads in a terminal and pipes into other tools. The first column is the
+ * entry's ID, which `--after-id` and `--before-id` take for reading on.
+ * Agents and categories show by name, or by ID once they no longer exist.
  */
 export function formatAuditLog(
 	entries: AuditLogView[],
 	includeBody: boolean,
 ): string {
 	const header = [
+		"id",
 		"occurred_at",
 		"event_type",
 		"from",
@@ -123,6 +147,7 @@ export function formatAuditLog(
 	];
 	const lines = entries.map((entry) =>
 		[
+			String(entry.id),
 			formatTime(entry.occurredAt),
 			entry.eventType,
 			entry.fromAgentName ?? entry.fromAgentId ?? "-",

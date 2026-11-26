@@ -20,6 +20,15 @@ export const MAX_AUDIT_QUERY_LIMIT = 1000;
 export interface AuditLogFilter {
 	/** Entries at or after this time. */
 	occurredFrom?: UnixMillis;
+	/** Entries with an ID above this one, for reading the next page. */
+	afterId?: number;
+	/** Entries with an ID below this one, for reading the next page. */
+	beforeId?: number;
+	/**
+	 * Read newest first (`"desc"`) by insertion ID instead of oldest first
+	 * (`"asc"`, the default; the CLI defaults to `"desc"`).
+	 */
+	order?: "asc" | "desc";
 	/** Entries strictly before this time. */
 	occurredBefore?: UnixMillis;
 	/** The asking agent, by ID. */
@@ -34,7 +43,7 @@ export interface AuditLogFilter {
 	categoryName?: string;
 	outcome?: AuditOutcome;
 	/**
-	 * Maximum number of entries, oldest first. Defaults to
+	 * Maximum number of entries, in the order `order` selects. Defaults to
 	 * `DEFAULT_AUDIT_QUERY_LIMIT`; at most `MAX_AUDIT_QUERY_LIMIT`.
 	 */
 	limit?: number;
@@ -75,6 +84,13 @@ function requireTime(value: number, name: string): number {
 	return value;
 }
 
+function requireId(value: number, name: string): number {
+	if (!Number.isSafeInteger(value) || value < 0) {
+		throw new RangeError(`${name} must be a non-negative integer`);
+	}
+	return value;
+}
+
 function requireText(value: string, name: string): string {
 	if (typeof value !== "string" || value.length === 0) {
 		throw new RangeError(`${name} must be a non-empty string`);
@@ -86,7 +102,8 @@ function requireText(value: string, name: string): string {
  * Builds the SELECT for a filter without touching a database. Throws a
  * `RangeError` on a malformed filter.
  *
- * Results are ordered by `occurred_at, id`. The columns are those of
+ * Results are ordered by `id` (insertion order, matching `afterId` and
+ * `beforeId`) in the direction `order` selects. The columns are those of
  * `AuditLogViewRow`; convert rows with `auditLogViewFromRow`.
  */
 export function buildAuditLogQuery(filter: AuditLogFilter = {}): AuditLogQuery {
@@ -105,6 +122,12 @@ export function buildAuditLogQuery(filter: AuditLogFilter = {}): AuditLogQuery {
 			"l.occurred_at < ?",
 			requireTime(filter.occurredBefore, "occurredBefore"),
 		);
+	}
+	if (filter.afterId !== undefined) {
+		add("l.id > ?", requireId(filter.afterId, "afterId"));
+	}
+	if (filter.beforeId !== undefined) {
+		add("l.id < ?", requireId(filter.beforeId, "beforeId"));
 	}
 	if (filter.fromAgentId !== undefined) {
 		add("l.from_agent_id = ?", requireText(filter.fromAgentId, "fromAgentId"));
@@ -149,7 +172,7 @@ export function buildAuditLogQuery(filter: AuditLogFilter = {}): AuditLogQuery {
 		"LEFT JOIN agents AS ta ON ta.id = l.to_agent_id",
 		"LEFT JOIN categories AS c ON c.id = l.category_id",
 		...(where.length > 0 ? [`WHERE ${where.join(" AND ")}`] : []),
-		"ORDER BY l.occurred_at, l.id",
+		filter.order === "desc" ? "ORDER BY l.id DESC" : "ORDER BY l.id",
 		"LIMIT ?",
 	].join(" ");
 	return { sql, params };
@@ -195,8 +218,8 @@ export function auditLogViewFromRow(row: AuditLogViewRow): AuditLogView {
 }
 
 /**
- * Reads audit log entries that match the filter, ordered by time and then by
- * ID. Rejects on a malformed filter or a database failure.
+ * Reads audit log entries that match the filter, ordered by insertion ID.
+ * Rejects on a malformed filter or a database failure.
  */
 export async function queryAuditLog(
 	db: D1Database,
