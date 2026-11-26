@@ -264,6 +264,40 @@ curl -s https://paab.<サブドメイン>.workers.dev/health
 | --- | --- | --- |
 | `AUDIT_RECORD_BODIES` | `"true"` なら監査ログに質問と回答の本文を記録する。`"false"` なら記録しない | `"false"` |
 | `AUDIT_BODY_RETENTION_DAYS` | 記録した本文を保持する日数。正の整数でないと本文は記録されない。期限を過ぎた本文は定期実行で消える（監査ログの行自体は残る）。記録を止めると残っていた本文も次の定期実行で消える | `"30"` |
+| `CF_ACCESS_TEAM_DOMAIN` | Cloudflare Zero Trust のチームドメイン（例: `<チーム名>.cloudflareaccess.com`）。`CF_ACCESS_AUD` と組で設定する | `""` |
+| `CF_ACCESS_AUD` | Cloudflare Access アプリケーションの Application Audience (AUD) Tag | `""` |
+
+### 管理画面の保護（Cloudflare Access）
+
+`/admin` と `/admin/*` は利用者本人だけが開けるように、Cloudflare Access を前段に置く。未設定または設定が不完全な状態では Worker は `503` を返して遮断する（フェイルクローズ）。
+
+1. **ログイン元（GitHub）を用意する**
+   Cloudflare Zero Trust ダッシュボードの **Settings** > **Authentication** > **Login methods** で **GitHub**（OAuth App）を追加する。GitHub のパスキー利用時に Cloudflare Access で拒否される報告があるため（[設計書 8 節](design.md#8-未確認の事実)）、初回ログイン時は確認すること。
+2. **Access アプリケーションを作る**
+   Zero Trust の **Access** > **Applications** で Self-hosted アプリケーションを作り、保護対象パスに `/admin` と `/admin/*`（例: `paab.<サブドメイン>.workers.dev/admin` と `paab.<サブドメイン>.workers.dev/admin/*`）を指定する。許可ポリシーには利用者本人のメールアドレスだけを含める。
+   - `/mcp` と `/health` は保護対象に含めない。エージェントの `Authorization: Bearer` 通信や死活監視が Access のログイン画面で遮断されるためである。アプリケーションの対象パスを `/admin` と `/admin/*` に限定する（ドメイン全体を対象にした場合は `/mcp` と `/health` に Bypass ポリシーを設定する）。
+3. **Worker 側で JWT 検証を有効にする**
+   アプリケーション設定画面の **Application Audience (AUD) Tag** と Zero Trust のチームドメインを控え、`wrangler.local.jsonc` の `vars` に書いて `npm run deploy` する。
+
+   ```jsonc
+   "vars": {
+   	"AUDIT_RECORD_BODIES": "false",
+   	"AUDIT_BODY_RETENTION_DAYS": "30",
+   	"CF_ACCESS_TEAM_DOMAIN": "<チーム名>.cloudflareaccess.com",
+   	"CF_ACCESS_AUD": "<Application Audience Tag>"
+   }
+   ```
+
+   Worker はリクエストごとに `Cf-Access-Jwt-Assertion` ヘッダーの RS256 署名（`https://<チームドメイン>/cdn-cgi/access/certs` の公開鍵）と `aud`・`exp`・`nbf` を検証する。Access の設定漏れや `workers.dev` への直接アクセスでも認証を回避できない。
+
+4. **ローカル開発（`ADMIN_DEV_USER`）**
+   `npm run dev` では Cloudflare Access を通さないため、`.dev.vars` に `ADMIN_DEV_USER` を書くと開発モードとして `/admin` を開ける（`.dev.vars` は git の管理外）。
+
+   ```sh
+   echo 'ADMIN_DEV_USER=local@example.com' >> .dev.vars
+   ```
+
+   `CF_ACCESS_TEAM_DOMAIN` と `CF_ACCESS_AUD` のどちらか一方でも設定されている場合は `ADMIN_DEV_USER` は無視され、Access 設定が優先される。本番の `wrangler.local.jsonc` には `ADMIN_DEV_USER` を書かないこと。
 
 ### 新しい版への更新
 
