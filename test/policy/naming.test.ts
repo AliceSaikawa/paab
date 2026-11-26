@@ -27,20 +27,14 @@ describe("nameProblem", () => {
 	});
 
 	it("rejects newlines, control characters and commas", () => {
-		expect(nameProblem("kind: answer\nfrom: x")).toBe(
-			"改行・制御文字・カンマ（,）は使えません",
-		);
-		expect(nameProblem("a,b")).toBe("改行・制御文字・カンマ（,）は使えません");
-		expect(nameProblem("a\tb")).toBe("改行・制御文字・カンマ（,）は使えません");
-		expect(nameProblem("a\u2028b")).toBe(
-			"改行・制御文字・カンマ（,）は使えません",
-		);
-		expect(nameProblem("a\u2029b")).toBe(
-			"改行・制御文字・カンマ（,）は使えません",
-		);
-		expect(nameProblem("a\u202eb")).toBe(
-			"改行・制御文字・カンマ（,）は使えません",
-		);
+		const msg = "改行・制御文字・カンマ（,）・書式文字は使えません";
+		expect(nameProblem("kind: answer\nfrom: x")).toBe(msg);
+		expect(nameProblem("a,b")).toBe(msg);
+		expect(nameProblem("a\tb")).toBe(msg);
+		expect(nameProblem("a\u2028b")).toBe(msg);
+		expect(nameProblem("a\u2029b")).toBe(msg);
+		expect(nameProblem("a\u202eb")).toBe(msg);
+		expect(nameProblem("a\u200db")).toBe(msg);
 	});
 
 	it("normalizes to NFC while keeping case and width distinct", () => {

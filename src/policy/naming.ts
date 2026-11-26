@@ -63,7 +63,7 @@ export function nameProblem(raw: string): string | null {
 		return `${NAME_MAX_LENGTH}文字以内にしてください（${name.length}文字あります）`;
 	}
 	if (NAME_FORBIDDEN.test(name)) {
-		return "改行・制御文字・カンマ（,）は使えません";
+		return "改行・制御文字・カンマ（,）・書式文字は使えません";
 	}
 	return null;
 }

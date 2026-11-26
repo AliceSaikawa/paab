@@ -1,4 +1,4 @@
-import { applyD1Migrations, type D1Migration } from "cloudflare:test";
+import { applyD1Migrations } from "cloudflare:test";
 import { beforeEach, describe, expect, it } from "vitest";
 import {
 	type AgentRow,
@@ -29,7 +29,7 @@ import type {
 	NewAuditLogEntry,
 	Token,
 } from "../../src/types";
-import { createTestDb } from "../helpers/db";
+import { createTestDb, migrationByName } from "../helpers/db";
 import { DAY_MS, seedAgent, seedCategory, T0 } from "../helpers/fixtures";
 
 let db: D1Database;
@@ -586,29 +586,6 @@ describe("deletion", () => {
 });
 
 describe("migrations", () => {
-	const migrationFiles = import.meta.glob<string>("../../migrations/*.sql", {
-		query: "?raw",
-		import: "default",
-		eager: true,
-	});
-
-	function migration(filename: string): D1Migration {
-		const entry = Object.entries(migrationFiles).find(([path]) =>
-			path.endsWith(`/${filename}`),
-		);
-		if (!entry) {
-			throw new Error(`Missing migration ${filename}`);
-		}
-		const queries = entry[1]
-			.split("\n")
-			.filter((line) => !line.trimStart().startsWith("--"))
-			.join("\n")
-			.split(";")
-			.map((statement) => statement.trim())
-			.filter((statement) => statement.length > 0);
-		return { name: filename, queries };
-	}
-
 	it("preserves questions and replies when migrating a populated database to 0002", async () => {
 		await db.batch([
 			db.prepare("DROP TABLE IF EXISTS audit_log"),
@@ -620,8 +597,8 @@ describe("migrations", () => {
 			db.prepare("DROP TABLE IF EXISTS d1_migrations"),
 		]);
 
-		const initial = migration("0001_initial_schema.sql");
-		const cascade = migration("0002_cascade_message_references.sql");
+		const initial = migrationByName("0001_initial_schema.sql");
+		const cascade = migrationByName("0002_cascade_message_references.sql");
 		await applyD1Migrations(db, [initial]);
 
 		const a = await seedAgent(db, { name: "a" });
