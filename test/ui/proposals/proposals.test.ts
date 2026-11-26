@@ -460,7 +460,8 @@ describe("/admin/proposals UI", () => {
 
 		const rulesView = await adminGet(session, "/admin/rules", T0 + 60);
 		expect(rulesView.response.status).toBe(200);
-		expect(rulesView.html).toContain(`管理者ボット: ${bot.id}`);
+		expect(rulesView.html).toContain("管理者ボット: admin-bot");
+		expect(rulesView.html).not.toContain(`管理者ボット: ${bot.id}`);
 		expect(rulesView.html).toContain(`承認: ${OWNER_EMAIL}`);
 	});
 

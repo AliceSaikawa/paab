@@ -31,9 +31,32 @@ export const UNDOABLE_CHANGE_ACTIONS = [
 	"allow_rule_revoked",
 	"allow_rule_granted",
 	"category_created",
+	"description_approved",
+	"description_rejected",
 ] as const satisfies readonly ChangeAction[];
 
 export type UndoableChangeAction = (typeof UNDOABLE_CHANGE_ACTIONS)[number];
+
+export type AgentField =
+	| "status"
+	| "name"
+	| "description"
+	| "dailyQuestionLimit";
+
+const ALL_AGENT_FIELDS: readonly AgentField[] = [
+	"status",
+	"name",
+	"description",
+	"dailyQuestionLimit",
+];
+
+const AGENT_UPDATE_FIELDS = [
+	"name",
+	"description",
+	"dailyQuestionLimit",
+] as const satisfies readonly AgentField[];
+
+const EMPTY_AGENT_FIELDS: ReadonlySet<AgentField> = new Set();
 
 export type UndoErrorCode =
 	| AdminErrorCode
@@ -130,6 +153,87 @@ function parseAllowRuleSnapshot(raw: string | null): {
 	return { fromAgentId, toAgentId, categoryId, createdAt };
 }
 
+/**
+ * Returns the set of `agents` columns mutated by `entry`.
+ *
+ * Used for field-scoped conflict detection and targeted `UPDATE` generation so
+ * unrelated mutations (such as webhook changes or approving a description)
+ * never lock out or get clobbered by reverting another field.
+ */
+export function changedAgentFields(
+	entry: ChangeLogEntry,
+): ReadonlySet<AgentField> {
+	switch (entry.action) {
+		case "agent_suspended":
+		case "agent_resumed":
+			return new Set<AgentField>(["status"]);
+		case "agent_deleted":
+			return new Set<AgentField>(ALL_AGENT_FIELDS);
+		case "description_approved":
+			return new Set<AgentField>(["description"]);
+		case "agent_updated": {
+			const before = parseJsonRecord(entry.beforeJson);
+			const after = parseJsonRecord(entry.afterJson);
+			if (before === null && after === null) {
+				return new Set<AgentField>(AGENT_UPDATE_FIELDS);
+			}
+			const changed = new Set<AgentField>();
+			if (before === null || after === null) {
+				const present = before ?? after;
+				for (const field of AGENT_UPDATE_FIELDS) {
+					if (present !== null && present[field] !== undefined) {
+						changed.add(field);
+					}
+				}
+				return changed;
+			}
+			for (const field of AGENT_UPDATE_FIELDS) {
+				if (before[field] !== after[field]) {
+					changed.add(field);
+				}
+			}
+			return changed;
+		}
+		case "agent_registered":
+		case "token_issued":
+		case "token_revoked":
+		case "category_created":
+		case "category_deleted":
+		case "allow_rule_granted":
+		case "allow_rule_revoked":
+		case "admin_bot_designated":
+		case "admin_bot_cleared":
+		case "admin_bot_switches_updated":
+		case "change_reverted":
+		case "description_rejected":
+		case "webhook_configured":
+		case "webhook_deleted":
+			return EMPTY_AGENT_FIELDS;
+	}
+}
+
+function setsIntersect<T>(a: ReadonlySet<T>, b: ReadonlySet<T>): boolean {
+	for (const value of a) {
+		if (b.has(value)) return true;
+	}
+	return false;
+}
+
+function newerAgentRelatedChangesQuery(
+	db: D1Database,
+	agentId: string,
+	afterChangeId: number,
+): D1PreparedStatement {
+	return db
+		.prepare(
+			`SELECT * FROM change_log
+			WHERE target_type IN ('agent', 'description') AND target_id = ? AND id > ?
+				AND reverted_at IS NULL AND action <> 'change_reverted'
+			ORDER BY id ASC`,
+		)
+		.bind(agentId, afterChangeId);
+}
+
 function newerTargetChangeQuery(
 	db: D1Database,
 	targetType: ChangeTargetType,
@@ -159,11 +263,23 @@ async function prepareAgentRestore(
 		return undoFail("invalid_input", "変更前スナップショットが不正です");
 	}
 
-	const [conflictResult, agentResult] = await db.batch([
-		newerTargetChangeQuery(db, "agent", entry.targetId, entry.id),
+	const fieldsToRestore = changedAgentFields(entry);
+	if (entry.action === "agent_updated" && fieldsToRestore.size === 0) {
+		return undoFail("invalid_input", "変更前のエージェント設定が不正です");
+	}
+
+	const [newerResult, agentResult] = await db.batch([
+		newerAgentRelatedChangesQuery(db, entry.targetId, entry.id),
 		db.prepare("SELECT * FROM agents WHERE id = ?").bind(entry.targetId),
 	]);
-	if ((conflictResult?.results.length ?? 0) > 0) {
+	const newerEntries = ((newerResult?.results ?? []) as ChangeLogRow[]).map(
+		changeLogEntryFromRow,
+	);
+	if (
+		newerEntries.some((newer) =>
+			setsIntersect(changedAgentFields(newer), fieldsToRestore),
+		)
+	) {
 		return undoFail(
 			"conflict_newer_change",
 			"対象エージェントに新しい変更があるため元に戻せません",
@@ -192,34 +308,17 @@ async function prepareAgentRestore(
 		};
 	}
 
-	const rawLimit = snapshot.dailyQuestionLimit;
-	const rawDescription = snapshot.description;
-	if (typeof rawLimit !== "number" || typeof rawDescription !== "string") {
-		return undoFail("invalid_input", "変更前のエージェント設定が不正です");
-	}
-	const limitCheck = validateDailyLimit(rawLimit);
-	if (!limitCheck.ok) {
-		return undoFail("invalid_input", limitCheck.message);
-	}
+	const setClauses: string[] = [];
+	const binds: (string | number)[] = [];
 
-	const nextDescription =
-		rawDescription === current.description
-			? current.description
-			: (() => {
-					const check = validateDescription(rawDescription);
-					return check.ok ? check.value : null;
-				})();
-	if (nextDescription === null) {
-		return undoFail("invalid_input", "変更前の説明文が不正です");
-	}
-
-	let nextName = current.name;
-	if (snapshot.name !== undefined) {
-		if (typeof snapshot.name !== "string") {
+	if (fieldsToRestore.has("name")) {
+		const rawName = snapshot.name;
+		if (typeof rawName !== "string") {
 			return undoFail("invalid_input", "変更前のエージェント名が不正です");
 		}
-		if (snapshot.name !== current.name) {
-			const nameCheck = validateName(snapshot.name);
+		let nextName = current.name;
+		if (rawName !== current.name) {
+			const nameCheck = validateName(rawName);
 			if (!nameCheck.ok) {
 				return undoFail("invalid_input", nameCheck.message);
 			}
@@ -235,15 +334,159 @@ async function prepareAgentRestore(
 				);
 			}
 		}
+		setClauses.push("name = ?");
+		binds.push(nextName);
+	}
+
+	if (fieldsToRestore.has("description")) {
+		const rawDescription = snapshot.description;
+		if (typeof rawDescription !== "string") {
+			return undoFail("invalid_input", "変更前の説明文が不正です");
+		}
+		const nextDescription =
+			rawDescription === current.description
+				? current.description
+				: (() => {
+						const check = validateDescription(rawDescription);
+						return check.ok ? check.value : null;
+					})();
+		if (nextDescription === null) {
+			return undoFail("invalid_input", "変更前の説明文が不正です");
+		}
+		setClauses.push("description = ?");
+		binds.push(nextDescription);
+	}
+
+	if (fieldsToRestore.has("dailyQuestionLimit")) {
+		const rawLimit = snapshot.dailyQuestionLimit;
+		if (typeof rawLimit !== "number") {
+			return undoFail("invalid_input", "変更前のエージェント設定が不正です");
+		}
+		const limitCheck = validateDailyLimit(rawLimit);
+		if (!limitCheck.ok) {
+			return undoFail("invalid_input", limitCheck.message);
+		}
+		setClauses.push("daily_question_limit = ?");
+		binds.push(limitCheck.value);
+	}
+
+	if (setClauses.length === 0) {
+		return undoFail("invalid_input", "変更前のエージェント設定が不正です");
+	}
+
+	return {
+		ok: true,
+		statement: db
+			.prepare(`UPDATE agents SET ${setClauses.join(", ")} WHERE id = ?`)
+			.bind(...binds, current.id),
+	};
+}
+
+async function prepareDescriptionRestore(
+	db: D1Database,
+	entry: ChangeLogEntry,
+): Promise<PreparedRestore> {
+	const snapshot = parseJsonRecord(entry.beforeJson);
+	if (snapshot === null) {
+		return undoFail("invalid_input", "変更前スナップショットが不正です");
+	}
+	const agentId = readNonEmptyString(snapshot, "agentId");
+	if (agentId === null || agentId !== entry.targetId) {
+		return undoFail("invalid_input", "説明文のスナップショットが不正です");
+	}
+	const rawDescription = snapshot.description;
+	if (typeof rawDescription !== "string") {
+		return undoFail("invalid_input", "変更前の説明文が不正です");
+	}
+
+	if (entry.action === "description_approved") {
+		const [newerResult, agentResult] = await db.batch([
+			newerAgentRelatedChangesQuery(db, entry.targetId, entry.id),
+			db.prepare("SELECT * FROM agents WHERE id = ?").bind(entry.targetId),
+		]);
+		const newerEntries = ((newerResult?.results ?? []) as ChangeLogRow[]).map(
+			changeLogEntryFromRow,
+		);
+		if (
+			newerEntries.some((newer) => changedAgentFields(newer).has("description"))
+		) {
+			return undoFail(
+				"conflict_newer_change",
+				"対象エージェントの説明文に新しい変更があるため元に戻せません",
+			);
+		}
+		const agentRow = (agentResult?.results[0] ?? null) as AgentRow | null;
+		if (agentRow === null) {
+			return undoFail("not_found", "対象のエージェントが見つかりません");
+		}
+		const current = agentFromRow(agentRow);
+		const nextDescription =
+			rawDescription === current.description
+				? current.description
+				: (() => {
+						const check = validateDescription(rawDescription);
+						return check.ok ? check.value : null;
+					})();
+		if (nextDescription === null) {
+			return undoFail("invalid_input", "変更前の説明文が不正です");
+		}
+		return {
+			ok: true,
+			statement: db
+				.prepare("UPDATE agents SET description = ? WHERE id = ?")
+				.bind(nextDescription, current.id),
+		};
+	}
+
+	const descCheck = validateDescription(rawDescription);
+	if (!descCheck.ok) {
+		return undoFail("invalid_input", descCheck.message);
+	}
+	const submittedAt = snapshot.submittedAt;
+	if (typeof submittedAt !== "number" || !Number.isSafeInteger(submittedAt)) {
+		return undoFail("invalid_input", "説明文の提出日時が不正です");
+	}
+
+	const [newerResult, agentResult, pendingResult] = await db.batch([
+		newerAgentRelatedChangesQuery(db, entry.targetId, entry.id),
+		db.prepare("SELECT id FROM agents WHERE id = ?").bind(entry.targetId),
+		db
+			.prepare("SELECT 1 AS found FROM pending_descriptions WHERE agent_id = ?")
+			.bind(entry.targetId),
+	]);
+	const newerEntries = ((newerResult?.results ?? []) as ChangeLogRow[]).map(
+		changeLogEntryFromRow,
+	);
+	if (
+		newerEntries.some(
+			(newer) =>
+				newer.action === "agent_deleted" ||
+				newer.action === "description_approved" ||
+				newer.action === "description_rejected",
+		)
+	) {
+		return undoFail(
+			"conflict_newer_change",
+			"対象エージェントの説明文に新しい変更があるため元に戻せません",
+		);
+	}
+	if ((pendingResult?.results.length ?? 0) > 0) {
+		return undoFail(
+			"conflict_newer_change",
+			"対象エージェントに新しい承認待ち説明文があるため元に戻せません",
+		);
+	}
+	if ((agentResult?.results.length ?? 0) === 0) {
+		return undoFail("not_found", "対象のエージェントが見つかりません");
 	}
 
 	return {
 		ok: true,
 		statement: db
 			.prepare(
-				"UPDATE agents SET name = ?, description = ?, daily_question_limit = ? WHERE id = ?",
+				"INSERT INTO pending_descriptions (agent_id, description, submitted_at) VALUES (?, ?, ?)",
 			)
-			.bind(nextName, nextDescription, limitCheck.value, current.id),
+			.bind(entry.targetId, descCheck.value, submittedAt),
 	};
 }
 
@@ -357,15 +600,8 @@ async function prepareCategoryRestore(
 		return undoFail("invalid_input", "カテゴリのスナップショットが不正です");
 	}
 
-	const [catConflict, ruleChanges, existingRule, categoryRow] = await db.batch([
+	const [catConflict, existingRule, categoryRow] = await db.batch([
 		newerTargetChangeQuery(db, "category", entry.targetId, entry.id),
-		db
-			.prepare(
-				`SELECT id, target_id FROM change_log
-				WHERE target_type = 'allow_rule' AND id > ?
-					AND reverted_at IS NULL AND action <> 'change_reverted'`,
-			)
-			.bind(entry.id),
 		db
 			.prepare(
 				"SELECT 1 AS found FROM allow_rules WHERE category_id = ? LIMIT 1",
@@ -374,12 +610,8 @@ async function prepareCategoryRestore(
 		db.prepare("SELECT id FROM categories WHERE id = ?").bind(categoryId),
 	]);
 
-	const hasDependentRuleChange = (
-		(ruleChanges?.results ?? []) as Array<{ id: number; target_id: string }>
-	).some((row) => row.target_id.endsWith(`:${categoryId}`));
 	if (
 		(catConflict?.results.length ?? 0) > 0 ||
-		hasDependentRuleChange ||
 		(existingRule?.results.length ?? 0) > 0
 	) {
 		return undoFail(
@@ -452,6 +684,10 @@ export async function revertAdminBotChange(
 			break;
 		case "category_created":
 			prepared = await prepareCategoryRestore(db, entry);
+			break;
+		case "description_approved":
+		case "description_rejected":
+			prepared = await prepareDescriptionRestore(db, entry);
 			break;
 	}
 	if (!prepared.ok) {

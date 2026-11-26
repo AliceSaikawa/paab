@@ -157,11 +157,15 @@ function formatRuleTarget(
 	return `${fromName} → ${toName} (${categoryName})`;
 }
 
-function formatActor(entry: ChangeLogEntry): string {
+function formatActor(entry: ChangeLogEntry, names: ChangeLogNameMaps): string {
 	const kind = entry.actorType === "owner" ? "所有者" : "管理者ボット";
+	const actor =
+		entry.actorType === "admin_bot"
+			? (names.agents.get(entry.actorId) ?? entry.actorId)
+			: entry.actorId;
 	const approver =
 		entry.approverId !== null ? `（承認: ${entry.approverId}）` : "";
-	return `${kind}: ${entry.actorId}${approver}`;
+	return `${kind}: ${actor}${approver}`;
 }
 
 export function describeChangeTarget(
@@ -224,6 +228,14 @@ function describeAgentSnapshot(
 	return parts.join(" ");
 }
 
+function describeDescriptionSnapshot(
+	record: Record<string, unknown>,
+	raw: string,
+): string {
+	const desc = record.description;
+	return typeof desc === "string" ? (desc.length > 0 ? desc : "（空）") : raw;
+}
+
 function describeRevertedSnapshot(
 	entry: ChangeLogEntry,
 	record: Record<string, unknown>,
@@ -237,9 +249,10 @@ function describeRevertedSnapshot(
 			return readString(record, "name") ?? raw;
 		case "agent":
 			return describeAgentSnapshot(entry.targetId, record);
+		case "description":
+			return describeDescriptionSnapshot(record, raw);
 		case "token":
 		case "admin_bot":
-		case "description":
 			return raw;
 	}
 }
@@ -311,14 +324,8 @@ function describeSnapshot(
 		case "change_reverted":
 			return describeRevertedSnapshot(entry, record, raw, names);
 		case "description_approved":
-		case "description_rejected": {
-			const desc = record.description;
-			return typeof desc === "string"
-				? desc.length > 0
-					? desc
-					: "（空）"
-				: raw;
-		}
+		case "description_rejected":
+			return describeDescriptionSnapshot(record, raw);
 		case "webhook_configured":
 		case "webhook_deleted": {
 			const url = readString(record, "url");
@@ -574,7 +581,7 @@ function renderChangeLogSection(
 										(entry) => html`
 											<tr>
 												<td>${formatTimestamp(entry.occurredAt)}</td>
-												<td>${formatActor(entry)}</td>
+												<td>${formatActor(entry, names)}</td>
 												<td>
 													${CHANGE_ACTION_LABELS[entry.action]}
 													${entry.revertedAt !== null ? html` <span class="badge">取消済</span>` : false}

@@ -391,7 +391,14 @@ function renderAdminBotChangesSection(view: AdminBotPageView): SafeHtml {
 											<tr>
 												<td>#${entry.id}</td>
 												<td>${formatTimestamp(entry.occurredAt)}</td>
-												<td>${CHANGE_ACTION_LABELS[entry.action]}</td>
+												<td>
+													${CHANGE_ACTION_LABELS[entry.action]}
+													${
+														entry.approverId !== null
+															? html` <span class="muted">（承認: ${entry.approverId}）</span>`
+															: false
+													}
+												</td>
 												<td>${describeChangeTarget(entry, names)}</td>
 												<td>${describeChangeBeforeAfter(entry, names)}</td>
 												<td>
