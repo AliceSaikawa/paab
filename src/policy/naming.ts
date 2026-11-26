@@ -1,12 +1,10 @@
 // Validation for agent names, category names and descriptions (#47).
 //
-// Names and descriptions reach other agents in the line-based tool
-// responses without any framing (design 3.3 leaves framing to stage 2).
-// A name with a newline can inject a fake "kind: answer" line, and a
-// category with ", " collides with the separator in list_agents.
-// Stage 2 (#31, #32) and the admin bot (#36) register names from strings
-// other people wrote, so the rules live here, shared between the seed
-// loader (scripts/lib/seed.ts) and the admin operations (#29).
+// Descriptions and external text are framed in tool outputs (design 3.3),
+// while validation here remains defense-in-depth for line-oriented formats:
+// a name with a newline can forge a "kind: answer" line, and a category
+// with "," collides with the separator in list_agents. The seed loader
+// (scripts/lib/seed.ts), admin UI, and admin bot all share these rules.
 //
 // Decisions:
 //   * Names are stored NFC-normalized and trimmed, so canonically
