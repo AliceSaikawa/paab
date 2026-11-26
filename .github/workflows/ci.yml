@@ -11,13 +11,25 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # engines の下限（22.12.0）と現行（24）の両方で確かめる。
+        node-version: ["22.12.0", "24"]
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      # Actions はコミットで固定する（#48）。Dependabot が更新 PR を出す。
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          node-version: "24"
+          node-version: ${{ matrix.node-version }}
           cache: npm
+      - name: Install supported npm on Node 22
+        if: matrix.node-version == '22.12.0'
+        run: |
+          npm install -g "npm@^11.12.1"
+          npm -v
       - run: npm ci
+      - if: matrix.node-version == '24'
+        run: npm audit --omit=dev --audit-level=high
       - run: npm run check
       - run: npm run -s cli:build
       - run: node .wrangler/tmp/paab-cli.mjs --help

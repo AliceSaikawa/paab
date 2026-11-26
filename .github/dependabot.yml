@@ -1,0 +1,22 @@
+# 依存と Actions の更新を Dependabot に提案させる（#48）。
+# 更新は週1回、npm の依存は1つの PR にまとめる。Action をコミットで
+# 固定しているため、github-actions の更新 PR がタグの移動も追う。
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: build
+      include: scope
+    groups:
+      dependencies:
+        patterns: ["*"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci

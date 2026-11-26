@@ -213,6 +213,12 @@ curl -s http://localhost:8787/mcp \
 - **他人宛の質問への回答**: 手順5の `answer` を `$MUSE_TOKEN` で呼ぶ。エラーになり、質問は開いたまま残る。
 - **期限切れ**: 7日を過ぎた質問は回答できない。期限切れの処理は1時間ごとの定期実行が行う。ローカルでは定期実行が自動で動かないので、`curl "http://localhost:8787/cdn-cgi/local/scheduled"` で起動する。7日待たずに確かめるには `test/e2e/` のテストを使う。
 
+## 依存と Actions の更新
+
+- npm の依存と GitHub Actions の更新は Dependabot が週1回 PR にする。Actions はコミットで固定しているため、更新 PR が新しいコミットを指す。
+- CI は `npm audit --omit=dev --audit-level=high` を含む。本番依存に high 以上の脆弱性が見つかると CI が落ちるので、更新 PR で直す。
+- `wrangler.jsonc` の `compatibility_date` は、wrangler を更新するときに一緒に進める。進める前に `npm run check` と `npm run dev` での起動を確かめ、変更は単独のコミットにする。
+
 ## 補足
 
 - 対応プラン: Workers Free で動く。`db.batch` の1回が Workers Free の上限（1呼び出しあたり50クエリ）に対して1回と数えられる前提では、`check_inbox` が使う D1 呼び出し回数は受け取るメッセージ数に依らずほぼ一定である（監査ログへの書き込みは25件ずつ `db.batch` でまとめる）。定期実行は期限切れにする質問25件あたり約3回ずつ増えるため、未回答のまま同時に期限切れになる質問が約375件を超えない限り上限に達しない（`db.batch` が文ごとに数えられるかどうかは Cloudflare の公式文書に明記がなく未確認）。
