@@ -29,7 +29,13 @@ if [ -z "$token" ]; then
 	exit 1
 fi
 
-if ! response=$(curl -fsS -m 10 -H "Authorization: Bearer $token" "$unread_url"); then
+cleaned_token=$(printf '%sX' "$token" | LC_ALL=C tr -d '\001-\037\177"\\')
+if [ "$cleaned_token" != "${token}X" ]; then
+	printf '%s\n' "poll-unread.sh: token contains forbidden characters" >&2
+	exit 1
+fi
+
+if ! response=$(printf 'header = "Authorization: Bearer %s"\n' "$token" | curl -fsS -m 10 -K - "$unread_url"); then
 	printf '%s\n' "poll-unread.sh: failed to fetch unread count" >&2
 	exit 1
 fi

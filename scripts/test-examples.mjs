@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import {
+	accessSync,
 	chmodSync,
+	constants,
 	existsSync,
+	mkdirSync,
 	mkdtempSync,
 	readFileSync,
 	rmSync,
@@ -11,7 +14,7 @@ import {
 } from "node:fs";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -87,6 +90,23 @@ function baseEnv(overrides = {}) {
 		PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
 		...overrides,
 	};
+}
+
+function findRealCurl() {
+	const pathEntries = (
+		process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin"
+	).split(delimiter);
+	for (const entry of pathEntries) {
+		if (!entry) continue;
+		const candidate = join(entry, "curl");
+		try {
+			accessSync(candidate, constants.X_OK);
+			return candidate;
+		} catch {
+			// continue searching PATH
+		}
+	}
+	throw new Error("curl executable not found in PATH");
 }
 
 test("poll-unread.sh exits 0 quietly without waking when unread is 0", async () => {
@@ -342,4 +362,132 @@ test("examples/wake-agent.sh and examples/poll-unread.sh are executable and wake
 	const missingArg = await runCommand(wakeScript, [], baseEnv());
 	assert.notEqual(missingArg.code, 0);
 	assert.match(missingArg.stderr, /Usage:/);
+});
+
+test("poll-unread.sh passes bearer token via curl -K - stdin and never on argv", async () => {
+	const secretToken = "paab_stdin_only_secret_token_42";
+	const realCurl = findRealCurl();
+
+	await withWakeSpy(async ({ dir, logPath, spyPath }) => {
+		const shimDir = join(dir, "bin");
+		mkdirSync(shimDir);
+		const argvLogPath = join(dir, "curl-argv.log");
+		const stdinLogPath = join(dir, "curl-stdin.log");
+		const shimCurl = join(shimDir, "curl");
+		writeFileSync(
+			shimCurl,
+			[
+				"#!/bin/sh",
+				`printf '%s\\n' "$@" > "${argvLogPath}"`,
+				`cat > "${stdinLogPath}"`,
+				`exec "${realCurl}" "$@" < "${stdinLogPath}"`,
+				"",
+			].join("\n"),
+			"utf8",
+		);
+		chmodSync(shimCurl, 0o755);
+
+		await withServer(
+			(_req, res) => {
+				res.writeHead(200, { "Content-Type": "application/json" });
+				res.end('{"unread":1}');
+			},
+			async ({ baseUrl, requests }) => {
+				const result = await runCommand(
+					pollScript,
+					[],
+					baseEnv({
+						PATH: `${shimDir}${delimiter}${process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin"}`,
+						PAAB_URL: baseUrl,
+						PAAB_UNREAD_TOKEN: secretToken,
+						PAAB_WAKE_CMD: spyPath,
+					}),
+				);
+				assert.equal(result.code, 0);
+				assert.equal(result.stderr, "");
+				assert.equal(requests.length, 1);
+				assert.equal(requests[0].authorization, `Bearer ${secretToken}`);
+				assert.equal(readFileSync(logPath, "utf8"), "1\n");
+
+				const argvText = readFileSync(argvLogPath, "utf8");
+				const argvLines = argvText.trim().split("\n");
+				assert.equal(argvText.includes(secretToken), false);
+				assert.equal(argvLines.includes("-H"), false);
+				const kIndex = argvLines.indexOf("-K");
+				assert.notEqual(kIndex, -1);
+				assert.equal(argvLines[kIndex + 1], "-");
+
+				const stdinText = readFileSync(stdinLogPath, "utf8");
+				assert.equal(
+					stdinText,
+					`header = "Authorization: Bearer ${secretToken}"\n`,
+				);
+			},
+		);
+	});
+});
+
+test("poll-unread.sh rejects tokens containing quotes, backslashes, or control characters without invoking curl or leaking the token", async () => {
+	const badEnvTokens = [
+		'paab_bad"quote',
+		"paab_bad\\backslash",
+		"paab_bad\rreturn",
+		"paab_bad\nnewline",
+		"paab_bad\ttab",
+	];
+	const badFileTokens = ['paab_file"quote', "paab_file\\backslash"];
+
+	await withWakeSpy(async ({ dir, logPath, spyPath }) => {
+		const shimDir = join(dir, "bin");
+		mkdirSync(shimDir);
+		const curlCalledPath = join(dir, "curl-called.log");
+		const shimCurl = join(shimDir, "curl");
+		writeFileSync(
+			shimCurl,
+			`#!/bin/sh\nprintf 'called\\n' >> "${curlCalledPath}"\nexit 99\n`,
+			"utf8",
+		);
+		chmodSync(shimCurl, 0o755);
+
+		const shimPath = `${shimDir}${delimiter}${process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin"}`;
+
+		for (const badToken of badEnvTokens) {
+			const result = await runCommand(
+				pollScript,
+				[],
+				baseEnv({
+					PATH: shimPath,
+					PAAB_URL: "http://127.0.0.1:1",
+					PAAB_UNREAD_TOKEN: badToken,
+					PAAB_WAKE_CMD: spyPath,
+				}),
+			);
+			assert.notEqual(result.code, 0, `expected failure for env token`);
+			assert.equal(existsSync(curlCalledPath), false);
+			assert.equal(existsSync(logPath), false);
+			assert.equal(result.stdout.includes(badToken), false);
+			assert.equal(result.stderr.includes(badToken), false);
+		}
+
+		for (const badToken of badFileTokens) {
+			const tokenFile = join(dir, "bad-token.txt");
+			writeFileSync(tokenFile, `${badToken}\n`, "utf8");
+			chmodSync(tokenFile, 0o600);
+			const result = await runCommand(
+				pollScript,
+				[],
+				baseEnv({
+					PATH: shimPath,
+					PAAB_URL: "http://127.0.0.1:1",
+					PAAB_UNREAD_TOKEN_FILE: tokenFile,
+					PAAB_WAKE_CMD: spyPath,
+				}),
+			);
+			assert.notEqual(result.code, 0, `expected failure for file token`);
+			assert.equal(existsSync(curlCalledPath), false);
+			assert.equal(existsSync(logPath), false);
+			assert.equal(result.stdout.includes(badToken), false);
+			assert.equal(result.stderr.includes(badToken), false);
+		}
+	});
 });
