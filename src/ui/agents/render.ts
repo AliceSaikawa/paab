@@ -95,6 +95,15 @@ export interface ConfiguredWebhookView {
 	replacedPrevious: boolean;
 }
 
+export interface AgentDeleteImpact {
+	isAdminBot: boolean;
+	hasActiveAdminToken: boolean;
+	webhookUrl: string | null;
+	proposalCount: number;
+	pendingProposalCount: number;
+	hasPendingDescription: boolean;
+}
+
 function agentActionPath(agentId: string, suffix = ""): string {
 	return `/admin/agents/${encodeURIComponent(agentId)}${suffix}`;
 }
@@ -408,9 +417,18 @@ export function renderAgentsPageBody(options: {
 
 export function renderDeleteConfirmBody(options: {
 	entry: AgentWithStatus;
+	impact: AgentDeleteImpact;
 	csrfToken: string;
 }): SafeHtml {
 	const { agent, activeTokens } = options.entry;
+	const { impact } = options;
+
+	const proposalSummary =
+		impact.proposalCount === 0
+			? "なし"
+			: impact.pendingProposalCount > 0
+				? `${impact.proposalCount}件（うち承認待ち ${impact.pendingProposalCount}件。同時に削除されます）`
+				: `${impact.proposalCount}件（同時に削除されます）`;
 
 	return html`
 		<div class="stack">
@@ -420,7 +438,7 @@ export function renderDeleteConfirmBody(options: {
 			</div>
 
 			<div class="banner banner-warning" role="alert">
-				エージェント「${agent.name}」を削除すると、紐づくトークン・許可ルール・メッセージも削除されます（監査ログと変更履歴の記録は保持されます）。
+				エージェント「${agent.name}」を削除すると、紐づくトークン・許可ルール・メッセージ・Webhook・提案・承認待ちの説明文も削除され、管理者ボットに指名中であれば指名と権限設定も解除されます（監査ログと変更履歴の記録は保持されます）。
 			</div>
 
 			<section class="card stack">
@@ -436,6 +454,34 @@ export function renderDeleteConfirmBody(options: {
 						</div>
 					`,
 				)}
+				<div>
+					<strong>管理者ボット指名:</strong>
+					${
+						impact.isAdminBot
+							? html`<span class="badge badge-danger">指名中</span> 削除すると管理者ボットの指名が解除され、本文閲覧・最高管理者権限の設定もオフにリセットされます`
+							: "指名されていません"
+					}
+				</div>
+				<div>
+					<strong>管理者トークン（/mcp/admin）:</strong>
+					${impact.hasActiveAdminToken ? "有効なトークンあり（同時に削除されます）" : "未発行"}
+				</div>
+				<div>
+					<strong>Webhook 通知:</strong>
+					${
+						impact.webhookUrl !== null
+							? html`設定済み（<code>${impact.webhookUrl}</code>・署名鍵と配信キューも同時に削除されます）`
+							: "未設定"
+					}
+				</div>
+				<div>
+					<strong>管理者ボットの提案:</strong>
+					${proposalSummary}
+				</div>
+				<div>
+					<strong>承認待ちの説明文:</strong>
+					${impact.hasPendingDescription ? "あり（同時に削除されます）" : "なし"}
+				</div>
 				<div class="actions">
 					<form class="inline-form" method="POST" action="${agentActionPath(agent.id, "/delete")}">
 						${csrfInput(options.csrfToken)}

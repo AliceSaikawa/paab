@@ -14,12 +14,14 @@ import {
 	suspendAgent,
 	updateAgent,
 } from "../../admin";
+import { getAdminBotConfig } from "../../adminbot";
 import { isLocalWebhookAllowed } from "../../notify";
 import { adminPageResponse, type FlashMessage } from "../layout";
 import type { AdminGetContext, AdminPostContext, AdminRoute } from "../router";
 import {
 	AGENT_TOKEN_UI_CONFIG,
 	AGENT_UI_TOKEN_PURPOSES,
+	type AgentDeleteImpact,
 	type AgentUiTokenPurpose,
 	type RegisterFormDraft,
 	renderAgentsPageBody,
@@ -247,6 +249,37 @@ async function handleGetDeleteConfirm(ctx: AdminGetContext): Promise<Response> {
 		});
 	}
 
+	const [adminBotConfig, webhooks, [proposalResult, pendingDescResult]] =
+		await Promise.all([
+			getAdminBotConfig(ctx.env.DB),
+			listAgentWebhooks(ctx.env.DB),
+			ctx.env.DB.batch([
+				ctx.env.DB.prepare(
+					`SELECT
+							COUNT(*) AS total,
+							COALESCE(SUM(CASE WHEN status = 'pending' AND expires_at > ? THEN 1 ELSE 0 END), 0) AS pending
+						FROM proposals
+						WHERE bot_agent_id = ?`,
+				).bind(ctx.now, agentId),
+				ctx.env.DB.prepare(
+					"SELECT 1 AS present FROM pending_descriptions WHERE agent_id = ? LIMIT 1",
+				).bind(agentId),
+			]),
+		]);
+
+	const proposalRow = (proposalResult?.results[0] ?? null) as {
+		total: number;
+		pending: number;
+	} | null;
+	const impact: AgentDeleteImpact = {
+		isAdminBot: adminBotConfig.agentId === entry.agent.id,
+		hasActiveAdminToken: entry.activeTokens.admin !== null,
+		webhookUrl: webhooks.get(entry.agent.id)?.url ?? null,
+		proposalCount: proposalRow?.total ?? 0,
+		pendingProposalCount: proposalRow?.pending ?? 0,
+		hasPendingDescription: (pendingDescResult?.results.length ?? 0) > 0,
+	};
+
 	return adminPageResponse({
 		title: "エージェント削除確認",
 		currentPath: AGENTS_PATH,
@@ -254,6 +287,7 @@ async function handleGetDeleteConfirm(ctx: AdminGetContext): Promise<Response> {
 		devMode: ctx.devMode,
 		body: renderDeleteConfirmBody({
 			entry,
+			impact,
 			csrfToken: ctx.csrfToken,
 		}),
 	});
