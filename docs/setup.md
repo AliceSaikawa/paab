@@ -12,6 +12,8 @@
    npm ci
    ```
 
+   npm 12 では `esbuild` と `workerd` の postinstall が `allowScripts` の対象外として止められ、警告が出ることがある。警告が出ても `npm run check` は通る。管理コマンド（`npm run seed` など）が esbuild を見付けられないときは `npm install-scripts approve esbuild workerd` を実行するか、`package.json` の `allowScripts` に両方を登録する（`approve` を実行すると共有の `package.json` の `allowScripts` に版付きで書き込まれるため、意図せずコミットしないよう注意し、依存を更新したときは再登録する）。
+
 2. 本番のD1に対して実行する場合は、Cloudflareにログインし、D1データベースを作る。
 
    ```sh
