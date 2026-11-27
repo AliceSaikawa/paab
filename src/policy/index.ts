@@ -4,6 +4,7 @@ export {
 	type PolicyReasonCode,
 	type QuestionCheckInput,
 	type QuestionDecision,
+	UTC_DAY_MS,
 	utcDayStart,
 } from "./check";
 export { type AllowedRecipient, listAllowedRecipients } from "./list";

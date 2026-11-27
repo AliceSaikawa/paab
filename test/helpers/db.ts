@@ -1,5 +1,6 @@
 import { applyD1Migrations, type D1Migration } from "cloudflare:test";
 import { env } from "cloudflare:workers";
+import { resetAuthFailureAuditLimiter } from "../../src/auth";
 
 // Every migration file, loaded as text at build time. This keeps the tests on
 // the real files in `migrations/` without adding bindings to the Vitest
@@ -62,6 +63,7 @@ const TABLES = [
  * empty. Call it in `beforeEach`.
  */
 export async function createTestDb(): Promise<D1Database> {
+	resetAuthFailureAuditLimiter();
 	const db = env.DB;
 	await applyD1Migrations(db, migrations);
 	await db.batch(TABLES.map((table) => db.prepare(`DELETE FROM ${table}`)));

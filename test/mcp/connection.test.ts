@@ -2,7 +2,11 @@ import { SELF } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { beforeEach, describe, expect, it } from "vitest";
 import { queryAuditLog } from "../../src/audit";
-import { issueToken } from "../../src/auth";
+import {
+	AUTH_FAILURE_AUDIT_MAX_PER_WINDOW,
+	AUTH_FAILURE_AUDIT_WINDOW_MS,
+	issueToken,
+} from "../../src/auth";
 import { handleMcpRequest } from "../../src/mcp";
 import { seedAgent, T0 } from "../helpers/fixtures";
 import { connect, createMcpWorld, MCP_URL, type McpWorld } from "./support";
@@ -71,16 +75,26 @@ describe("authentication", () => {
 			}));
 	}
 
-	it("rejects a request without a token", async () => {
-		const response = await handleMcpRequest(post(null), env, T0);
-		expect(response.status).toBe(401);
-		expect(response.headers.get("WWW-Authenticate")).toBe("Bearer");
+	it("rejects missing and malformed credentials with 401 and writes zero audit rows", async () => {
+		const missing = await handleMcpRequest(post(null), env, T0);
+		expect(missing.status).toBe(401);
+		expect(missing.headers.get("WWW-Authenticate")).toBe("Bearer");
 		await expect(connect(null)).rejects.toThrow();
-		expect((await authFailures())[0]).toEqual({
-			fromAgentId: null,
-			reasonCode: "token_missing",
-			outcome: "denied",
-		});
+
+		for (const header of [
+			"",
+			"Basic dXNlcjpwYXNz",
+			"Bearer",
+			"Bearer   ",
+			"Bearer not-a-token",
+			"Bearer paab_short",
+			`Bearer paab_${"!".repeat(43)}`,
+		]) {
+			const response = await handleMcpRequest(post(header), env, T0);
+			expect(response.status).toBe(401);
+			expect(response.headers.get("WWW-Authenticate")).toBe("Bearer");
+		}
+		expect(await authFailures()).toEqual([]);
 	});
 
 	it("rejects an unknown token", async () => {
@@ -143,5 +157,48 @@ describe("authentication", () => {
 			reasonCode: "sender_suspended",
 			outcome: "denied",
 		});
+	});
+
+	it("throttles burst auth_failed audit writes per isolate while still returning 401", async () => {
+		const wrong = `paab_${"B".repeat(43)}`;
+		for (let i = 0; i < AUTH_FAILURE_AUDIT_MAX_PER_WINDOW + 5; i++) {
+			const response = await handleMcpRequest(
+				post(`Bearer ${wrong}`),
+				env,
+				T0 + i,
+			);
+			expect(response.status).toBe(401);
+		}
+		expect(await authFailures()).toHaveLength(
+			AUTH_FAILURE_AUDIT_MAX_PER_WINDOW,
+		);
+
+		// A revoked token uses its own reason bucket and is still audited.
+		const old = world.alice.token;
+		await issueToken(world.db, {
+			agentId: world.alice.agent.id,
+			purpose: "participant",
+			now: T0 + 1,
+		});
+		const revokedRes = await handleMcpRequest(
+			post(`Bearer ${old}`),
+			env,
+			T0 + 50,
+		);
+		expect(revokedRes.status).toBe(401);
+		expect(await authFailures()).toHaveLength(
+			AUTH_FAILURE_AUDIT_MAX_PER_WINDOW + 1,
+		);
+
+		// Next minute window allows auditing unknown tokens again.
+		const nextWindowRes = await handleMcpRequest(
+			post(`Bearer ${wrong}`),
+			env,
+			T0 + AUTH_FAILURE_AUDIT_WINDOW_MS,
+		);
+		expect(nextWindowRes.status).toBe(401);
+		expect(await authFailures()).toHaveLength(
+			AUTH_FAILURE_AUDIT_MAX_PER_WINDOW + 2,
+		);
 	});
 });

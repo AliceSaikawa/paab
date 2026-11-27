@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it } from "vitest";
+import { configureAgentWebhook } from "../../src/admin";
 import { queryAuditLog } from "../../src/audit";
 import { ANSWER_MAX_LENGTH, QUESTION_MAX_LENGTH } from "../../src/mcp";
+import { DAY_MS, T0 } from "../helpers/fixtures";
 import {
 	askBob,
 	call,
@@ -8,6 +10,7 @@ import {
 	createMcpWorld,
 	type McpWorld,
 	questionIdOf,
+	unreadCount,
 	withoutFooter,
 } from "./support";
 
@@ -89,6 +92,151 @@ describe("ask", () => {
 		});
 		expect(refused.isError).toBe(true);
 		expect(await messageCount()).toBe(0);
+	});
+
+	it("suppresses message rows, delayed webhooks, and repeat audit rows after daily_question_limit", async () => {
+		await world.db
+			.prepare("UPDATE agents SET daily_question_limit = 2 WHERE id = ?")
+			.bind(world.alice.agent.id)
+			.run();
+		await configureAgentWebhook(world.db, {
+			agentId: world.alice.agent.id,
+			url: "https://hooks.example.com/alice",
+			authMode: "paab_hmac",
+			actor: { actorType: "owner", actorId: "owner@example.com" },
+			now: T0,
+		});
+
+		const alice = await connect(world.alice.token, { now: T0 });
+		const accepted1 = await call(alice, "ask", {
+			to: "bob",
+			category: "schedule",
+			question: "First?",
+		});
+		const accepted2 = await call(alice, "ask", {
+			to: "bob",
+			category: "schedule",
+			question: "Second?",
+		});
+		expect(accepted1.isError).toBe(false);
+		expect(accepted2.isError).toBe(false);
+		expect(await messageCount()).toBe(2);
+
+		const normalize = (text: string) =>
+			withoutFooter(text).replace(questionIdOf(text), "<id>");
+
+		// Repeat over-limit asks (both allowed targets and disallowed targets).
+		const over1 = await call(alice, "ask", {
+			to: "bob",
+			category: "schedule",
+			question: "Third?",
+		});
+		const over2 = await call(alice, "ask", {
+			to: "bob",
+			category: "schedule",
+			question: "Fourth?",
+		});
+		const overDisallowed = await call(alice, "ask", {
+			to: "bob",
+			category: "health",
+			question: "Disallowed after limit?",
+		});
+		const overUnknown = await call(alice, "ask", {
+			to: "nobody",
+			category: "schedule",
+			question: "Unknown recipient after limit?",
+		});
+
+		for (const res of [over1, over2, overDisallowed, overUnknown]) {
+			expect(res.isError).toBe(false);
+			expect(normalize(res.text)).toBe(normalize(accepted1.text));
+			expect(unreadCount(res.text)).toBe(0);
+		}
+		expect(questionIdOf(over1.text)).not.toBe(questionIdOf(over2.text));
+
+		// Zero new rows in messages and zero delayed webhooks scheduled for alice.
+		expect(await messageCount()).toBe(2);
+		const deliveries = await world.db
+			.prepare(
+				"SELECT COUNT(*) AS n FROM webhook_deliveries WHERE agent_id = ?",
+			)
+			.bind(world.alice.agent.id)
+			.first<{ n: number }>();
+		expect(deliveries?.n).toBe(0);
+
+		// At most one daily_limit_exceeded audit row on Day 1.
+		const day1LimitAudits = (await queryAuditLog(world.db)).filter(
+			(entry) =>
+				entry.eventType === "question_blocked" &&
+				entry.reasonCode === "daily_limit_exceeded",
+		);
+		expect(day1LimitAudits).toHaveLength(1);
+		expect(day1LimitAudits[0]).toMatchObject({
+			fromAgentId: world.alice.agent.id,
+			toAgentId: world.bob.agent.id,
+			categoryId: world.schedule.id,
+			messageId: questionIdOf(over1.text),
+			outcome: "denied",
+		});
+
+		// Next UTC day resets both the daily question limit and the daily audit cap.
+		const aliceDay2 = await connect(world.alice.token, { now: T0 + DAY_MS });
+		await askBob(aliceDay2, "Day 2 first");
+		await askBob(aliceDay2, "Day 2 second");
+		expect(await messageCount()).toBe(4);
+
+		const day2Over1 = await call(aliceDay2, "ask", {
+			to: "bob",
+			category: "schedule",
+			question: "Day 2 third",
+		});
+		const day2Over2 = await call(aliceDay2, "ask", {
+			to: "bob",
+			category: "schedule",
+			question: "Day 2 fourth",
+		});
+		expect(unreadCount(day2Over1.text)).toBe(0);
+		expect(unreadCount(day2Over2.text)).toBe(0);
+		expect(await messageCount()).toBe(4);
+
+		const allLimitAudits = (await queryAuditLog(world.db)).filter(
+			(entry) =>
+				entry.eventType === "question_blocked" &&
+				entry.reasonCode === "daily_limit_exceeded",
+		);
+		expect(allLimitAudits).toHaveLength(2);
+		expect(allLimitAudits[1]?.messageId).toBe(questionIdOf(day2Over1.text));
+	});
+
+	it("keeps non-limit bridge blocks recorded until daily_question_limit is reached, then stops writing messages", async () => {
+		await world.db
+			.prepare("UPDATE agents SET daily_question_limit = 2 WHERE id = ?")
+			.bind(world.alice.agent.id)
+			.run();
+		const alice = await connect(world.alice.token, { now: T0 });
+
+		// Two non-limit bridge blocks below the limit write 2 messages each (4 total).
+		await call(alice, "ask", {
+			to: "bob",
+			category: "health",
+			question: "Disallowed 1",
+		});
+		await call(alice, "ask", {
+			to: "nobody",
+			category: "schedule",
+			question: "Unknown 2",
+		});
+		expect(await messageCount()).toBe(4);
+
+		// A third disallowed ask now hits daily_limit_exceeded and writes zero messages.
+		const afterLimit = await call(alice, "ask", {
+			to: "bob",
+			category: "health",
+			question: "Disallowed 3",
+		});
+		expect(afterLimit.isError).toBe(false);
+		expect(await messageCount()).toBe(4);
+		expect(unreadCount(afterLimit.text)).toBe(2);
 	});
 });
 

@@ -226,21 +226,41 @@ describe("precedence when several conditions hold", () => {
 		});
 	});
 
-	it("reports the daily limit last", async () => {
+	it("reports the daily limit right after a suspended sender", async () => {
 		for (let i = 0; i < 3; i++) await recordQuestion(alice, T0);
 		await seedAgent(db, { name: "carol" });
 
 		expect(await check(alice, "carol", "schedule")).toMatchObject({
-			reasonCode: "no_allow_rule",
+			allowed: false,
+			reasonCode: "daily_limit_exceeded",
 		});
 		expect(await check(alice, "bob", "nothing")).toMatchObject({
-			reasonCode: "category_not_found",
+			allowed: false,
+			reasonCode: "daily_limit_exceeded",
+			toAgentId: bob.id,
+			categoryId: null,
 		});
 		expect(await check(alice, "alice", "schedule")).toMatchObject({
-			reasonCode: "self_addressed",
+			allowed: false,
+			reasonCode: "daily_limit_exceeded",
+		});
+		expect(await check(alice, "nobody", "schedule")).toMatchObject({
+			allowed: false,
+			reasonCode: "daily_limit_exceeded",
+			toAgentId: null,
+			categoryId: schedule.id,
 		});
 		expect(await check(alice, "bob", "schedule")).toMatchObject({
+			allowed: false,
 			reasonCode: "daily_limit_exceeded",
+			toAgentId: bob.id,
+			categoryId: schedule.id,
+		});
+
+		await suspend(alice);
+		expect(await check(alice, "bob", "schedule")).toMatchObject({
+			allowed: false,
+			reasonCode: "sender_suspended",
 		});
 	});
 });

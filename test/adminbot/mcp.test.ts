@@ -12,7 +12,7 @@ import {
 	issueAdminBotToken,
 } from "../../src/adminbot";
 import { queryAuditLog, recordAuditEvent } from "../../src/audit";
-import { issueToken } from "../../src/auth";
+import { AUTH_FAILURE_AUDIT_MAX_PER_WINDOW, issueToken } from "../../src/auth";
 import { handleMcpRequest } from "../../src/mcp";
 import type { McpEnv } from "../../src/mcp/config";
 import type { Agent, Category } from "../../src/types";
@@ -153,10 +153,18 @@ describe("/mcp/admin authentication and authorization", () => {
 			}));
 	}
 
-	it("rejects missing, unknown, revoked, and non-admin tokens with 401", async () => {
+	it("rejects missing, malformed, unknown, revoked, and non-admin tokens with 401 and skips audit writes for missing/malformed credentials", async () => {
 		const missingRes = await handleAdminMcpRequest(adminMcpPost(null), env, T0);
 		expect(missingRes.status).toBe(401);
 		expect(missingRes.headers.get("WWW-Authenticate")).toBe("Bearer");
+
+		const malformedRes = await handleAdminMcpRequest(
+			adminMcpPost("Bearer paab_short"),
+			env,
+			T0,
+		);
+		expect(malformedRes.status).toBe(401);
+		expect(await authFailures()).toEqual([]);
 
 		const unknownToken = `paab_${"A".repeat(43)}`;
 		const unknownRes = await handleAdminMcpRequest(
@@ -203,12 +211,26 @@ describe("/mcp/admin authentication and authorization", () => {
 		expect(revokedRes.status).toBe(401);
 
 		expect(await authFailures()).toEqual([
-			{ fromAgentId: null, reasonCode: "token_missing", outcome: "denied" },
 			{ fromAgentId: null, reasonCode: "token_unknown", outcome: "denied" },
 			{ fromAgentId: muse.id, reasonCode: "token_unknown", outcome: "denied" },
 			{ fromAgentId: muse.id, reasonCode: "token_unknown", outcome: "denied" },
 			{ fromAgentId: muse.id, reasonCode: "token_revoked", outcome: "denied" },
 		]);
+	});
+
+	it("throttles burst auth_failed audit writes on /mcp/admin while still returning 401", async () => {
+		const wrong = `paab_${"C".repeat(43)}`;
+		for (let i = 0; i < AUTH_FAILURE_AUDIT_MAX_PER_WINDOW + 5; i++) {
+			const res = await handleAdminMcpRequest(
+				adminMcpPost(`Bearer ${wrong}`),
+				env,
+				T0 + i,
+			);
+			expect(res.status).toBe(401);
+		}
+		expect(await authFailures()).toHaveLength(
+			AUTH_FAILURE_AUDIT_MAX_PER_WINDOW,
+		);
 	});
 
 	it("rejects an admin token on the participant /mcp endpoint", async () => {

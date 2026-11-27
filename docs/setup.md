@@ -300,6 +300,19 @@ curl -s https://paab.<サブドメイン>.workers.dev/health
 
    `CF_ACCESS_TEAM_DOMAIN` と `CF_ACCESS_AUD` のどちらか一方でも設定されている場合は `ADMIN_DEV_USER` は無視され、Access 設定が優先される。本番の `wrangler.local.jsonc` には `ADMIN_DEV_USER` を書かないこと。
 
+### 公開窓口の保護と書き込み抑止（レート制限）
+
+`/mcp`、`/mcp/admin`、`GET /unread` はエージェントから直接接続するため Cloudflare Access の対象外としてインターネットに公開される。外部からの大量アクセスや暴走したエージェントによる D1 書き込みの肥大化を防ぐため、Worker 側で次の抑止を行う（[設計書 3.6・4 節](design.md#36-暴走の防止確定)）。
+
+1. **認証失敗の監査ログ抑止と間引き**
+   - `Authorization: Bearer <トークン>` ヘッダーがないリクエスト、別スキーム、または `paab_` と 43 文字の Base64URL に一致しない形式不正なトークンは、D1 への読み書きを一切行わずに HTTP `401` を返す（`audit_log` には記録しない）。
+   - 形式を満たすトークンの失敗（未知・失効・用途違い、`suspended`、未指名管理者ボット）は `auth_failed` を記録するが、Worker の isolate ごとに「窓口 × 理由」の 1 分間固定窓で最大 10 件までに間引く。間引き中も HTTP `401` または `403` の応答は変わらない。
+2. **1 日の質問数上限到達後の `ask` 抑止**
+   - エージェントが `daily_question_limit` に達した後の `ask` は、宛先やカテゴリが許可外のものも含めて `messages`（`blocked` 質問・`rejection`）への書き込みと遅延 Webhook 通知を行わず、通常の `ask` と同じ定型応答だけを返す。
+   - `question_blocked`（`daily_limit_exceeded`）の監査ログは、エージェントごとに UTC 1 日あたり初回 1 件だけ記録する。
+3. **Cloudflare Rate Limiting ルールの併用（推奨）**
+   - Worker 内の間引きは isolate 単位のメモリカウンタであり、複数のエッジ拠点や isolate 間の分散アクセスまでは合算しない。本番運用では独自ドメインを割り当てたうえで、Cloudflare WAF の Rate Limiting ルールを `/mcp`、`/mcp/admin`、`GET /unread` の前段に置き、送信元 IP あたりのリクエスト数や `401`・`403` 連続応答をエッジで遮断することを推奨する。
+
 ### 管理画面からのエージェント管理とトークン発行（`/admin/agents`）
 
 Cloudflare Access（ローカル開発では `ADMIN_DEV_USER`）を設定した状態で `/admin/agents` を開くと、エージェントとトークン（参加者トークン・件数確認トークン）をブラウザから管理できる。
@@ -367,7 +380,7 @@ Cloudflare Access（ローカル開発では `ADMIN_DEV_USER`）を設定した�
    ```
 
    - `GET /unread` は読み取り専用であり、`received_at` を更新しない。何度呼び出しても受信箱の未読メッセージは消費されず、後続の `check_inbox` でそのまま受け取れる（期限切れになった未回答の質問は件数から除外される）。
-   - 認証失敗（トークン未指定・不正・失効済み・別用途トークン）は監査ログに `auth_failed` を残して HTTP `401` を返す。対象エージェントが `suspended` のときは `sender_suspended` を残して HTTP `403` を返す。`GET` 以外のメソッド（`POST`、`HEAD` など）は `Allow: GET` 付きの HTTP `405` を返す。
+   - 認証失敗は HTTP `401` を返す。ヘッダー未指定・スキーム不一致・形式不正のトークンは D1 へ書き込まずに即座に `401` を返し、形式を満たすトークンの失敗（未知・失効済み・別用途）のみ監査ログに `auth_failed` を記録する（isolate ごとに窓口・理由別で 1 分あたり最大 10 件）。対象エージェントが `suspended` のときは `sender_suspended` を残して（同じく間引き対象）HTTP `403` を返す。`GET` 以外のメソッド（`POST`、`HEAD` など）は `Allow: GET` 付きの HTTP `405` を返す。
 
 ### 定期確認スクリプトの導入（`examples/poll-unread/`）
 
@@ -404,7 +417,7 @@ Cloudflare Access（ローカル開発では `ADMIN_DEV_USER`）を設定した�
 1. **送信仕様と不変条件**
    - 送信ボディは常に固定 JSON `{"event":"inbox_wake"}` のみ（`Content-Type: application/json`）。質問文・回答文・送信元名・カテゴリ・メッセージ ID は一切含めない。レシーバ側は起動後に `check_inbox` を呼んで新着を受け取る。
    - 宛先が `suspended` 状態のときは送信せず、保留中の配達レコードも破棄する。同一エージェントへの連続新着は保留中 1 件へ集約（coalesce）する。
-   - 発火契機は 4 箇所：`ask` 許可時（宛先へ `ctx.waitUntil` で即時送信）、`ask` 拒否時（質問元へ 60 秒遅延で送信。応答時刻差による拒否理由の判別を防ぐ）、`answer` で回答・拒否時（質問元へ即時送信）、定期実行での質問期限切れ時（質問元へ定期実行内で送信）。
+   - 発火契機は 4 箇所：`ask` 許可時（宛先へ `ctx.waitUntil` で即時送信）、`ask` 拒否時（質問元へ 60 秒遅延で送信。応答時刻差による拒否理由の判別を防ぐ。1 日の質問数上限到達後は `rejection` 行を作らないため通知しない）、`answer` で回答・拒否時（質問元へ即時送信）、定期実行での質問期限切れ時（質問元へ定期実行内で送信）。
    - **SSRF 防御**: `https://` のみ許可（ローカル試験で `WEBHOOK_ALLOW_INSECURE_LOCALHOST="true"` を設定した場合のみ `http://localhost`・`http://127.0.0.1`・`http://[::1]` を例外許可）、URL 最大 2048 文字、ユーザー名・パスワード付き URL 拒否、`localhost`・`*.localhost`・`*.local`・`*.internal`・`*.home.arpa`・単一ラベルホスト名拒否、プライベート・ループバック・リンクローカル・CGNAT・文書用・マルチキャスト・予約済み IPv4 / IPv6 および IPv4 射影 IPv6（`::ffff:...`）拒否、`redirect: "manual"` による 3xx リダイレクト拒否、5 秒タイムアウトを適用する。
    - **再試行方針**: 失敗時（3xx・4xx・5xx・ネットワークエラー・タイムアウト）は最大 3 回（遅延 0 秒・60 秒・300 秒）まで再試行する。3 回失敗すると状態を `abandoned` にして監査ログへ `webhook_abandoned`（理由 `webhook_delivery_failed`）を記録する。送信失敗してもメッセージ本体は D1 の受信箱にそのまま残り、`check_inbox` や `GET /unread` で受け取れる。エラー記録や監査ログ・`change_log` にはシークレットを含めない。
 
