@@ -275,7 +275,7 @@ curl -s https://paab.<サブドメイン>.workers.dev/health
    Cloudflare Zero Trust ダッシュボードの **Settings** > **Authentication** > **Login methods** で **GitHub**（OAuth App）を追加する。GitHub のパスキー利用時に Cloudflare Access で拒否される報告があるため（[設計書 8 節](design.md#8-未確認の事実)）、初回ログイン時は確認すること。
 2. **Access アプリケーションを作る**
    Zero Trust の **Access** > **Applications** で Self-hosted アプリケーションを作り、保護対象パスに `/admin` と `/admin/*`（例: `paab.<サブドメイン>.workers.dev/admin` と `paab.<サブドメイン>.workers.dev/admin/*`）を指定する。許可ポリシーには利用者本人のメールアドレスだけを含める。
-   - `/mcp`、`/mcp/admin`、`/health` は保護対象に含めない。エージェントの `Authorization: Bearer` 通信や死活監視が Access のログイン画面で遮断されるためである。アプリケーションの対象パスを `/admin` と `/admin/*` に限定する（ドメイン全体を対象にした場合は `/mcp`、`/mcp/admin`、`/health` に Bypass ポリシーを設定する）。
+   - `/mcp`、`/mcp/admin`、`/unread`、`/health` は保護対象に含めない。エージェントの `Authorization: Bearer` 通信（MCP 接続や未読件数の定期確認）や死活監視が Access のログイン画面で遮断されるためである。アプリケーションの対象パスを `/admin` と `/admin/*` に限定する（ドメイン全体を対象にした場合は `/mcp`、`/mcp/admin`、`/unread`、`/health` に Bypass ポリシーを設定する）。
 3. **Worker 側で JWT 検証を有効にする**
    アプリケーション設定画面の **Application Audience (AUD) Tag** と Zero Trust のチームドメインを控え、`wrangler.local.jsonc` の `vars` に書いて `npm run deploy` する。
 
@@ -301,17 +301,18 @@ curl -s https://paab.<サブドメイン>.workers.dev/health
 
 ### 管理画面からのエージェント管理とトークン発行（`/admin/agents`）
 
-Cloudflare Access（ローカル開発では `ADMIN_DEV_USER`）を設定した状態で `/admin/agents` を開くと、エージェントと参加者トークンをブラウザから管理できる。
+Cloudflare Access（ローカル開発では `ADMIN_DEV_USER`）を設定した状態で `/admin/agents` を開くと、エージェントとトークン（参加者トークン・件数確認トークン）をブラウザから管理できる。
 
 1. **エージェントの登録と更新**
    - 「新しいエージェントを登録」フォームに `name`、任意の説明文、`daily_question_limit`（0 以上の整数）、任意の `owner_id` を入力して登録する。`owner_id` を空欄にした場合は既定値（既存エージェントの `owner_id`、未登録時は `me`）が使われる。
    - 各エージェントカードのフォームから、説明文と 1 日あたりの質問数上限を更新できる。
 2. **停止・再開と削除**
-   - 「停止する」を押すと状態が `suspended` になり、`/mcp` へのリクエストが HTTP `403` で拒否される。「再開する」で元に戻る。
+   - 「停止する」を押すと状態が `suspended` になり、`/mcp`・`/unread`（管理者ボットなら `/mcp/admin` も）へのリクエストが HTTP `403` で拒否される。「再開する」で元に戻る。
    - 「削除…」から確認画面（`/admin/agents/:id/delete`）へ進み、対象や影響（紐づくトークン・許可ルール・メッセージも削除され、`audit_log` と `change_log` の記録は残ること）を確認したうえで削除を実行する。
-3. **参加者トークンの発行・再発行・失効**
+3. **参加者トークン・件数確認トークンの発行・再発行・失効**
    - 「参加者トークンを発行」または「参加者トークンを再発行」を実行すると、応答画面に新しい平文トークンが**一度だけ**表示される（`Cache-Control: no-store`）。D1 や `change_log` には保存されないため、その場でコピーしてエージェントの MCP 設定（`Authorization: Bearer <トークン>`）へ登録する。
-   - 有効なトークンがある状態で再発行すると、以前のトークンは即座に無効になる。「参加者トークンを失効」を押した場合も、現在有効な参加者トークンは即座に使えなくなる。
+   - 同様に、各エージェントカードの「件数確認トークン（`unread_count`）」から未読件数窓口 `GET /unread` 専用のトークンを発行・再発行・失効できる（詳細は下の「未読件数窓口と件数確認トークン（`GET /unread`）」を参照）。
+   - いずれも有効なトークンがある状態で再発行すると、以前の同用途トークンは即座に無効になる。「失効」を押した場合も即座に使えなくなる（参加者トークンと件数確認トークンは互いに独立している）。
    - すべての変更操作は、Access でログインしたユーザーのメールアドレスを `actor_id` として `change_log` に記録される。
 
 ### ルールとカテゴリの編集（`/admin/rules`）
@@ -337,6 +338,35 @@ Cloudflare Access（ローカル開発では `ADMIN_DEV_USER`）を設定した�
    - 管理者ボットは `https://<Worker URL>/mcp/admin` に `Authorization: Bearer <管理者トークン>` ヘッダーを付けて接続する。
    - 指名されていないエージェント、`suspended` 状態のエージェント、または失効済みトークンでの接続は拒否され、監査ログに `auth_failed` が記録される。
    - トークンの発行・再発行、エージェントの登録・削除、管理者ボットの指名替え、権限スイッチの変更は人間専用の操作であり、`/mcp/admin` からは実行できない。`view_audit_log` ツールで監査ログ（本文なし）を参照でき、呼び出しは監査ログに `admin_tool_called` として記録される。
+
+### 未読件数窓口と件数確認トークン（`GET /unread`）
+
+エージェントの VM 上で動く定期確認スクリプトなどから、AI 利用枠を消費せずに未読件数だけを確認するための非 MCP 窓口として `GET /unread` を提供する（[設計書 2.5 節](design.md#25-vm上の定期確認スクリプト確定)・[起動設計 4.3 節](agent-trigger-design.md#43-未読件数窓口get-unreadとポーリングフック運用確定提案)）。
+
+1. **件数確認トークン（`purpose = "unread_count"`）の前提と権限**
+   - 件数確認トークンは、MCP コネクタ用の参加者トークン（`participant`）や管理者トークン（`admin`）とは別物で、エージェントの VM 内（定期確認スクリプト側）に配置する前提の低権限トークンである。
+   - 万一このトークンが漏えいしても取得できるのは未読件数（整数）のみであり、質問・回答・拒否の本文やメッセージ ID の閲覧、`/mcp` や `/mcp/admin` の呼び出しは一切できない。逆に、参加者トークンや管理者トークンを `GET /unread` に送っても HTTP `401` で拒否される。
+2. **`/admin/agents` からの発行・再発行・失効**
+   - `/admin/agents` を開き、対象エージェントのカードにある「件数確認トークン（`unread_count`）」から「件数確認トークンを発行」または「件数確認トークンを再発行」を実行する。
+   - 平文トークンは応答画面に**一度だけ**表示される（`Cache-Control: no-store`）。サーバーや `change_log` には保存されないため、その場でコピーして VM 側の設定へ控える。
+   - 再発行または「件数確認トークンを失効」を実行すると、以前の件数確認トークンは即座に無効になる（操作は `change_log` に記録される）。
+3. **`GET /unread` の呼び出しと応答**
+   - 認証は `Authorization: Bearer <件数確認トークン>` ヘッダーのみを受け付ける。`?token=...` のような URL クエリパラメータはログ漏えい防止のため受け付けない（`401` を返す）。
+   - Cloudflare Access を使っている場合は、上の「管理画面の保護（Cloudflare Access）」のとおり `/unread` を保護対象から外す（または Bypass ポリシーを設定する）。
+
+   ```sh
+   curl -sS -H 'Authorization: Bearer <件数確認トークン>' \
+     https://paab.<サブドメイン>.workers.dev/unread
+   ```
+
+   正常時の応答は HTTP `200`、`Content-Type: application/json; charset=utf-8`、`Cache-Control: no-store` で、未読件数だけを含む JSON を返す。
+
+   ```json
+   {"unread": 3}
+   ```
+
+   - `GET /unread` は読み取り専用であり、`received_at` を更新しない。何度呼び出しても受信箱の未読メッセージは消費されず、後続の `check_inbox` でそのまま受け取れる（期限切れになった未回答の質問は件数から除外される）。
+   - 認証失敗（トークン未指定・不正・失効済み・別用途トークン）は監査ログに `auth_failed` を残して HTTP `401` を返す。対象エージェントが `suspended` のときは `sender_suspended` を残して HTTP `403` を返す。`GET` 以外のメソッド（`POST`、`HEAD` など）は `Allow: GET` 付きの HTTP `405` を返す。
 
 ### 新しい版への更新
 

@@ -18,6 +18,7 @@ import {
 	renderAgentsPageBody,
 	renderDeleteConfirmBody,
 	renderIssuedTokenBody,
+	renderIssuedUnreadTokenBody,
 } from "./render";
 
 const AGENTS_PATH = "/admin/agents";
@@ -343,6 +344,75 @@ async function handleRevokeParticipantToken(
 	});
 }
 
+async function handleIssueUnreadToken(
+	ctx: AdminPostContext,
+): Promise<Response> {
+	const agentId = ctx.params.id ?? "";
+	const result = await issueAgentToken(ctx.env.DB, {
+		agentId,
+		purpose: "unread_count",
+		actor: actorFrom(ctx),
+		now: ctx.now,
+	});
+	if (!result.ok) {
+		return renderAgentsList(ctx, {
+			status: errorStatus(result.code),
+			flash: { kind: "error", message: result.message },
+		});
+	}
+
+	const agents = await listAgentsWithStatus(ctx.env.DB, ctx.now);
+	const agentName =
+		agents.find((item) => item.agent.id === agentId)?.agent.name ?? agentId;
+
+	return adminPageResponse({
+		title: "件数確認トークン発行",
+		currentPath: AGENTS_PATH,
+		user: ctx.user,
+		devMode: ctx.devMode,
+		flash: {
+			kind: "success",
+			message: `「${agentName}」の件数確認トークンを発行しました`,
+		},
+		body: renderIssuedUnreadTokenBody({
+			agentName,
+			token: result.data.token,
+			revokedPrevious: result.data.revokedPrevious,
+			unreadUrl: `${ctx.url.origin}/unread`,
+		}),
+	});
+}
+
+async function handleRevokeUnreadToken(
+	ctx: AdminPostContext,
+): Promise<Response> {
+	const result = await revokeAgentTokens(ctx.env.DB, {
+		agentId: ctx.params.id ?? "",
+		purpose: "unread_count",
+		actor: actorFrom(ctx),
+		now: ctx.now,
+	});
+	if (!result.ok) {
+		return renderAgentsList(ctx, {
+			status: errorStatus(result.code),
+			flash: { kind: "error", message: result.message },
+		});
+	}
+
+	return renderAgentsList(ctx, {
+		flash:
+			result.data.revokedCount > 0
+				? {
+						kind: "success",
+						message: "件数確認トークンを失効させました",
+					}
+				: {
+						kind: "info",
+						message: "有効な件数確認トークンはありませんでした",
+					},
+	});
+}
+
 export function agentRoutes(): AdminRoute[] {
 	return [
 		{
@@ -374,6 +444,14 @@ export function agentRoutes(): AdminRoute[] {
 		{
 			pattern: "/admin/agents/:id/token/revoke",
 			post: handleRevokeParticipantToken,
+		},
+		{
+			pattern: "/admin/agents/:id/unread-token",
+			post: handleIssueUnreadToken,
+		},
+		{
+			pattern: "/admin/agents/:id/unread-token/revoke",
+			post: handleRevokeUnreadToken,
 		},
 	];
 }

@@ -17,6 +17,13 @@ export interface IssuedTokenView {
 	mcpUrl: string;
 }
 
+export interface IssuedUnreadTokenView {
+	agentName: string;
+	token: string;
+	revokedPrevious: boolean;
+	unreadUrl: string;
+}
+
 function agentActionPath(agentId: string, suffix = ""): string {
 	return `/admin/agents/${encodeURIComponent(agentId)}${suffix}`;
 }
@@ -69,6 +76,52 @@ function renderParticipantTokenSection(
 				<form class="inline-form" method="POST" action="${agentActionPath(agent.id, "/token/revoke")}">
 					${csrfInput(csrfToken)}
 					<button type="submit" class="btn btn-danger">参加者トークンを失効</button>
+				</form>
+			</div>
+		</div>
+	`;
+}
+
+function renderUnreadTokenSection(
+	entry: AgentWithStatus,
+	csrfToken: string,
+): SafeHtml {
+	const { agent, activeTokens } = entry;
+	const token = activeTokens.unread_count;
+
+	if (token === null) {
+		return html`
+			<div class="stack">
+				<div>
+					<strong>件数確認トークン（<code>unread_count</code>）:</strong>
+					<span class="badge">未発行</span>
+				</div>
+				<form method="POST" action="${agentActionPath(agent.id, "/unread-token")}">
+					${csrfInput(csrfToken)}
+					<button type="submit" class="btn btn-primary">件数確認トークンを発行</button>
+				</form>
+			</div>
+		`;
+	}
+
+	return html`
+		<div class="stack">
+			<div>
+				<strong>件数確認トークン（<code>unread_count</code>）:</strong>
+				<span class="badge badge-ok">有効</span>
+				<span class="muted">（発行日時: ${formatTimestamp(token.createdAt)}）</span>
+			</div>
+			<div class="banner banner-warning" role="note">
+				注意: 件数確認トークンを再発行すると、現在有効な件数確認トークンは即座に無効になります。
+			</div>
+			<div class="actions">
+				<form class="inline-form" method="POST" action="${agentActionPath(agent.id, "/unread-token")}">
+					${csrfInput(csrfToken)}
+					<button type="submit" class="btn btn-primary">件数確認トークンを再発行</button>
+				</form>
+				<form class="inline-form" method="POST" action="${agentActionPath(agent.id, "/unread-token/revoke")}">
+					${csrfInput(csrfToken)}
+					<button type="submit" class="btn btn-danger">件数確認トークンを失効</button>
 				</form>
 			</div>
 		</div>
@@ -133,6 +186,8 @@ function renderAgentCard(entry: AgentWithStatus, csrfToken: string): SafeHtml {
 
 			${renderParticipantTokenSection(entry, csrfToken)}
 
+			${renderUnreadTokenSection(entry, csrfToken)}
+
 			<div class="actions">
 				${statusForm}
 				<a class="btn btn-danger" href="${agentActionPath(agent.id, "/delete")}">削除…</a>
@@ -170,7 +225,7 @@ export function renderAgentsPageBody(options: {
 			<div>
 				<h1>エージェント管理（${options.agents.length}件）</h1>
 				<p class="muted">
-					エージェントの登録・編集・停止/再開・削除と、MCP 接続用の参加者トークン発行を行います。
+					エージェントの登録・編集・停止/再開・削除と、MCP 接続用の参加者トークン・未読件数確認用の件数確認トークン発行を行います。
 				</p>
 			</div>
 
@@ -259,6 +314,10 @@ export function renderDeleteConfirmBody(options: {
 					<strong>参加者トークン:</strong>
 					${activeTokens.participant === null ? "未発行" : "有効なトークンあり（同時に削除されます）"}
 				</div>
+				<div>
+					<strong>件数確認トークン:</strong>
+					${activeTokens.unread_count === null ? "未発行" : "有効なトークンあり（同時に削除されます）"}
+				</div>
 				<div class="actions">
 					<form class="inline-form" method="POST" action="${agentActionPath(agent.id, "/delete")}">
 						${csrfInput(options.csrfToken)}
@@ -300,6 +359,48 @@ export function renderIssuedTokenBody(view: IssuedTokenView): SafeHtml {
 					</p>
 					<ul>
 						<li>接続先 URL: <code>${view.mcpUrl}</code></li>
+						<li>ヘッダー: <code>Authorization: Bearer &lt;コピーしたトークン&gt;</code></li>
+					</ul>
+				</div>
+				<div class="actions">
+					<a class="btn btn-primary" href="/admin/agents">エージェント一覧へ戻る</a>
+				</div>
+			</section>
+		</div>
+	`;
+}
+
+export function renderIssuedUnreadTokenBody(
+	view: IssuedUnreadTokenView,
+): SafeHtml {
+	return html`
+		<div class="stack">
+			<div>
+				<h1>件数確認トークン（<code>unread_count</code>）を発行しました</h1>
+				<p class="muted">対象エージェント: <strong>${view.agentName}</strong></p>
+			</div>
+
+			${
+				view.revokedPrevious
+					? html`
+						<div class="banner banner-warning" role="status">
+							以前の件数確認トークンは即座に無効になりました。定期確認スクリプト側の設定を新しいトークンへ差し替えてください。
+						</div>
+					`
+					: false
+			}
+
+			<section class="card stack">
+				<div class="banner banner-info">
+					このトークンの平文はセキュリティ上、今この画面に一度だけ表示されます。サーバーにはハッシュ値のみが保存されるため、画面を閉じると再表示できません。
+				</div>
+				<div class="token-box">${view.token}</div>
+				<div>
+					<p>
+						このトークンは VM 上の定期確認スクリプト（ポーリング）向けに配置する前提の低権限トークンです。未読件数（<code>{"unread": 件数}</code>）のみを取得でき、メッセージ本文の閲覧や <code>/mcp</code> の呼び出しはできません。
+					</p>
+					<ul>
+						<li>呼び出し先: <code>GET ${view.unreadUrl}</code></li>
 						<li>ヘッダー: <code>Authorization: Bearer &lt;コピーしたトークン&gt;</code></li>
 					</ul>
 				</div>
