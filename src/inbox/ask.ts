@@ -1,6 +1,6 @@
 import { insertMessage, newId } from "../db";
 import type { UnixMillis } from "../types";
-import { QUESTION_TTL_MS } from "./constants";
+import { BRIDGE_REJECTION_DELAY_MS, QUESTION_TTL_MS } from "./constants";
 import { rejectionFor } from "./rejection";
 
 export interface SubmitQuestionInput {
@@ -40,6 +40,7 @@ export async function submitQuestion(
 		receivedAt: null,
 		expiresAt,
 		bodyDeletedAt: null,
+		availableAt: null,
 	}).run();
 	return { questionId, expiresAt };
 }
@@ -54,9 +55,10 @@ export interface RecordBlockedQuestionInput {
 }
 
 /**
- * Records a question the bridge rejected and puts a rejection into the
+ * Records a question the bridge rejected and puts a delayed rejection into the
  * asker's inbox, in one transaction. The question row counts toward the
- * asker's daily limit and is never delivered.
+ * asker's daily limit and is never delivered; the rejection becomes visible
+ * after `BRIDGE_REJECTION_DELAY_MS` (design 3.4).
  *
  * The body is deliberately not taken: a blocked question is never handed to
  * anyone, so the bridge has no reason to keep its text.
@@ -80,6 +82,7 @@ export async function recordBlockedQuestion(
 			receivedAt: null,
 			expiresAt: null,
 			bodyDeletedAt: null,
+			availableAt: null,
 		}),
 		insertMessage(
 			db,
@@ -87,6 +90,7 @@ export async function recordBlockedQuestion(
 				questionId,
 				askerAgentId: input.fromAgentId,
 				now: input.now,
+				availableAt: input.now + BRIDGE_REJECTION_DELAY_MS,
 			}),
 		),
 	]);

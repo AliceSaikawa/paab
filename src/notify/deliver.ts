@@ -5,13 +5,14 @@ import {
 	type WebhookDeliveryRow,
 	webhookDeliveryFromRow,
 } from "../db";
+import { BRIDGE_REJECTION_DELAY_MS } from "../inbox/constants";
 import type { AgentWebhook, UnixMillis, WebhookDelivery } from "../types";
 import { buildWebhookHeaders, WAKE_PAYLOAD } from "./sign";
 import { validateCustomHeaderName, validateWebhookUrl } from "./validate";
 
 export const WEBHOOK_MAX_ATTEMPTS = 3;
 export const WEBHOOK_RETRY_DELAYS_MS = [0, 60_000, 300_000] as const;
-export const WEBHOOK_BLOCKED_DELAY_MS = 60_000;
+export const WEBHOOK_BLOCKED_DELAY_MS = BRIDGE_REJECTION_DELAY_MS;
 export const WEBHOOK_TIMEOUT_MS = 5_000;
 export const DEFAULT_DUE_WEBHOOK_LIMIT = 8;
 export const WEBHOOK_IN_FLIGHT_LEASE_MS = 10_000;

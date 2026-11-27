@@ -16,6 +16,7 @@ export function rejectionFor(input: {
 	questionId: string;
 	askerAgentId: string;
 	now: UnixMillis;
+	availableAt: UnixMillis | null;
 }): Message {
 	return {
 		id: newId(),
@@ -30,5 +31,6 @@ export function rejectionFor(input: {
 		receivedAt: null,
 		expiresAt: null,
 		bodyDeletedAt: null,
+		availableAt: input.availableAt,
 	};
 }

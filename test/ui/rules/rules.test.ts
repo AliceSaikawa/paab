@@ -8,6 +8,7 @@ import {
 } from "../../../src/admin";
 import { queryAuditLog } from "../../../src/audit";
 import { issueToken } from "../../../src/auth";
+import { BRIDGE_REJECTION_DELAY_MS } from "../../../src/inbox";
 import { handleAdminRequest, type UiEnv } from "../../../src/ui";
 import { createTestDb } from "../../helpers/db";
 import { seedAgent, seedCategory, T0 } from "../../helpers/fixtures";
@@ -240,9 +241,15 @@ describe("Allow rules lifecycle via /admin/rules and MCP tools", () => {
 		expect(withoutFooter((await call(aliceClient, "check_inbox")).text)).toBe(
 			"no new messages",
 		);
-		expect(
-			withoutFooter((await call(bobClient, "check_inbox")).text),
-		).toContain("kind: rejection");
+		expect(withoutFooter((await call(bobClient, "check_inbox")).text)).toBe(
+			"no new messages",
+		);
+		const bobLater = await connect(bobTok.token, {
+			now: T0 + BRIDGE_REJECTION_DELAY_MS,
+		});
+		expect(withoutFooter((await call(bobLater, "check_inbox")).text)).toContain(
+			"kind: rejection",
+		);
 
 		// Advisory notice does not block granting "その他".
 		const grantOther = await adminPost(
@@ -301,8 +308,14 @@ describe("Allow rules lifecycle via /admin/rules and MCP tools", () => {
 		expect(withoutFooter((await call(bobClient, "check_inbox")).text)).toBe(
 			"no new messages",
 		);
+		expect(withoutFooter((await call(aliceClient, "check_inbox")).text)).toBe(
+			"no new messages",
+		);
+		const aliceLater = await connect(aliceTok.token, {
+			now: T0 + BRIDGE_REJECTION_DELAY_MS,
+		});
 		expect(
-			withoutFooter((await call(aliceClient, "check_inbox")).text),
+			withoutFooter((await call(aliceLater, "check_inbox")).text),
 		).toContain("kind: rejection");
 
 		const blockedAudits = (

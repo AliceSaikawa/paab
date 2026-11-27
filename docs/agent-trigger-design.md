@@ -58,9 +58,11 @@ paab の受信箱が正本であり、トリガーは通知の欠落を許容す
 | 契機 | 対象ファイル（現行 `main`） | 通知先 | 送信タイミング | 理由 |
 | --- | --- | --- | --- | --- |
 | `ask` が許可された | `src/inbox/ask.ts`（`submitQuestion`） | 宛先エージェント | 即時（`ctx.waitUntil`） | 宛先へ質問到着を速やかに伝える |
-| `ask` がルール等で拒否された | `src/inbox/ask.ts`（`recordBlockedQuestion`） | 質問元エージェント | 遅延（60 秒後、cron または次回処理） | [設計書 3.4 節](design.md#34-拒否の伝え方確定) に従い、ブリッジ拒否と回答側拒否を応答時刻の差で見分けさせない |
+| `ask` がルール等で拒否された | `src/inbox/ask.ts`（`recordBlockedQuestion`） | 質問元エージェント | 遅延（60 秒後、cron または次回処理） | [設計書 3.4 節](design.md#34-拒否の伝え方確定) に従い、ブリッジ拒否と回答側拒否を応答時刻や未読件数の差で見分けさせない |
 | `answer` で回答または拒否された | `src/inbox/answer.ts`（`answerQuestion`） | 質問元エージェント | 即時（`ctx.waitUntil`） | 質問元へ結果到着を伝える |
 | 定期実行で質問が期限切れになった | `src/inbox/maintenance.ts`（`expireQuestions`） | 質問元エージェント | 定期実行内 | 期限切れの `rejection` が質問元の受信箱へ追加されるため |
+
+ブリッジによる拒否メッセージには、遅延 Webhook 通知と同じ 60 秒の遅延定数（`BRIDGE_REJECTION_DELAY_MS`）で `messages.available_at = now + 60 秒` を設定する。これにより、60 秒が経過するまで `check_inbox`、ツール応答末尾の `unread_messages`、`GET /unread` のいずれにも現れず、遅延 Webhook 通知と同時に可視化される。回答側による `decline` と期限切れによる拒否は `available_at = NULL` とし、即時可視のままとする。
 
 Worker の `fetch` ハンドラ（`src/index.ts`）は `ExecutionContext` を `handleMcpRequest` へ渡し、即時通知の初回送信を `ctx.waitUntil` で実行する。MCP レスポンス自体は Webhook 完了を待たずに返す。
 

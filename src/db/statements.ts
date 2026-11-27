@@ -83,8 +83,8 @@ export function insertMessage(
 		.prepare(
 			`INSERT INTO messages
 				(id, kind, from_agent_id, to_agent_id, category_id, body, in_reply_to,
-				status, created_at, received_at, expires_at, body_deleted_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				status, created_at, received_at, expires_at, body_deleted_at, available_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		)
 		.bind(
 			message.id,
@@ -99,6 +99,7 @@ export function insertMessage(
 			message.receivedAt,
 			message.expiresAt,
 			message.bodyDeletedAt,
+			message.availableAt,
 		);
 }
 

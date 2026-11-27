@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
 	answerQuestion,
+	BRIDGE_REJECTION_DELAY_MS,
+	countUnread,
 	fetchInbox,
 	type InboxItem,
 	recordBlockedQuestion,
@@ -54,6 +56,62 @@ describe("a question the bridge blocked", () => {
 			category_id: null,
 		});
 		expect(await repliesTo(db, questionId)).toHaveLength(1);
+	});
+
+	it("hides its rejection until BRIDGE_REJECTION_DELAY_MS elapses", async () => {
+		expect(BRIDGE_REJECTION_DELAY_MS).toBe(60_000);
+		const { questionId } = await recordBlockedQuestion(db, {
+			fromAgentId: world.asker.id,
+			toAgentId: world.responder.id,
+			categoryId: world.category.id,
+			now: T0,
+		});
+
+		expect(await countUnread(db, world.asker.id, T0)).toBe(0);
+		expect(await fetchInbox(db, world.asker.id, T0)).toEqual([]);
+
+		const justBefore = T0 + BRIDGE_REJECTION_DELAY_MS - 1;
+		expect(await countUnread(db, world.asker.id, justBefore)).toBe(0);
+		expect(await fetchInbox(db, world.asker.id, justBefore)).toEqual([]);
+
+		const atBoundary = T0 + BRIDGE_REJECTION_DELAY_MS;
+		expect(await countUnread(db, world.asker.id, atBoundary)).toBe(1);
+		expect(await fetchInbox(db, world.asker.id, atBoundary)).toEqual([
+			{
+				kind: "rejection",
+				id: expect.any(String),
+				inReplyTo: questionId,
+			},
+		]);
+		expect(await countUnread(db, world.asker.id, atBoundary)).toBe(0);
+	});
+
+	it("orders a delayed bridge rejection by availability time rather than earlier creation time", async () => {
+		const blocked = await recordBlockedQuestion(db, {
+			fromAgentId: world.asker.id,
+			toAgentId: world.responder.id,
+			categoryId: world.category.id,
+			now: T0,
+		});
+		const allowed = await ask(world, T0 + 10_000, "Are you free?");
+		const answered = await answerQuestion(db, {
+			questionId: allowed.questionId,
+			responderAgentId: world.responder.id,
+			reply: { kind: "answer", body: "Yes." },
+			now: T0 + 20_000,
+		});
+		expect(answered.ok).toBe(true);
+
+		const items = await fetchInbox(
+			db,
+			world.asker.id,
+			T0 + BRIDGE_REJECTION_DELAY_MS + 10_000,
+		);
+		expect(
+			items.map((item) =>
+				item.kind === "question" ? item.id : item.inReplyTo,
+			),
+		).toEqual([allowed.questionId, blocked.questionId]);
 	});
 });
 
@@ -129,15 +187,21 @@ describe("the three kinds of rejection", () => {
 		}
 	});
 
-	it("are stored the same way, apart from IDs and creation time", async () => {
+	it("are stored the same way, apart from IDs, creation time, and bridge visibility delay", async () => {
 		const questions = await rejectInEveryWay();
-		for (const questionId of Object.values(questions)) {
+		for (const [label, questionId] of Object.entries(questions)) {
 			const [rejection, ...rest] = await repliesTo(db, questionId);
 			expect(rest).toEqual([]);
-			const { id, in_reply_to, created_at, ...common } = rejection;
+			const { id, in_reply_to, created_at, available_at, ...common } =
+				rejection;
 			expect(id).not.toBe(questionId);
 			expect(in_reply_to).toBe(questionId);
 			expect(created_at).toBeGreaterThanOrEqual(T0);
+			if (label === "blocked" || label === "blockedUnknown") {
+				expect(available_at).toBe(T0 + BRIDGE_REJECTION_DELAY_MS);
+			} else {
+				expect(available_at).toBeNull();
+			}
 			expect(common).toEqual({
 				kind: "rejection",
 				from_agent_id: null,
@@ -150,5 +214,27 @@ describe("the three kinds of rejection", () => {
 				body_deleted_at: null,
 			});
 		}
+	});
+
+	it("keeps recipient declines immediately visible while delaying bridge rejections", async () => {
+		const declined = await ask(world, T0);
+		const result = await answerQuestion(db, {
+			questionId: declined.questionId,
+			responderAgentId: world.responder.id,
+			reply: { kind: "decline" },
+			now: T0 + 1_000,
+		});
+		expect(result.ok).toBe(true);
+
+		const [row] = await repliesTo(db, declined.questionId);
+		expect(row?.available_at).toBeNull();
+		expect(await countUnread(db, world.asker.id, T0 + 1_000)).toBe(1);
+		expect(await fetchInbox(db, world.asker.id, T0 + 1_000)).toEqual([
+			{
+				kind: "rejection",
+				id: expect.any(String),
+				inReplyTo: declined.questionId,
+			},
+		]);
 	});
 });

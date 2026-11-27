@@ -8,7 +8,7 @@ import {
 	createMcpWorld,
 	type McpWorld,
 	questionIdOf,
-	withoutFooter,
+	unreadCount,
 } from "./support";
 
 let world: McpWorld;
@@ -44,10 +44,13 @@ describe("ask", () => {
 		});
 
 		const normalize = (text: string) =>
-			withoutFooter(text).replace(questionIdOf(text), "<id>");
+			text.replace(questionIdOf(text), "<id>");
 		expect(allowed.isError).toBe(false);
 		expect(noRule).toMatchObject({ isError: false });
 		expect(unknownRecipient).toMatchObject({ isError: false });
+		expect(unreadCount(allowed.text)).toBe(0);
+		expect(unreadCount(noRule.text)).toBe(0);
+		expect(unreadCount(unknownRecipient.text)).toBe(0);
 		expect(normalize(noRule.text)).toBe(normalize(allowed.text));
 		expect(normalize(unknownRecipient.text)).toBe(normalize(allowed.text));
 		expect(normalize(allowed.text)).toContain("check_inbox");

@@ -1,7 +1,8 @@
 import type { Client } from "@modelcontextprotocol/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { BRIDGE_REJECTION_DELAY_MS } from "../../src/inbox";
 import { DAY_MS, HOUR_MS, T0 } from "../helpers/fixtures";
-import { call, questionIdOf, withoutFooter } from "../mcp/support";
+import { call, questionIdOf, unreadCount, withoutFooter } from "../mcp/support";
 import {
 	ANSWER,
 	auditLog,
@@ -114,10 +115,16 @@ describe("a question and its answer", () => {
 });
 
 describe("a question the bridge does not allow", () => {
-	it("in a category without a rule never reaches bob, and alice gets a rejection", async () => {
+	it("in a category without a rule never reaches bob, and alice gets a rejection after the delay", async () => {
 		const questionId = await ask(alice, "bob", "健康");
 
 		expect(await inbox(bob)).toEqual([]);
+		expect(await inbox(alice)).toEqual([]);
+
+		vi.setSystemTime(T0 + BRIDGE_REJECTION_DELAY_MS - 1);
+		expect(await inbox(alice)).toEqual([]);
+
+		vi.setSystemTime(T0 + BRIDGE_REJECTION_DELAY_MS);
 		expect(await inbox(alice)).toEqual([rejectionOf(questionId)]);
 		expect(await auditLog()).toMatchObject([
 			{
@@ -135,6 +142,9 @@ describe("a question the bridge does not allow", () => {
 		const questionId = await ask(bob, "alice", "予定");
 
 		expect(await inbox(alice)).toEqual([]);
+		expect(await inbox(bob)).toEqual([]);
+
+		vi.setSystemTime(T0 + BRIDGE_REJECTION_DELAY_MS);
 		expect(await inbox(bob)).toEqual([rejectionOf(questionId)]);
 	});
 
@@ -156,6 +166,9 @@ describe("a question the bridge does not allow", () => {
 
 		const delivered = (await inbox(bob)).map(questionIdOf);
 		expect(delivered.sort()).toEqual([first, second].sort());
+		expect(await inbox(alice)).toEqual([]);
+
+		vi.setSystemTime(T0 + BRIDGE_REJECTION_DELAY_MS);
 		expect(await inbox(alice)).toEqual([rejectionOf(overLimit)]);
 		expect(await auditLog()).toContainEqual(
 			expect.objectContaining({
@@ -185,9 +198,9 @@ describe("a rejection", () => {
 			category: "健康",
 			question: QUESTION,
 		});
-		expect(maskIds(withoutFooter(toBlock.text))).toBe(
-			maskIds(withoutFooter(toDecline.text)),
-		);
+		expect(unreadCount(toDecline.text)).toBe(0);
+		expect(unreadCount(toBlock.text)).toBe(0);
+		expect(maskIds(toBlock.text)).toBe(maskIds(toDecline.text));
 		expect(toBlock.isError).toBe(toDecline.isError);
 
 		const declined = await call(bob, "answer", {
@@ -196,6 +209,7 @@ describe("a rejection", () => {
 		});
 		expect(declined.isError).toBe(false);
 
+		vi.setSystemTime(T0 + BRIDGE_REJECTION_DELAY_MS);
 		const received = await call(alice, "check_inbox");
 		const rejections = inboxMessages(received.text);
 		expect(rejections).toHaveLength(2);

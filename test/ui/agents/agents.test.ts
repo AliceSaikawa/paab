@@ -757,6 +757,7 @@ describe("/admin/agents UI", () => {
 				receivedAt: null,
 				expiresAt: T0 + 7 * DAY_MS,
 				bodyDeletedAt: null,
+				availableAt: null,
 			}),
 			insertMessage(db, {
 				id: newId(),
@@ -771,6 +772,7 @@ describe("/admin/agents UI", () => {
 				receivedAt: null,
 				expiresAt: T0 + 7 * DAY_MS,
 				bodyDeletedAt: null,
+				availableAt: null,
 			}),
 		]);
 

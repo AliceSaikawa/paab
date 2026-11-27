@@ -83,6 +83,7 @@ export interface MessageRow {
 	received_at: number | null;
 	expires_at: number | null;
 	body_deleted_at: number | null;
+	available_at: number | null;
 }
 
 export interface AuditLogRow {
@@ -225,6 +226,7 @@ export function messageFromRow(row: MessageRow): Message {
 		receivedAt: row.received_at,
 		expiresAt: row.expires_at,
 		bodyDeletedAt: row.body_deleted_at,
+		availableAt: row.available_at ?? null,
 	};
 }
 
