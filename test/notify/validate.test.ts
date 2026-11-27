@@ -46,7 +46,7 @@ describe("validateWebhookUrl", () => {
 		}
 	});
 
-	it("rejects localhost, internal suffixes, and single-label hostnames", () => {
+	it("rejects localhost, internal suffixes, leading-dot, and single-label hostnames", () => {
 		const invalid = [
 			"https://localhost/wake",
 			"https://localhost./wake",
@@ -56,6 +56,8 @@ describe("validateWebhookUrl", () => {
 			"https://router.home.arpa/wake",
 			"https://intranet/wake",
 			"https://metadata/computeMetadata/v1/",
+			"https://.example.com/hook",
+			"https://..example.com/hook",
 		];
 		for (const raw of invalid) {
 			const result = validateWebhookUrl(raw);
@@ -269,10 +271,21 @@ describe("webhook secrets validation and generation", () => {
 			"secret\0null",
 			"secret\twith-tab",
 			"日本語トークン",
+			" secret",
+			"secret ",
+			" secret ",
 		];
 		for (const raw of invalid) {
 			expect(validateExternalSecret(raw).ok, raw).toBe(false);
 		}
+		expect(validateExternalSecret(" secret")).toEqual({
+			ok: false,
+			message: "認証シークレットの前後に空白は含められません",
+		});
+		expect(validateExternalSecret("secret ")).toEqual({
+			ok: false,
+			message: "認証シークレットの前後に空白は含められません",
+		});
 	});
 
 	it("generates distinct 256-bit paab_whsec_ secrets", () => {

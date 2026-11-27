@@ -1,6 +1,7 @@
 export {
 	type AttemptWebhookOptions,
 	attemptWebhookDelivery,
+	DEFAULT_DUE_WEBHOOK_LIMIT,
 	type EnqueueWakeInput,
 	enqueueWake,
 	type NotifyAgentImmediatelyOptions,
@@ -12,6 +13,7 @@ export {
 	sanitizeWebhookError,
 	scheduleDelayedWake,
 	WEBHOOK_BLOCKED_DELAY_MS,
+	WEBHOOK_IN_FLIGHT_LEASE_MS,
 	WEBHOOK_MAX_ATTEMPTS,
 	WEBHOOK_RETRY_DELAYS_MS,
 	WEBHOOK_TIMEOUT_MS,

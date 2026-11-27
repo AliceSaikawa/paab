@@ -74,6 +74,14 @@ export async function setAgentStatus(
 	const updated: Agent = { ...agent, status };
 	await db.execute([
 		sql("UPDATE agents SET status = ? WHERE id = ?", status, agent.id),
+		...(status === "suspended"
+			? [
+					sql(
+						"DELETE FROM webhook_deliveries WHERE agent_id = ? AND status = 'pending'",
+						agent.id,
+					),
+				]
+			: []),
 		insertChangeLogSql({
 			occurredAt: now,
 			actorType: "owner",

@@ -3,8 +3,13 @@ import { revokeAgentTokens, setAgentStatus } from "../../scripts/lib/admin";
 import { CliError } from "../../scripts/lib/sql";
 import { issueParticipantToken } from "../../scripts/lib/token";
 import { authenticate } from "../../src/auth";
-import { type ChangeLogRow, changeLogEntryFromRow } from "../../src/db";
+import {
+	type ChangeLogRow,
+	changeLogEntryFromRow,
+	upsertAgentWebhook,
+} from "../../src/db";
 import { handleMcpRequest } from "../../src/mcp";
+import { enqueueWake } from "../../src/notify";
 import type { Agent } from "../../src/types";
 import { createTestDb } from "../helpers/db";
 import { seedAgent, T0 } from "../helpers/fixtures";
@@ -118,6 +123,49 @@ describe("setAgentStatus", () => {
 		await setAgentStatus(d1Client(db), "muse", "active");
 		const resumedRes = await handleMcpRequest(post(), mcpEnv, T0 + 2);
 		expect(resumedRes.status).toBe(200);
+	});
+
+	it("deletes pending webhook_deliveries for the agent when suspending while preserving other agents", async () => {
+		const grok = await seedAgent(db, { name: "grok" });
+		await db.batch([
+			upsertAgentWebhook(db, {
+				agentId: muse.id,
+				url: "https://hooks.example.com/muse",
+				authMode: "paab_hmac",
+				secret: `paab_whsec_${"aa".repeat(32)}`,
+				createdAt: T0,
+				updatedAt: T0,
+			}),
+			upsertAgentWebhook(db, {
+				agentId: grok.id,
+				url: "https://hooks.example.com/grok",
+				authMode: "paab_hmac",
+				secret: `paab_whsec_${"bb".repeat(32)}`,
+				createdAt: T0,
+				updatedAt: T0,
+			}),
+		]);
+		await enqueueWake(db, { agentId: muse.id, now: T0 });
+		await enqueueWake(db, { agentId: grok.id, now: T0 });
+
+		expect(
+			await setAgentStatus(d1Client(db), "muse", "suspended", T0 + 1),
+		).toBe(true);
+
+		const musePending = await db
+			.prepare(
+				"SELECT COUNT(*) AS n FROM webhook_deliveries WHERE agent_id = ? AND status = 'pending'",
+			)
+			.bind(muse.id)
+			.first<{ n: number }>();
+		const grokPending = await db
+			.prepare(
+				"SELECT COUNT(*) AS n FROM webhook_deliveries WHERE agent_id = ? AND status = 'pending'",
+			)
+			.bind(grok.id)
+			.first<{ n: number }>();
+		expect(musePending?.n).toBe(0);
+		expect(grokPending?.n).toBe(1);
 	});
 });
 

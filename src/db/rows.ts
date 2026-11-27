@@ -156,6 +156,7 @@ export interface WebhookDeliveryRow {
 	status: string;
 	attempts: number;
 	next_attempt_at: number;
+	leased_until: number | null;
 	last_error: string | null;
 	created_at: number;
 	updated_at: number;
@@ -440,6 +441,7 @@ export function webhookDeliveryFromRow(
 		status,
 		attempts: row.attempts,
 		nextAttemptAt: row.next_attempt_at,
+		leasedUntil: row.leased_until,
 		lastError: row.last_error,
 		createdAt: row.created_at,
 		updatedAt: row.updated_at,

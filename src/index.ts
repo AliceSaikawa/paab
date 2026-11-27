@@ -1,5 +1,10 @@
 import { handleAdminMcpRequest } from "./adminbot";
-import { handleMcpRequest, runScheduledMaintenance } from "./mcp";
+import {
+	handleMcpRequest,
+	runScheduledMaintenance,
+	runWebhookMaintenance,
+	WEBHOOK_POLL_CRON,
+} from "./mcp";
 import { handleAdminRequest } from "./ui";
 import { handleUnreadRequest } from "./unread";
 
@@ -31,10 +36,15 @@ export default {
 	},
 
 	async scheduled(
-		_event: ScheduledController,
+		event: ScheduledController,
 		env: Env,
 		ctx: ExecutionContext,
 	): Promise<void> {
-		ctx.waitUntil(runScheduledMaintenance(env, Date.now()));
+		const now = Date.now();
+		if (event.cron === WEBHOOK_POLL_CRON) {
+			ctx.waitUntil(runWebhookMaintenance(env, now));
+			return;
+		}
+		ctx.waitUntil(runScheduledMaintenance(env, now));
 	},
 };

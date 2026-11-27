@@ -231,9 +231,9 @@ export function insertWebhookDelivery(
 	return db
 		.prepare(
 			`INSERT INTO webhook_deliveries
-				(id, agent_id, status, attempts, next_attempt_at, last_error,
-				created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+				(id, agent_id, status, attempts, next_attempt_at, leased_until,
+				last_error, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		)
 		.bind(
 			delivery.id,
@@ -241,6 +241,7 @@ export function insertWebhookDelivery(
 			delivery.status,
 			delivery.attempts,
 			delivery.nextAttemptAt,
+			delivery.leasedUntil,
 			delivery.lastError,
 			delivery.createdAt,
 			delivery.updatedAt,

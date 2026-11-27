@@ -13,6 +13,9 @@ import {
 	type McpEnv,
 } from "./config";
 
+export const WEBHOOK_POLL_CRON = "* * * * *";
+export const HOURLY_MAINTENANCE_CRON = "0 * * * *";
+
 export interface ScheduledMaintenanceOptions {
 	webhookFetcher?: WebhookFetcher;
 }
@@ -28,6 +31,29 @@ function reportMaintenanceFailure(
 		});
 	} catch {
 		// Logging failures must not hide the underlying step error.
+	}
+}
+
+/**
+ * The per-minute cron job: processes due webhook deliveries and purges pending
+ * deliveries for suspended or unconfigured agents without querying `messages`,
+ * `audit_log`, or `proposals`.
+ */
+export async function runWebhookMaintenance(
+	env: McpEnv,
+	now: UnixMillis,
+	options?: ScheduledMaintenanceOptions,
+): Promise<void> {
+	try {
+		await processDueWebhooks(env.DB, {
+			now,
+			audit: auditBodyConfig(env),
+			allowInsecureLocalhost: allowInsecureLocalhostWebhook(env),
+			fetcher: options?.webhookFetcher,
+		});
+	} catch (error) {
+		reportMaintenanceFailure("webhooks", error);
+		throw error;
 	}
 }
 

@@ -24,6 +24,7 @@ CREATE TABLE webhook_deliveries (
 	status TEXT NOT NULL CHECK (status IN ('pending', 'delivered', 'abandoned')),
 	attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
 	next_attempt_at INTEGER NOT NULL,
+	leased_until INTEGER,
 	last_error TEXT,
 	created_at INTEGER NOT NULL,
 	updated_at INTEGER NOT NULL
@@ -33,7 +34,7 @@ CREATE UNIQUE INDEX webhook_deliveries_pending_agent_idx
 	ON webhook_deliveries (agent_id) WHERE status = 'pending';
 
 CREATE INDEX webhook_deliveries_due_idx
-	ON webhook_deliveries (next_attempt_at) WHERE status = 'pending';
+	ON webhook_deliveries (next_attempt_at, leased_until) WHERE status = 'pending';
 
 CREATE INDEX webhook_deliveries_agent_updated_idx
 	ON webhook_deliveries (agent_id, updated_at DESC);

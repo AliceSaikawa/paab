@@ -168,7 +168,7 @@ export async function listAgentWebhooks(
 			ORDER BY agent_id ASC`,
 		),
 		db.prepare(
-			`SELECT d.id, d.agent_id, d.status, d.attempts, d.next_attempt_at, d.last_error, d.created_at, d.updated_at
+			`SELECT d.id, d.agent_id, d.status, d.attempts, d.next_attempt_at, d.leased_until, d.last_error, d.created_at, d.updated_at
 			FROM webhook_deliveries d
 			WHERE d.rowid = (
 				SELECT d2.rowid
@@ -208,7 +208,7 @@ export async function getAgentWebhookSummary(
 			.bind(agentId),
 		db
 			.prepare(
-				`SELECT id, agent_id, status, attempts, next_attempt_at, last_error, created_at, updated_at
+				`SELECT id, agent_id, status, attempts, next_attempt_at, leased_until, last_error, created_at, updated_at
 				FROM webhook_deliveries
 				WHERE agent_id = ?
 				ORDER BY updated_at DESC, created_at DESC, rowid DESC

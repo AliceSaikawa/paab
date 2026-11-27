@@ -1,3 +1,8 @@
+import {
+	createExecutionContext,
+	createScheduledController,
+	waitOnExecutionContext,
+} from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import {
 	Client,
@@ -7,27 +12,34 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { configureAgentWebhook, suspendAgent } from "../../src/admin";
 import { AUDIT_BODY_RECORDING_DISABLED, queryAuditLog } from "../../src/audit";
 import {
+	insertAuditLogEntry,
 	upsertAgentWebhook,
 	type WebhookDeliveryRow,
 	webhookDeliveryFromRow,
 } from "../../src/db";
+import worker from "../../src/index";
 import {
+	HOURLY_MAINTENANCE_CRON,
 	handleMcpRequest,
 	type McpRequestOptions,
 	runScheduledMaintenance,
+	WEBHOOK_POLL_CRON,
 } from "../../src/mcp";
 import type { McpEnv } from "../../src/mcp/config";
 import {
 	attemptWebhookDelivery,
+	DEFAULT_DUE_WEBHOOK_LIMIT,
 	enqueueWake,
+	notifyAgentImmediately,
 	processDueWebhooks,
 	sanitizeWebhookError,
 	WAKE_PAYLOAD,
 	WEBHOOK_BLOCKED_DELAY_MS,
+	WEBHOOK_IN_FLIGHT_LEASE_MS,
 	WEBHOOK_RETRY_DELAYS_MS,
 	type WebhookFetcher,
 } from "../../src/notify";
-import { DAY_MS, T0 } from "../helpers/fixtures";
+import { DAY_MS, seedAgent, T0 } from "../helpers/fixtures";
 import {
 	askBob,
 	call,
@@ -903,5 +915,292 @@ describe("coalescing, suspended agents, retries, redirect rejection, and secret 
 		});
 		expect(suspended.ok).toBe(true);
 		expect(await listDeliveries(world.bob.agent.id)).toHaveLength(0);
+	});
+
+	it("prevents duplicate concurrent POSTs when a second notifyAgentImmediately arrives mid-flight on attempt 0", async () => {
+		await configureAgentWebhook(world.db, {
+			agentId: world.bob.agent.id,
+			url: "https://hooks.example.com/bob",
+			authMode: "standard_webhooks",
+			secret: WHSEC_KEY,
+			actor: OWNER,
+			now: T0,
+		});
+
+		let releaseFetch: (() => void) | undefined;
+		const seenIds: string[] = [];
+		const slowFetcher: WebhookFetcher = vi.fn((_input, init) => {
+			const headers = new Headers(init?.headers);
+			seenIds.push(headers.get("webhook-id") ?? "");
+			return new Promise<Response>((resolve) => {
+				releaseFetch = () => resolve(new Response("ok", { status: 200 }));
+			});
+		});
+
+		const pendingTasks: Promise<unknown>[] = [];
+		const waitUntil = (promise: Promise<unknown>) => {
+			pendingTasks.push(promise);
+		};
+
+		// First immediate notification starts attempt 0 and holds the lease in-flight.
+		await notifyAgentImmediately(world.db, {
+			agentId: world.bob.agent.id,
+			now: T0,
+			audit: AUDIT_BODY_RECORDING_DISABLED,
+			waitUntil,
+			fetcher: slowFetcher,
+		});
+		await vi.waitFor(() => expect(slowFetcher).toHaveBeenCalledTimes(1));
+
+		const midFlightRows = await listDeliveries(world.bob.agent.id);
+		expect(midFlightRows).toHaveLength(1);
+		expect(midFlightRows[0]?.attempts).toBe(0);
+		expect(midFlightRows[0]?.leasedUntil).toBe(T0 + WEBHOOK_IN_FLIGHT_LEASE_MS);
+
+		// Second immediate notification arrives while attempt 0 is still mid-flight.
+		// Must preserve leased_until and NOT schedule a second HTTP POST.
+		await notifyAgentImmediately(world.db, {
+			agentId: world.bob.agent.id,
+			now: T0 + 100,
+			audit: AUDIT_BODY_RECORDING_DISABLED,
+			waitUntil,
+			fetcher: slowFetcher,
+		});
+		expect(pendingTasks).toHaveLength(1);
+		expect(slowFetcher).toHaveBeenCalledTimes(1);
+
+		const stillLeased = await listDeliveries(world.bob.agent.id);
+		expect(stillLeased[0]?.leasedUntil).toBe(T0 + WEBHOOK_IN_FLIGHT_LEASE_MS);
+
+		releaseFetch?.();
+		await Promise.all(pendingTasks);
+
+		expect(slowFetcher).toHaveBeenCalledTimes(1);
+		expect(seenIds).toHaveLength(1);
+
+		const deliveredRows = await listDeliveries(world.bob.agent.id);
+		expect(deliveredRows).toHaveLength(1);
+		expect(deliveredRows[0]?.status).toBe("delivered");
+		expect(deliveredRows[0]?.attempts).toBe(1);
+		expect(deliveredRows[0]?.leasedUntil).toBeNull();
+	});
+
+	it("recovers crashed deliveries via processDueWebhooks once leased_until expires", async () => {
+		await configureAgentWebhook(world.db, {
+			agentId: world.bob.agent.id,
+			url: "https://hooks.example.com/bob",
+			authMode: "paab_hmac",
+			actor: OWNER,
+			now: T0,
+		});
+		const deliveryId = await enqueueWake(world.db, {
+			agentId: world.bob.agent.id,
+			now: T0,
+		});
+		const leaseExpiresAt = T0 + WEBHOOK_IN_FLIGHT_LEASE_MS;
+		// Simulate a worker that acquired the lease and crashed before recording an outcome.
+		await world.db
+			.prepare(
+				"UPDATE webhook_deliveries SET leased_until = ?, updated_at = ? WHERE id = ?",
+			)
+			.bind(leaseExpiresAt, T0, deliveryId)
+			.run();
+
+		const fetcher: WebhookFetcher = vi.fn(
+			async () => new Response("ok", { status: 200 }),
+		);
+
+		// Before lease expiration: skipped by due query.
+		const beforeExpiry = await processDueWebhooks(world.db, {
+			now: leaseExpiresAt - 1,
+			audit: AUDIT_BODY_RECORDING_DISABLED,
+			fetcher,
+		});
+		expect(beforeExpiry).toEqual({
+			purged: 0,
+			processed: 0,
+			delivered: 0,
+			retried: 0,
+			abandoned: 0,
+			skipped: 0,
+		});
+		expect(fetcher).not.toHaveBeenCalled();
+
+		// At/after lease expiration: picked up, delivered, and leased_until cleared.
+		const afterExpiry = await processDueWebhooks(world.db, {
+			now: leaseExpiresAt,
+			audit: AUDIT_BODY_RECORDING_DISABLED,
+			fetcher,
+		});
+		expect(afterExpiry).toEqual({
+			purged: 0,
+			processed: 1,
+			delivered: 1,
+			retried: 0,
+			abandoned: 0,
+			skipped: 0,
+		});
+		expect(fetcher).toHaveBeenCalledTimes(1);
+
+		const rows = await listDeliveries(world.bob.agent.id);
+		expect(rows).toHaveLength(1);
+		expect(rows[0]?.status).toBe("delivered");
+		expect(rows[0]?.leasedUntil).toBeNull();
+	});
+
+	it("separates per-minute webhook cron from hourly full maintenance in Worker scheduled", async () => {
+		await configureAgentWebhook(world.db, {
+			agentId: world.bob.agent.id,
+			url: "https://hooks.example.com/bob",
+			authMode: "paab_hmac",
+			actor: OWNER,
+			now: T0,
+		});
+
+		// Create an overdue question (expires at T0 + 7 days) and an audit row holding a body.
+		const alice = await connectWithOptions(world.alice.token, { now: T0 });
+		await askBob(alice, "Overdue question body");
+		await insertAuditLogEntry(world.db, {
+			occurredAt: T0,
+			eventType: "question_accepted",
+			fromAgentId: world.alice.agent.id,
+			toAgentId: world.bob.agent.id,
+			categoryId: world.schedule.id,
+			outcome: "ok",
+			reasonCode: null,
+			messageId: null,
+			body: "Audit body to purge on hourly cron",
+		}).run();
+
+		// Ensure one due webhook delivery is pending for Bob.
+		await enqueueWake(world.db, { agentId: world.bob.agent.id, now: T0 });
+
+		const dueNow = T0 + 7 * DAY_MS + 1;
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockImplementation(async () => new Response("ok", { status: 200 }));
+		vi.useFakeTimers({ toFake: ["Date"], now: dueNow });
+
+		try {
+			// 1. Per-minute cron ("* * * * *"): delivers due webhooks ONLY.
+			const minuteCtx = createExecutionContext();
+			await worker.scheduled(
+				createScheduledController({
+					cron: WEBHOOK_POLL_CRON,
+					scheduledTime: dueNow,
+				}),
+				env,
+				minuteCtx,
+			);
+			await waitOnExecutionContext(minuteCtx);
+
+			expect(fetchSpy).toHaveBeenCalledTimes(1);
+			expect((await listDeliveries(world.bob.agent.id))[0]?.status).toBe(
+				"delivered",
+			);
+
+			const qAfterMinute = await world.db
+				.prepare("SELECT status, body FROM messages WHERE kind = 'question'")
+				.first<{ status: string; body: string | null }>();
+			expect(qAfterMinute?.status).toBe("pending");
+			expect(qAfterMinute?.body).toBe("Overdue question body");
+
+			const auditBodyAfterMinute = await world.db
+				.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE body IS NOT NULL")
+				.first<{ n: number }>();
+			expect(auditBodyAfterMinute?.n).toBe(1);
+
+			// 2. Hourly cron ("0 * * * *"): expires overdue questions, purges audit bodies, and delivers due webhooks.
+			await enqueueWake(world.db, {
+				agentId: world.bob.agent.id,
+				now: dueNow,
+			});
+			const hourCtx = createExecutionContext();
+			await worker.scheduled(
+				createScheduledController({
+					cron: HOURLY_MAINTENANCE_CRON,
+					scheduledTime: dueNow,
+				}),
+				env,
+				hourCtx,
+			);
+			await waitOnExecutionContext(hourCtx);
+
+			expect(fetchSpy).toHaveBeenCalledTimes(2);
+
+			const qAfterHour = await world.db
+				.prepare("SELECT status, body FROM messages WHERE kind = 'question'")
+				.first<{ status: string; body: string | null }>();
+			expect(qAfterHour?.status).toBe("expired");
+			expect(qAfterHour?.body).toBeNull();
+
+			const auditBodyAfterHour = await world.db
+				.prepare("SELECT COUNT(*) AS n FROM audit_log WHERE body IS NOT NULL")
+				.first<{ n: number }>();
+			expect(auditBodyAfterHour?.n).toBe(0);
+		} finally {
+			vi.useRealTimers();
+			fetchSpy.mockRestore();
+		}
+	});
+
+	it("processes at most DEFAULT_DUE_WEBHOOK_LIMIT (8) due deliveries per processDueWebhooks call by default", async () => {
+		expect(DEFAULT_DUE_WEBHOOK_LIMIT).toBe(8);
+
+		for (let i = 0; i < 10; i += 1) {
+			const agent = await seedAgent(world.db, { name: `agent-batch-${i}` });
+			await configureAgentWebhook(world.db, {
+				agentId: agent.id,
+				url: `https://hooks.example.com/agent-${i}`,
+				authMode: "paab_hmac",
+				actor: OWNER,
+				now: T0,
+			});
+			await enqueueWake(world.db, {
+				agentId: agent.id,
+				now: T0 + i,
+			});
+		}
+
+		const fetcher: WebhookFetcher = vi.fn(
+			async () => new Response("ok", { status: 200 }),
+		);
+
+		const firstPass = await processDueWebhooks(world.db, {
+			now: T0 + 100,
+			audit: AUDIT_BODY_RECORDING_DISABLED,
+			fetcher,
+		});
+		expect(firstPass).toEqual({
+			purged: 0,
+			processed: 8,
+			delivered: 8,
+			retried: 0,
+			abandoned: 0,
+			skipped: 0,
+		});
+		expect(fetcher).toHaveBeenCalledTimes(8);
+
+		const remainingBeforeSecond = await world.db
+			.prepare(
+				"SELECT COUNT(*) AS n FROM webhook_deliveries WHERE status = 'pending'",
+			)
+			.first<{ n: number }>();
+		expect(remainingBeforeSecond?.n).toBe(2);
+
+		const secondPass = await processDueWebhooks(world.db, {
+			now: T0 + 100,
+			audit: AUDIT_BODY_RECORDING_DISABLED,
+			fetcher,
+		});
+		expect(secondPass).toEqual({
+			purged: 0,
+			processed: 2,
+			delivered: 2,
+			retried: 0,
+			abandoned: 0,
+			skipped: 0,
+		});
+		expect(fetcher).toHaveBeenCalledTimes(10);
 	});
 });

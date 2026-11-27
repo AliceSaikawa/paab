@@ -331,6 +331,7 @@ export interface WebhookDelivery {
 	status: WebhookDeliveryStatus;
 	attempts: number;
 	nextAttemptAt: UnixMillis;
+	leasedUntil: UnixMillis | null;
 	lastError: string | null;
 	createdAt: UnixMillis;
 	updatedAt: UnixMillis;

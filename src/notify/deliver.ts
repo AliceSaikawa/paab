@@ -1,12 +1,11 @@
 import { type AuditBodyConfig, recordAuditEvent } from "../audit";
 import {
-	type AgentWebhookRow,
 	agentWebhookFromRow,
 	newId,
 	type WebhookDeliveryRow,
 	webhookDeliveryFromRow,
 } from "../db";
-import type { AgentWebhook, UnixMillis } from "../types";
+import type { AgentWebhook, UnixMillis, WebhookDelivery } from "../types";
 import { buildWebhookHeaders, WAKE_PAYLOAD } from "./sign";
 import { validateCustomHeaderName, validateWebhookUrl } from "./validate";
 
@@ -14,9 +13,10 @@ export const WEBHOOK_MAX_ATTEMPTS = 3;
 export const WEBHOOK_RETRY_DELAYS_MS = [0, 60_000, 300_000] as const;
 export const WEBHOOK_BLOCKED_DELAY_MS = 60_000;
 export const WEBHOOK_TIMEOUT_MS = 5_000;
+export const DEFAULT_DUE_WEBHOOK_LIMIT = 8;
+export const WEBHOOK_IN_FLIGHT_LEASE_MS = 10_000;
 
 const MAX_ERROR_LENGTH = 200;
-const WEBHOOK_IN_FLIGHT_LEASE_MS = 10_000;
 
 function stripControlChars(text: string): string {
 	let out = "";
@@ -100,8 +100,39 @@ export interface ScheduleDelayedWakeOptions {
 	delayMs?: number;
 }
 
-interface AgentWebhookJoinRow extends Partial<AgentWebhookRow> {
-	agent_status: string;
+interface JoinedDueWebhookRow extends WebhookDeliveryRow {
+	agent_status: string | null;
+	webhook_agent_id: string | null;
+	url: string | null;
+	auth_mode: string | null;
+	header_name: string | null;
+	secret: string | null;
+	webhook_created_at: number | null;
+	webhook_updated_at: number | null;
+}
+
+function extractWebhookFromJoinedRow(
+	row: JoinedDueWebhookRow,
+): AgentWebhook | null {
+	if (
+		row.webhook_agent_id === null ||
+		row.url === null ||
+		row.auth_mode === null ||
+		row.secret === null ||
+		row.webhook_created_at === null ||
+		row.webhook_updated_at === null
+	) {
+		return null;
+	}
+	return agentWebhookFromRow({
+		agent_id: row.webhook_agent_id,
+		url: row.url,
+		auth_mode: row.auth_mode,
+		header_name: row.header_name,
+		secret: row.secret,
+		created_at: row.webhook_created_at,
+		updated_at: row.webhook_updated_at,
+	});
 }
 
 /**
@@ -157,6 +188,7 @@ interface EnqueuedWakeRecord {
 	id: string;
 	attempts: number;
 	nextAttemptAt: UnixMillis;
+	leasedUntil: UnixMillis | null;
 }
 
 async function enqueueWakeRecord(
@@ -190,8 +222,8 @@ async function enqueueWakeRecord(
 	const row = await db
 		.prepare(
 			`INSERT INTO webhook_deliveries
-				(id, agent_id, status, attempts, next_attempt_at, last_error, created_at, updated_at)
-			VALUES (?, ?, 'pending', 0, ?, NULL, ?, ?)
+				(id, agent_id, status, attempts, next_attempt_at, leased_until, last_error, created_at, updated_at)
+			VALUES (?, ?, 'pending', 0, ?, NULL, NULL, ?, ?)
 			ON CONFLICT (agent_id) WHERE status = 'pending' DO UPDATE SET
 				next_attempt_at = CASE
 					WHEN webhook_deliveries.attempts = 0
@@ -199,17 +231,23 @@ async function enqueueWakeRecord(
 					ELSE webhook_deliveries.next_attempt_at
 				END,
 				updated_at = excluded.updated_at
-			RETURNING id, attempts, next_attempt_at`,
+			RETURNING id, attempts, next_attempt_at, leased_until`,
 		)
 		.bind(id, input.agentId, nextAttemptAt, input.now, input.now)
-		.first<{ id: string; attempts: number; next_attempt_at: number }>();
+		.first<{
+			id: string;
+			attempts: number;
+			next_attempt_at: number;
+			leased_until: number | null;
+		}>();
 
 	return row === null
-		? { id, attempts: 0, nextAttemptAt }
+		? { id, attempts: 0, nextAttemptAt, leasedUntil: null }
 		: {
 				id: row.id,
 				attempts: row.attempts,
 				nextAttemptAt: row.next_attempt_at,
+				leasedUntil: row.leased_until,
 			};
 }
 
@@ -242,7 +280,7 @@ async function recordDeliveryFailure(
 		const update = await db
 			.prepare(
 				`UPDATE webhook_deliveries
-				SET status = 'abandoned', attempts = ?, last_error = ?, updated_at = ?
+				SET status = 'abandoned', attempts = ?, leased_until = NULL, last_error = ?, updated_at = ?
 				WHERE id = ? AND status = 'pending' AND attempts = ?`,
 			)
 			.bind(nextAttempts, lastError, now, delivery.id, delivery.attempts)
@@ -266,7 +304,7 @@ async function recordDeliveryFailure(
 	const update = await db
 		.prepare(
 			`UPDATE webhook_deliveries
-			SET attempts = ?, next_attempt_at = ?, last_error = ?, updated_at = ?
+			SET attempts = ?, next_attempt_at = ?, leased_until = NULL, last_error = ?, updated_at = ?
 			WHERE id = ? AND status = 'pending' AND attempts = ?`,
 		)
 		.bind(
@@ -289,14 +327,11 @@ async function recordDeliveryFailure(
 	};
 }
 
-/**
- * Attempts one pending webhook delivery. Handles suspended-agent/missing-webhook
- * cleanup, SSRF re-validation, no-redirect 5s timeout POST, retries, and
- * audit logging.
- */
-export async function attemptWebhookDelivery(
+async function deliverLoadedWebhook(
 	db: D1Database,
-	deliveryId: string,
+	delivery: WebhookDelivery,
+	agentStatus: string | null,
+	webhook: AgentWebhook | null,
 	options: AttemptWebhookOptions,
 ): Promise<WebhookAttemptOutcome> {
 	const {
@@ -306,67 +341,14 @@ export async function attemptWebhookDelivery(
 		allowInsecureLocalhost = false,
 	} = options;
 
-	const rawDelivery = await db
-		.prepare(
-			"SELECT * FROM webhook_deliveries WHERE id = ? AND status = 'pending'",
-		)
-		.bind(deliveryId)
-		.first<WebhookDeliveryRow>();
-	if (rawDelivery === null) {
-		return { status: "skipped", reason: "not_pending" };
-	}
-	const delivery = webhookDeliveryFromRow(rawDelivery);
-	if (delivery.nextAttemptAt > now) {
-		return { status: "skipped", reason: "not_due" };
-	}
-
-	const lease = await db
-		.prepare(
-			`UPDATE webhook_deliveries
-			SET next_attempt_at = ?, updated_at = ?
-			WHERE id = ? AND status = 'pending' AND attempts = ? AND next_attempt_at <= ?`,
-		)
-		.bind(
-			now + WEBHOOK_IN_FLIGHT_LEASE_MS,
-			now,
-			delivery.id,
-			delivery.attempts,
-			now,
-		)
-		.run();
-	if ((lease.meta.changes ?? 0) === 0) {
-		return { status: "skipped", reason: "not_due" };
-	}
-
-	const joined = await db
-		.prepare(
-			`SELECT
-				a.status AS agent_status,
-				w.agent_id,
-				w.url,
-				w.auth_mode,
-				w.header_name,
-				w.secret,
-				w.created_at,
-				w.updated_at
-			FROM agents a
-			LEFT JOIN agent_webhooks w ON w.agent_id = a.id
-			WHERE a.id = ?`,
-		)
-		.bind(delivery.agentId)
-		.first<AgentWebhookJoinRow>();
-
 	if (
-		joined === null ||
-		joined.agent_status !== "active" ||
-		joined.agent_id === undefined ||
-		joined.agent_id === null ||
-		joined.url === undefined ||
-		joined.auth_mode === undefined ||
-		joined.secret === undefined ||
-		joined.created_at === undefined ||
-		joined.updated_at === undefined
+		delivery.nextAttemptAt > now ||
+		(delivery.leasedUntil !== null && delivery.leasedUntil > now)
 	) {
+		return { status: "skipped", reason: "not_due" };
+	}
+
+	if (agentStatus !== "active" || webhook === null) {
 		await db
 			.prepare(
 				"DELETE FROM webhook_deliveries WHERE id = ? AND status = 'pending'",
@@ -375,22 +357,32 @@ export async function attemptWebhookDelivery(
 			.run();
 		return {
 			status: "skipped",
-			reason:
-				joined !== null && joined.agent_status === "suspended"
-					? "agent_suspended"
-					: "no_webhook",
+			reason: agentStatus === "suspended" ? "agent_suspended" : "no_webhook",
 		};
 	}
 
-	const webhook = agentWebhookFromRow({
-		agent_id: joined.agent_id,
-		url: joined.url,
-		auth_mode: joined.auth_mode,
-		header_name: joined.header_name ?? null,
-		secret: joined.secret,
-		created_at: joined.created_at,
-		updated_at: joined.updated_at,
-	});
+	const lease = await db
+		.prepare(
+			`UPDATE webhook_deliveries
+			SET leased_until = ?, updated_at = ?
+			WHERE id = ?
+				AND status = 'pending'
+				AND attempts = ?
+				AND next_attempt_at <= ?
+				AND (leased_until IS NULL OR leased_until <= ?)`,
+		)
+		.bind(
+			now + WEBHOOK_IN_FLIGHT_LEASE_MS,
+			now,
+			delivery.id,
+			delivery.attempts,
+			now,
+			now,
+		)
+		.run();
+	if ((lease.meta.changes ?? 0) === 0) {
+		return { status: "skipped", reason: "not_due" };
+	}
 
 	const urlCheck = validateWebhookUrl(webhook.url, { allowInsecureLocalhost });
 	if (!urlCheck.ok) {
@@ -454,7 +446,7 @@ export async function attemptWebhookDelivery(
 		const update = await db
 			.prepare(
 				`UPDATE webhook_deliveries
-				SET status = 'delivered', attempts = ?, last_error = NULL, updated_at = ?
+				SET status = 'delivered', attempts = ?, leased_until = NULL, last_error = NULL, updated_at = ?
 				WHERE id = ? AND status = 'pending' AND attempts = ?`,
 			)
 			.bind(nextAttempts, now, delivery.id, delivery.attempts)
@@ -485,6 +477,47 @@ export async function attemptWebhookDelivery(
 }
 
 /**
+ * Attempts one pending webhook delivery. Handles suspended-agent/missing-webhook
+ * cleanup, SSRF re-validation, no-redirect 5s timeout POST, retries, and
+ * audit logging.
+ */
+export async function attemptWebhookDelivery(
+	db: D1Database,
+	deliveryId: string,
+	options: AttemptWebhookOptions,
+): Promise<WebhookAttemptOutcome> {
+	const raw = await db
+		.prepare(
+			`SELECT
+				d.*,
+				a.status AS agent_status,
+				w.agent_id AS webhook_agent_id,
+				w.url,
+				w.auth_mode,
+				w.header_name,
+				w.secret,
+				w.created_at AS webhook_created_at,
+				w.updated_at AS webhook_updated_at
+			FROM webhook_deliveries d
+			LEFT JOIN agents a ON a.id = d.agent_id
+			LEFT JOIN agent_webhooks w ON w.agent_id = d.agent_id
+			WHERE d.id = ? AND d.status = 'pending'`,
+		)
+		.bind(deliveryId)
+		.first<JoinedDueWebhookRow>();
+	if (raw === null) {
+		return { status: "skipped", reason: "not_pending" };
+	}
+	return deliverLoadedWebhook(
+		db,
+		webhookDeliveryFromRow(raw),
+		raw.agent_status,
+		extractWebhookFromJoinedRow(raw),
+		options,
+	);
+}
+
+/**
  * Purges pending deliveries for suspended or unconfigured agents, then
  * processes up to `limit` due pending deliveries.
  */
@@ -492,7 +525,7 @@ export async function processDueWebhooks(
 	db: D1Database,
 	options: ProcessDueWebhooksOptions,
 ): Promise<ProcessDueWebhooksResult> {
-	const limit = options.limit ?? 20;
+	const limit = options.limit ?? DEFAULT_DUE_WEBHOOK_LIMIT;
 	if (!Number.isSafeInteger(limit) || limit <= 0) {
 		throw new Error("limit must be a positive integer");
 	}
@@ -511,13 +544,27 @@ export async function processDueWebhooks(
 
 	const { results } = await db
 		.prepare(
-			`SELECT id FROM webhook_deliveries
-			WHERE status = 'pending' AND next_attempt_at <= ?
-			ORDER BY next_attempt_at ASC
+			`SELECT
+				d.*,
+				a.status AS agent_status,
+				w.agent_id AS webhook_agent_id,
+				w.url,
+				w.auth_mode,
+				w.header_name,
+				w.secret,
+				w.created_at AS webhook_created_at,
+				w.updated_at AS webhook_updated_at
+			FROM webhook_deliveries d
+			JOIN agents a ON a.id = d.agent_id
+			JOIN agent_webhooks w ON w.agent_id = d.agent_id
+			WHERE d.status = 'pending'
+				AND d.next_attempt_at <= ?
+				AND (d.leased_until IS NULL OR d.leased_until <= ?)
+			ORDER BY d.next_attempt_at ASC
 			LIMIT ?`,
 		)
-		.bind(options.now, limit)
-		.all<{ id: string }>();
+		.bind(options.now, options.now, limit)
+		.all<JoinedDueWebhookRow>();
 
 	let delivered = 0;
 	let retried = 0;
@@ -525,12 +572,18 @@ export async function processDueWebhooks(
 	let skipped = 0;
 
 	for (const row of results) {
-		const outcome = await attemptWebhookDelivery(db, row.id, {
-			now: options.now,
-			audit: options.audit,
-			fetcher: options.fetcher,
-			allowInsecureLocalhost: options.allowInsecureLocalhost,
-		});
+		const outcome = await deliverLoadedWebhook(
+			db,
+			webhookDeliveryFromRow(row),
+			row.agent_status,
+			extractWebhookFromJoinedRow(row),
+			{
+				now: options.now,
+				audit: options.audit,
+				fetcher: options.fetcher,
+				allowInsecureLocalhost: options.allowInsecureLocalhost,
+			},
+		);
 		switch (outcome.status) {
 			case "delivered":
 				delivered += 1;
@@ -576,7 +629,8 @@ export async function notifyAgentImmediately(
 			record === null ||
 			options.waitUntil === undefined ||
 			record.attempts > 0 ||
-			record.nextAttemptAt > options.now
+			record.nextAttemptAt > options.now ||
+			(record.leasedUntil !== null && record.leasedUntil > options.now)
 		) {
 			return;
 		}

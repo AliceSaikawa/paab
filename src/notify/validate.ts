@@ -344,7 +344,11 @@ export function validateWebhookUrl(
 	}
 
 	const normalizedHost = hostname.replace(/\.+$/, "");
-	if (normalizedHost.length === 0 || normalizedHost.includes("..")) {
+	if (
+		normalizedHost.length === 0 ||
+		normalizedHost.startsWith(".") ||
+		normalizedHost.includes("..")
+	) {
 		return { ok: false, message: "呼び出し先 URL のホスト名が不正です" };
 	}
 
@@ -515,6 +519,12 @@ export function validateExternalSecret(raw: string): SecretValidation {
 		return {
 			ok: false,
 			message: "認証シークレットに改行や制御文字は含められません",
+		};
+	}
+	if (raw !== raw.trim()) {
+		return {
+			ok: false,
+			message: "認証シークレットの前後に空白は含められません",
 		};
 	}
 	if (hasNonByteStringChar(raw)) {

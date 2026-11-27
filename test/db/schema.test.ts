@@ -1777,6 +1777,7 @@ describe("agent_webhooks and webhook_deliveries (migration 0007)", () => {
 				status: "bogus",
 				attempts: 0,
 				next_attempt_at: T0,
+				leased_until: null,
 				last_error: null,
 				created_at: T0,
 				updated_at: T0,
@@ -1790,6 +1791,7 @@ describe("agent_webhooks and webhook_deliveries (migration 0007)", () => {
 				status: "pending",
 				attempts: -1,
 				next_attempt_at: T0,
+				leased_until: null,
 				last_error: null,
 				created_at: T0,
 				updated_at: T0,
@@ -1806,6 +1808,7 @@ describe("agent_webhooks and webhook_deliveries (migration 0007)", () => {
 			status: "pending",
 			attempts: 0,
 			nextAttemptAt: T0,
+			leasedUntil: T0 + 10_000,
 			lastError: null,
 			createdAt: T0,
 			updatedAt: T0,
@@ -1827,6 +1830,7 @@ describe("agent_webhooks and webhook_deliveries (migration 0007)", () => {
 			status: "delivered",
 			attempts: 1,
 			nextAttemptAt: T0 - 10,
+			leasedUntil: null,
 			lastError: null,
 			createdAt: T0 - 10,
 			updatedAt: T0 - 10,
@@ -1837,6 +1841,7 @@ describe("agent_webhooks and webhook_deliveries (migration 0007)", () => {
 			status: "abandoned",
 			attempts: 3,
 			nextAttemptAt: T0 - 20,
+			leasedUntil: null,
 			lastError: "HTTP 500",
 			createdAt: T0 - 20,
 			updatedAt: T0 - 20,
@@ -1852,31 +1857,48 @@ describe("agent_webhooks and webhook_deliveries (migration 0007)", () => {
 			.first<WebhookDeliveryRow>();
 		expect(webhookDeliveryFromRow(row1 as WebhookDeliveryRow)).toEqual(d1);
 
+		const row2 = await db
+			.prepare("SELECT * FROM webhook_deliveries WHERE id = ?")
+			.bind(d2.id)
+			.first<WebhookDeliveryRow>();
+		expect(webhookDeliveryFromRow(row2 as WebhookDeliveryRow)).toEqual(d2);
+
 		// Invalid status / negative attempts fail CHECK.
 		await expect(
 			db
 				.prepare(
 					`INSERT INTO webhook_deliveries
-						(id, agent_id, status, attempts, next_attempt_at, last_error, created_at, updated_at)
-					VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+						(id, agent_id, status, attempts, next_attempt_at, leased_until, last_error, created_at, updated_at)
+					VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				)
-				.bind(newId(), a.id, "failed", 0, T0, null, T0, T0)
+				.bind(newId(), a.id, "failed", 0, T0, null, null, T0, T0)
 				.run(),
 		).rejects.toThrow(/CHECK/);
 		await expect(
 			db
 				.prepare(
 					`INSERT INTO webhook_deliveries
-						(id, agent_id, status, attempts, next_attempt_at, last_error, created_at, updated_at)
-					VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+						(id, agent_id, status, attempts, next_attempt_at, leased_until, last_error, created_at, updated_at)
+					VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				)
-				.bind(newId(), a.id, "delivered", -1, T0, null, T0, T0)
+				.bind(newId(), a.id, "delivered", -1, T0, null, null, T0, T0)
 				.run(),
 		).rejects.toThrow(/CHECK/);
 
-		// Due query uses partial due index.
+		// Due query uses partial due index (next_attempt_at, leased_until).
 		const plan = await queryPlan(
-			"SELECT id FROM webhook_deliveries WHERE status = 'pending' AND next_attempt_at <= ? ORDER BY next_attempt_at ASC LIMIT 20",
+			`SELECT d.*, a.status AS agent_status, w.agent_id AS webhook_agent_id,
+				w.url, w.auth_mode, w.header_name, w.secret,
+				w.created_at AS webhook_created_at, w.updated_at AS webhook_updated_at
+			FROM webhook_deliveries d
+			JOIN agents a ON a.id = d.agent_id
+			JOIN agent_webhooks w ON w.agent_id = d.agent_id
+			WHERE d.status = 'pending'
+				AND d.next_attempt_at <= ?
+				AND (d.leased_until IS NULL OR d.leased_until <= ?)
+			ORDER BY d.next_attempt_at ASC
+			LIMIT 8`,
+			T0,
 			T0,
 		);
 		expect(plan).toContain("webhook_deliveries_due_idx");
@@ -1889,7 +1911,7 @@ describe("agent_webhooks and webhook_deliveries (migration 0007)", () => {
 		expect(count?.n).toBe(0);
 	});
 
-	it("preserves populated data when upgrading from migration 0006 to 0007", async () => {
+	it("preserves populated data when upgrading from migration 0006 through 0008", async () => {
 		await db.batch([
 			db.prepare("DROP TABLE IF EXISTS webhook_deliveries"),
 			db.prepare("DROP TABLE IF EXISTS agent_webhooks"),
@@ -1913,6 +1935,7 @@ describe("agent_webhooks and webhook_deliveries (migration 0007)", () => {
 		const m5 = migrationByName("0005_proposals.sql");
 		const m6 = migrationByName("0006_pending_descriptions.sql");
 		const m7 = migrationByName("0007_webhooks.sql");
+		const m8 = migrationByName("0008_body_retention_indexes.sql");
 
 		await applyD1Migrations(db, [m1, m2, m3, m4, m5, m6]);
 		const a = await seedAgent(db, { name: "existing-agent" });
@@ -1922,7 +1945,7 @@ describe("agent_webhooks and webhook_deliveries (migration 0007)", () => {
 			submittedAt: T0,
 		}).run();
 
-		await applyD1Migrations(db, [m1, m2, m3, m4, m5, m6, m7]);
+		await applyD1Migrations(db, [m1, m2, m3, m4, m5, m6, m7, m8]);
 
 		const fkCheck = await db.prepare("PRAGMA foreign_key_check").all();
 		expect(fkCheck.results).toEqual([]);
@@ -1945,5 +1968,52 @@ describe("agent_webhooks and webhook_deliveries (migration 0007)", () => {
 			.bind(a.id)
 			.first<AgentWebhookRow>();
 		expect(loaded?.url).toBe("https://hooks.example.com/migrated");
+
+		const { results: indexRows } = await db
+			.prepare(
+				"SELECT name FROM sqlite_schema WHERE type = 'index' AND name IN ('messages_with_body_idx', 'audit_log_with_body_idx') ORDER BY name",
+			)
+			.all<{ name: string }>();
+		expect(indexRows.map((row) => row.name)).toEqual([
+			"audit_log_with_body_idx",
+			"messages_with_body_idx",
+		]);
+	});
+});
+
+describe("partial body-retention indexes (migration 0008)", () => {
+	it("uses messages_with_body_idx for deleteBodies instead of scanning the full messages table", async () => {
+		const plan = await queryPlan(
+			`UPDATE messages SET body = NULL, body_deleted_at = ?1
+			WHERE body IS NOT NULL AND (
+				(kind = 'question' AND status = 'expired' AND received_at IS NULL)
+				OR (
+					received_at <= ?2
+					AND (
+						kind = 'answer'
+						OR (kind = 'question' AND status IN ('answered', 'declined', 'expired'))
+					)
+				)
+			)`,
+			T0 + DAY_MS,
+			T0,
+		);
+		expect(plan).toContain("messages_with_body_idx");
+		expect(plan).not.toMatch(/\bSCAN messages(?! USING INDEX)/);
+	});
+
+	it("uses audit_log_with_body_idx for purgeExpiredAuditBodies instead of scanning the full audit_log table", async () => {
+		const retentionPlan = await queryPlan(
+			"UPDATE audit_log SET body = NULL WHERE body IS NOT NULL AND occurred_at <= ?",
+			T0,
+		);
+		expect(retentionPlan).toContain("audit_log_with_body_idx");
+		expect(retentionPlan).not.toMatch(/\bSCAN audit_log(?! USING INDEX)/);
+
+		const disabledPlan = await queryPlan(
+			"UPDATE audit_log SET body = NULL WHERE body IS NOT NULL",
+		);
+		expect(disabledPlan).toContain("audit_log_with_body_idx");
+		expect(disabledPlan).not.toMatch(/\bSCAN audit_log(?! USING INDEX)/);
 	});
 });
