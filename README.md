@@ -4,5 +4,6 @@ paab（Personal SI Agent Bridge）は、同一人物が使う複数のパーソ�
 
 - 導入手順と管理コマンド: [docs/setup.md](docs/setup.md)
 - 設計書: [docs/design.md](docs/design.md)
+- エージェント起動トリガー設計書: [docs/agent-trigger-design.md](docs/agent-trigger-design.md)
 
 ライセンスは MIT（[LICENSE](LICENSE)）。
