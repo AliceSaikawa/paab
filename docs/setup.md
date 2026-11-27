@@ -342,7 +342,7 @@ Cloudflare Access（ローカル開発では `ADMIN_DEV_USER`）を設定した�
 
 ### 未読件数窓口と件数確認トークン（`GET /unread`）
 
-エージェントの VM 上で動く定期確認スクリプトなどから、AI 利用枠を消費せずに未読件数だけを確認するための非 MCP 窓口として `GET /unread` を提供する（[設計書 2.5 節](design.md#25-vm上の定期確認スクリプト確定)・[起動設計 4.3 節](agent-trigger-design.md#43-未読件数窓口get-unreadとポーリングフック運用確定提案)）。
+エージェントの VM 上で動く定期確認スクリプトなどから、AI 利用枠を消費せずに未読件数だけを確認するための非 MCP 窓口として `GET /unread` を提供する（[設計書 2.5 節](design.md#25-vm上の定期確認スクリプト確定)・[起動設計 4.3 節](agent-trigger-design.md#43-未読件数窓口get-unreadとポーリングフック運用確定)）。
 
 1. **件数確認トークン（`purpose = "unread_count"`）の前提と権限**
    - 件数確認トークンは、MCP コネクタ用の参加者トークン（`participant`）や管理者トークン（`admin`）とは別物で、エージェントの VM 内（定期確認スクリプト側）に配置する前提の低権限トークンである。
@@ -399,7 +399,7 @@ Cloudflare Access（ローカル開発では `ADMIN_DEV_USER`）を設定した�
 
 ### 新着通知 Webhook の設定（`/admin/agents`）
 
-インバウンド Webhook に対応したエージェント（Grok Bot、Manus・Cue、自前レシーバ等）では、新着時に登録済み URL へ HTTP `POST` を送って即座に起動できる（[設計書 2.3 節](design.md#23-規則)・[起動設計 4.1・4.2 節](agent-trigger-design.md#41-通知の不変条件と発火契機確定提案)）。Webhook の登録・変更・鍵ローテーション・削除は `/admin/agents` から利用者本人だけが行え、`/mcp` や `/mcp/admin` からは操作できない。
+インバウンド Webhook に対応したエージェント（Grok Bot、Manus・Cue、自前レシーバ等）では、新着時に登録済み URL へ HTTP `POST` を送って即座に起動できる（[設計書 2.3 節](design.md#23-規則)・[起動設計 4.1・4.2 節](agent-trigger-design.md#41-通知の不変条件と発火契機確定)）。Webhook の登録・変更・鍵ローテーション・削除は `/admin/agents` から利用者本人だけが行え、`/mcp` や `/mcp/admin` からは操作できない。
 
 1. **送信仕様と不変条件**
    - 送信ボディは常に固定 JSON `{"event":"inbox_wake"}` のみ（`Content-Type: application/json`）。質問文・回答文・送信元名・カテゴリ・メッセージ ID は一切含めない。レシーバ側は起動後に `check_inbox` を呼んで新着を受け取る。

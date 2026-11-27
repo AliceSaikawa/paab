@@ -232,7 +232,7 @@ paab（Personal SI Agent Bridge）は、同一人物が使う複数のパーソ�
 
 - **確認済み**: 使用するライブラリのバージョンと対応状況（`@modelcontextprotocol/server` 2.4.0 の `createMcpHandler` による Web Standard Fetch Streamable HTTP と `zod` 4.6.7 を直接利用。Cloudflare の `agents` 補助パッケージは不要）。
 - **確認済み（2026-11-27、Muse 実環境）**: Muse に公式のインバウンド Webhook とサイドチャット外部投稿 API はない。ランタイム管理の cron とフックはアプリ終了や VM 入れ替え後も常駐し、フックが `wake` を返すとワーカーエージェントが起動する。ただしフック自体はシークレットやコネクタ資格情報を持てない。`credentials.request_api_access` は単一 API キーのヘッダー配置に対応し、`Background sync` の Allow・Deny 行はユーザー作成の cron・フックには適用されない。
-- **未確認**: Muse で実際に paab の `/mcp` へ Bearer 接続したとき、カスタム MCP ツールが権限ツリーと事前承認（preapproval）に対応して無人実行できるか。またフックから `GET /unread` 相当の外部 HTTP GET（低権限トークン付き）と `wake` 後のワーカーからのカスタム MCP 呼び出しが通るか（実機未試験。検証手順は [docs/agent-trigger-design.md](agent-trigger-design.md#5-第-4-段階実装前の実機検証ゲート)）。
+- **未確認**: Muse で実際に paab の `/mcp` へ Bearer 接続したとき、カスタム MCP ツールが権限ツリーと事前承認（preapproval）に対応して無人実行できるか。またフックから `GET /unread` 相当の外部 HTTP GET（低権限トークン付き）と `wake` 後のワーカーからのカスタム MCP 呼び出しが通るか（実機未試験。検証手順は [docs/agent-trigger-design.md](agent-trigger-design.md#5-第-4-段階の実機検証ゲート)）。
 - **未確認**: Grok Bot の `grok.com/connectors` UI でヘッダー方式が通るか（OAuth のみとする報告と食い違い）。また Webhook Trigger 起動のルーチンからプライベート Custom MCP を承認・スコープ制限なしで呼べるか（実機未試験）。
 - **未確認**: Cue（Manus 2.0）で Automations の Webhook Trigger が Cue 個人エージェントの記憶と Custom MCP 接続を引き継いで動くか、別タスクになるか（実機未試験）。
 - **未確認**: Grok Bot で VM とその上のスクリプトが会話の外でも動き続け、エージェント本体を起こせるか（実機未試験）。
