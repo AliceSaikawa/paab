@@ -19,10 +19,12 @@ import type { Agent, Category } from "../../../src/types";
 import { handleAdminRequest, type UiEnv } from "../../../src/ui";
 import { createTestDb } from "../../helpers/db";
 import { seedAgent, seedCategory, T0 } from "../../helpers/fixtures";
+import { TestCookieJar } from "../../helpers/ui-cookies";
 import { call, connect } from "../../mcp/support";
 
 const OWNER_EMAIL = "owner@example.com";
 const OWNER = { actorType: "owner" as const, actorId: OWNER_EMAIL };
+const ADMIN_ORIGIN = new URL("https://paab.test");
 
 let db: D1Database;
 let muse: Agent;
@@ -66,8 +68,17 @@ function devEnv(devUser = OWNER_EMAIL): UiEnv {
 }
 
 interface CsrfSession {
+	jar: TestCookieJar;
 	cookie: string;
 	token: string;
+}
+
+function syncSession(session: CsrfSession): void {
+	session.cookie = session.jar.header();
+	const token = session.jar.csrfToken(ADMIN_ORIGIN);
+	if (token !== undefined) {
+		session.token = token;
+	}
 }
 
 async function openDescriptionsSession(now = T0): Promise<{
@@ -80,23 +91,16 @@ async function openDescriptionsSession(now = T0): Promise<{
 		devEnv(),
 		now,
 	);
-	const setCookie = response.headers.get("Set-Cookie") ?? "";
-	const cookie = setCookie.split(";", 1)[0] ?? "";
+	const jar = new TestCookieJar();
+	jar.applyResponse(response);
 	const html = await response.text();
 	const tokenMatch = /name="csrf_token" value="([^"]+)"/.exec(html);
-	if (tokenMatch?.[1]) {
-		return {
-			session: { cookie, token: tokenMatch[1] },
-			response,
-			html,
-		};
-	}
-	const cookieVal = cookie.split("=", 2)[1] ?? "";
-	if (!cookie || !cookieVal) {
+	const token = tokenMatch?.[1] ?? jar.csrfToken(ADMIN_ORIGIN) ?? "";
+	if (!jar.header() || !token) {
 		throw new Error("Expected CSRF cookie on /admin/descriptions");
 	}
 	return {
-		session: { cookie, token: cookieVal },
+		session: { jar, cookie: jar.header(), token },
 		response,
 		html,
 	};
@@ -110,11 +114,15 @@ async function adminGet(
 	const response = await handleAdminRequest(
 		new Request(`https://paab.test${path}`, {
 			method: "GET",
-			headers: session ? { Cookie: session.cookie } : {},
+			headers: session ? { Cookie: session.jar.header() } : {},
 		}),
 		devEnv(),
 		now,
 	);
+	if (session) {
+		session.jar.applyResponse(response);
+		syncSession(session);
+	}
 	return { response, html: await response.text() };
 }
 
@@ -123,12 +131,17 @@ async function adminPost(
 	session: CsrfSession,
 	fields: Record<string, string> = {},
 	now = T0,
-): Promise<{ response: Response; html: string }> {
-	const response = await handleAdminRequest(
+): Promise<{
+	response: Response;
+	postResponse: Response;
+	location: string | null;
+	html: string;
+}> {
+	const postResponse = await handleAdminRequest(
 		new Request(`https://paab.test${path}`, {
 			method: "POST",
 			headers: {
-				Cookie: session.cookie,
+				Cookie: session.jar.header(),
 				Origin: "https://paab.test",
 			},
 			body: new URLSearchParams({
@@ -139,7 +152,27 @@ async function adminPost(
 		devEnv(),
 		now,
 	);
-	return { response, html: await response.text() };
+	session.jar.applyResponse(postResponse);
+	syncSession(session);
+	if (postResponse.status === 303) {
+		const location = postResponse.headers.get("Location");
+		if (location === null) {
+			throw new Error("Expected Location header on 303 response");
+		}
+		const followed = await adminGet(location, session, now);
+		return {
+			response: followed.response,
+			postResponse,
+			location,
+			html: followed.html,
+		};
+	}
+	return {
+		response: postResponse,
+		postResponse,
+		location: null,
+		html: await postResponse.text(),
+	};
 }
 
 async function loadAgent(id: string): Promise<Agent> {
@@ -283,14 +316,18 @@ describe("POST /admin/descriptions/:agentId/approve and /reject", () => {
 			"approve",
 		);
 
-		// Missing submission_id returns 400 and leaves pending row untouched.
+		// Missing submission_id redirects 303 with error flash and leaves pending row untouched.
 		const missingSubmissionApprove = await adminPost(
 			`/admin/descriptions/${encodeURIComponent(muse.id)}/approve`,
 			session,
 			{},
 			T0 + 14,
 		);
-		expect(missingSubmissionApprove.response.status).toBe(400);
+		expect(missingSubmissionApprove.postResponse.status).toBe(303);
+		expect(missingSubmissionApprove.location).toBe("/admin/descriptions");
+		expect(missingSubmissionApprove.html).toContain(
+			'class="banner banner-error"',
+		);
 		expect(missingSubmissionApprove.html).toContain("提出IDを指定してください");
 		expect(await loadPendingRow(muse.id)).not.toBeNull();
 
@@ -300,7 +337,11 @@ describe("POST /admin/descriptions/:agentId/approve and /reject", () => {
 			{ submission_id: "   " },
 			T0 + 14,
 		);
-		expect(missingSubmissionReject.response.status).toBe(400);
+		expect(missingSubmissionReject.postResponse.status).toBe(303);
+		expect(missingSubmissionReject.location).toBe("/admin/descriptions");
+		expect(missingSubmissionReject.html).toContain(
+			'class="banner banner-error"',
+		);
 		expect(missingSubmissionReject.html).toContain("提出IDを指定してください");
 
 		const approveBot = await adminPost(
@@ -367,14 +408,15 @@ describe("POST /admin/descriptions/:agentId/approve and /reject", () => {
 		expect((await loadAgent(carol.id)).description).toBe("");
 		expect(await loadPendingRow(carol.id)).toBeNull();
 
-		// Double-approve returns 404.
+		// Double-approve redirects 303 with error flash.
 		const doubleApprove = await adminPost(
 			`/admin/descriptions/${encodeURIComponent(grok.id)}/approve`,
 			session,
 			{ submission_id: grokSub.data.pending.submissionId },
 			T0 + 40,
 		);
-		expect(doubleApprove.response.status).toBe(404);
+		expect(doubleApprove.postResponse.status).toBe(303);
+		expect(doubleApprove.html).toContain('class="banner banner-error"');
 		expect(doubleApprove.html).toContain("承認待ちの説明文が見つかりません");
 
 		// Missing CSRF returns 403.
@@ -425,14 +467,16 @@ describe("POST /admin/descriptions/:agentId/approve and /reject", () => {
 		});
 		expect(submitD2.isError).toBe(false);
 
-		// Approving with stale S1 fails with HTTP 409, leaving agents.description and change_log untouched.
+		// Approving with stale S1 redirects 303 with error flash, leaving agents.description and change_log untouched.
 		const staleApprove = await adminPost(
 			`/admin/descriptions/${encodeURIComponent(grok.id)}/approve`,
 			session,
 			{ submission_id: s1Approve },
 			T0 + 20,
 		);
-		expect(staleApprove.response.status).toBe(409);
+		expect(staleApprove.postResponse.status).toBe(303);
+		expect(staleApprove.location).toBe("/admin/descriptions");
+		expect(staleApprove.html).toContain('class="banner banner-error"');
 		expect(staleApprove.html).toContain(
 			"承認待ちの説明文が新しい内容へ更新されたため処理できませんでした",
 		);
@@ -449,14 +493,16 @@ describe("POST /admin/descriptions/:agentId/approve and /reject", () => {
 			"Malicious D2 bio swapped before click",
 		);
 
-		// Rejecting with stale S1 also fails with HTTP 409 and keeps D2 pending.
+		// Rejecting with stale S1 also redirects 303 with error flash and keeps D2 pending.
 		const staleReject = await adminPost(
 			`/admin/descriptions/${encodeURIComponent(grok.id)}/reject`,
 			session,
 			{ submission_id: s1Reject },
 			T0 + 21,
 		);
-		expect(staleReject.response.status).toBe(409);
+		expect(staleReject.postResponse.status).toBe(303);
+		expect(staleReject.location).toBe("/admin/descriptions");
+		expect(staleReject.html).toContain('class="banner banner-error"');
 		expect(staleReject.html).toContain(
 			"承認待ちの説明文が新しい内容へ更新されたため処理できませんでした",
 		);

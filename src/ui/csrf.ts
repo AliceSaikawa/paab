@@ -16,9 +16,21 @@ export class FormReadError extends Error {
 	}
 }
 
+export type CsrfFailureReason =
+	| "cross_origin"
+	| "missing_cookie"
+	| "invalid_form"
+	| "missing_token"
+	| "token_mismatch";
+
 export type CsrfPostResult =
 	| { ok: true; token: string; form: URLSearchParams }
-	| { ok: false; status: 400 | 403 | 413 | 415; message: string };
+	| {
+			ok: false;
+			status: 400 | 403 | 413 | 415;
+			reason: CsrfFailureReason;
+			message: string;
+	  };
 
 export function csrfCookieName(url: URL): string {
 	return url.protocol === "https:" ? "__Host-paab_csrf" : "paab_csrf";
@@ -147,6 +159,7 @@ export async function verifyCsrfPost(
 		return {
 			ok: false,
 			status: 403,
+			reason: "cross_origin",
 			message: "クロスオリジンからの送信は許可されていません",
 		};
 	}
@@ -156,6 +169,7 @@ export async function verifyCsrfPost(
 		return {
 			ok: false,
 			status: 403,
+			reason: "cross_origin",
 			message: "不正な送信元からのリクエストです",
 		};
 	}
@@ -165,6 +179,7 @@ export async function verifyCsrfPost(
 		return {
 			ok: false,
 			status: 403,
+			reason: "missing_cookie",
 			message: "CSRF クッキーがありません。画面を再読み込みしてください",
 		};
 	}
@@ -174,25 +189,45 @@ export async function verifyCsrfPost(
 		form = await readForm(request);
 	} catch (error) {
 		if (error instanceof FormReadError) {
-			return { ok: false, status: error.status, message: error.message };
+			return {
+				ok: false,
+				status: error.status,
+				reason: "invalid_form",
+				message: error.message,
+			};
 		}
 		throw error;
 	}
 
 	const formToken = form.get(CSRF_FORM_FIELD);
-	if (
-		formToken === null ||
-		!isValidCsrfToken(formToken) ||
-		!tokensEqual(cookieToken, formToken)
-	) {
+	if (formToken === null || !isValidCsrfToken(formToken)) {
 		return {
 			ok: false,
 			status: 403,
+			reason: "missing_token",
+			message: "CSRF トークンが一致しません。画面を再読み込みしてください",
+		};
+	}
+	if (!tokensEqual(cookieToken, formToken)) {
+		return {
+			ok: false,
+			status: 403,
+			reason: "token_mismatch",
 			message: "CSRF トークンが一致しません。画面を再読み込みしてください",
 		};
 	}
 
 	return { ok: true, token: cookieToken, form };
+}
+
+export function rotateCsrfCookie(response: Response, url: URL): Response {
+	const headers = new Headers(response.headers);
+	headers.append("Set-Cookie", createCsrfSetCookie(url, generateCsrfToken()));
+	return new Response(response.body, {
+		status: response.status,
+		statusText: response.statusText,
+		headers,
+	});
 }
 
 /** Renders the hidden CSRF input field for admin POST forms. */

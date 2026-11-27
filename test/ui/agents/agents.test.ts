@@ -5,6 +5,8 @@ import { hashToken } from "../../../src/auth";
 import { insertMessage, newId } from "../../../src/db";
 import { handleMcpRequest } from "../../../src/mcp";
 import {
+	csrfCookieName,
+	FLASH_COOKIE_NAME,
 	handleAdminRequest,
 	type JwkKey,
 	type JwksFetcher,
@@ -12,6 +14,7 @@ import {
 } from "../../../src/ui";
 import { createTestDb } from "../../helpers/db";
 import { DAY_MS, HOUR_MS, seedCategory, T0 } from "../../helpers/fixtures";
+import { findSetCookie, TestCookieJar } from "../../helpers/ui-cookies";
 import { call, connect, MCP_URL } from "../../mcp/support";
 
 const TEAM_DOMAIN = "paab-team.cloudflareaccess.com";
@@ -110,11 +113,22 @@ function jwksFetcher(): JwksFetcher {
 	return vi.fn(async () => doc);
 }
 
+const ADMIN_ORIGIN = new URL("https://paab.test");
+
 interface AdminSession {
+	jar: TestCookieJar;
 	cookie: string;
 	csrfToken: string;
 	jwt: string;
 	fetcher: JwksFetcher;
+}
+
+function syncSession(session: AdminSession): void {
+	session.cookie = session.jar.header();
+	const token = session.jar.csrfToken(ADMIN_ORIGIN);
+	if (token !== undefined) {
+		session.csrfToken = token;
+	}
 }
 
 function extractCsrfToken(htmlText: string): string {
@@ -140,12 +154,12 @@ async function openAdminSession(
 		now,
 		{ fetchJwks: fetcher },
 	);
-	const setCookie = response.headers.get("Set-Cookie") ?? "";
-	const cookie = setCookie.split(";", 1)[0] ?? "";
+	const jar = new TestCookieJar();
+	jar.applyResponse(response);
 	const html = await response.text();
 	const csrfToken = extractCsrfToken(html);
 	return {
-		session: { cookie, csrfToken, jwt, fetcher },
+		session: { jar, cookie: jar.header(), csrfToken, jwt, fetcher },
 		response,
 		html,
 	};
@@ -160,7 +174,7 @@ async function adminGet(
 		new Request(`https://paab.test${path}`, {
 			method: "GET",
 			headers: {
-				Cookie: session.cookie,
+				Cookie: session.jar.header(),
 				"Cf-Access-Jwt-Assertion": session.jwt,
 			},
 		}),
@@ -168,6 +182,8 @@ async function adminGet(
 		now,
 		{ fetchJwks: session.fetcher },
 	);
+	session.jar.applyResponse(response);
+	syncSession(session);
 	return { response, html: await response.text() };
 }
 
@@ -176,16 +192,21 @@ async function adminPost(
 	path: string,
 	fields: Record<string, string>,
 	now = T0,
-): Promise<{ response: Response; html: string }> {
+): Promise<{
+	response: Response;
+	postResponse: Response;
+	location: string | null;
+	html: string;
+}> {
 	const body = new URLSearchParams({
 		csrf_token: session.csrfToken,
 		...fields,
 	});
-	const response = await handleAdminRequest(
+	const postResponse = await handleAdminRequest(
 		new Request(`https://paab.test${path}`, {
 			method: "POST",
 			headers: {
-				Cookie: session.cookie,
+				Cookie: session.jar.header(),
 				Origin: "https://paab.test",
 				"Cf-Access-Jwt-Assertion": session.jwt,
 			},
@@ -195,7 +216,27 @@ async function adminPost(
 		now,
 		{ fetchJwks: session.fetcher },
 	);
-	return { response, html: await response.text() };
+	session.jar.applyResponse(postResponse);
+	syncSession(session);
+	if (postResponse.status === 303) {
+		const location = postResponse.headers.get("Location");
+		if (location === null) {
+			throw new Error("Expected Location header on 303 response");
+		}
+		const followed = await adminGet(session, location, now);
+		return {
+			response: followed.response,
+			postResponse,
+			location,
+			html: followed.html,
+		};
+	}
+	return {
+		response: postResponse,
+		postResponse,
+		location: null,
+		html: await postResponse.text(),
+	};
 }
 
 async function mcpRawPost(token: string, now = T0): Promise<Response> {
@@ -287,7 +328,15 @@ describe("/admin/agents UI", () => {
 			},
 			T0 + 10,
 		);
+		expect(regMuse.postResponse.status).toBe(303);
+		expect(regMuse.location).toBe("/admin/agents");
+		expect(findSetCookie(regMuse.postResponse, FLASH_COOKIE_NAME)).toContain(
+			"HttpOnly",
+		);
 		expect(regMuse.response.status).toBe(200);
+		expect(findSetCookie(regMuse.response, FLASH_COOKIE_NAME)).toContain(
+			"Max-Age=0",
+		);
 		expect(regMuse.html).toContain("エージェント「muse」を登録しました");
 		expect(regMuse.html).toContain("所有者: owner-custom");
 		expect(regMuse.html).toContain("未発行");
@@ -304,6 +353,8 @@ describe("/admin/agents UI", () => {
 			},
 			T0 + 20,
 		);
+		expect(regGrok.postResponse.status).toBe(303);
+		expect(regGrok.location).toBe("/admin/agents");
 		expect(regGrok.response.status).toBe(200);
 		expect(regGrok.html).toContain("エージェント「grok」を登録しました");
 		expect(regGrok.html).toContain('placeholder="owner-custom"');
@@ -312,6 +363,7 @@ describe("/admin/agents UI", () => {
 		const grokId = await findAgentIdByName("grok");
 
 		// Issue participant tokens for both via UI.
+		const csrfBeforeMuseIssue = initial.session.csrfToken;
 		const issueMuse = await adminPost(
 			initial.session,
 			`/admin/agents/${museId}/token`,
@@ -320,7 +372,12 @@ describe("/admin/agents UI", () => {
 		);
 		expect(issueMuse.response.status).toBe(200);
 		expect(issueMuse.response.headers.get("Cache-Control")).toBe("no-store");
-		expect(issueMuse.response.headers.get("Set-Cookie")).toBeNull();
+		const rotatedCookie = findSetCookie(
+			issueMuse.response,
+			csrfCookieName(ADMIN_ORIGIN),
+		);
+		expect(rotatedCookie).toBeTruthy();
+		expect(initial.session.csrfToken).not.toBe(csrfBeforeMuseIssue);
 		expect(issueMuse.response.headers.get("Location")).toBeNull();
 		expect(issueMuse.html).toContain("今この画面に一度だけ表示されます");
 		expect(issueMuse.html).toContain("Authorization: Bearer");
@@ -329,6 +386,8 @@ describe("/admin/agents UI", () => {
 		expect(issueMuse.html.match(/<script>/g)).toHaveLength(1);
 
 		const museToken = extractIssuedToken(issueMuse.html);
+		expect(rotatedCookie).not.toContain(museToken);
+		expect(rotatedCookie).not.toContain(museToken.slice("paab_".length));
 		await assertNoTokenLeakInDb(museToken);
 
 		const issueGrok = await adminPost(
@@ -610,15 +669,32 @@ describe("/admin/agents UI", () => {
 				},
 				T0 + 1,
 			);
-			expect(res.response.status).toBe(400);
+			expect(res.postResponse.status).toBe(303);
+			expect(res.location).toBe("/admin/agents");
+			expect(res.response.status).toBe(200);
+			expect(res.html).toContain('class="banner banner-error"');
 			expect(res.html).toContain(
 				"1日あたりの質問数上限は0以上の整数で入力してください",
 			);
-			expect(res.html).toContain("&lt;script&gt;xss&lt;/script&gt;");
 			expect(res.html).not.toContain("<script>xss</script>");
 		}
 
-		// Duplicate and invalid names are rejected cleanly.
+		// Registering an agent with HTML special chars escapes both the flash banner and agent card.
+		const xssReg = await adminPost(
+			session,
+			"/admin/agents",
+			{
+				name: "<script>xss</script>",
+				description: "ok",
+				daily_question_limit: "5",
+			},
+			T0 + 1,
+		);
+		expect(xssReg.postResponse.status).toBe(303);
+		expect(xssReg.html).toContain("&lt;script&gt;xss&lt;/script&gt;");
+		expect(xssReg.html).not.toContain("<script>xss</script>");
+
+		// Duplicate and invalid names are rejected cleanly via 303 + error flash.
 		await adminPost(
 			session,
 			"/admin/agents",
@@ -631,7 +707,8 @@ describe("/admin/agents UI", () => {
 			{ name: "muse", description: "dup", daily_question_limit: "5" },
 			T0 + 3,
 		);
-		expect(dup.response.status).toBe(400);
+		expect(dup.postResponse.status).toBe(303);
+		expect(dup.html).toContain('class="banner banner-error"');
 		expect(dup.html).toContain("すでに登録されています");
 
 		const badName = await adminPost(
@@ -640,7 +717,8 @@ describe("/admin/agents UI", () => {
 			{ name: "bad,name", description: "ok", daily_question_limit: "5" },
 			T0 + 4,
 		);
-		expect(badName.response.status).toBe(400);
+		expect(badName.postResponse.status).toBe(303);
+		expect(badName.html).toContain('class="banner banner-error"');
 		expect(badName.html).toContain("改行・制御文字・カンマ");
 
 		// Invalid integer on edit leaves DB untouched.
@@ -651,7 +729,8 @@ describe("/admin/agents UI", () => {
 			{ description: "changed", daily_question_limit: "12px" },
 			T0 + 5,
 		);
-		expect(badEdit.response.status).toBe(400);
+		expect(badEdit.postResponse.status).toBe(303);
+		expect(badEdit.html).toContain('class="banner banner-error"');
 		expect(badEdit.html).toContain(
 			"1日あたりの質問数上限は0以上の整数で入力してください",
 		);
@@ -663,66 +742,29 @@ describe("/admin/agents UI", () => {
 			.first<{ daily_question_limit: number; description: string }>();
 		expect(row).toEqual({ daily_question_limit: 5, description: "ok" });
 
-		// Missing agent returns 404 cleanly across endpoints.
+		// Missing agent returns 404 on GET confirmation and 303 + error flash across POST endpoints.
 		const missingId = newId();
 		expect(
 			(await adminGet(session, `/admin/agents/${missingId}/delete`, T0 + 6))
 				.response.status,
 		).toBe(404);
-		expect(
-			(
-				await adminPost(
-					session,
-					`/admin/agents/${missingId}/update`,
-					{ description: "x", daily_question_limit: "1" },
-					T0 + 6,
-				)
-			).response.status,
-		).toBe(404);
-		expect(
-			(
-				await adminPost(
-					session,
-					`/admin/agents/${missingId}/suspend`,
-					{},
-					T0 + 6,
-				)
-			).response.status,
-		).toBe(404);
-		expect(
-			(
-				await adminPost(
-					session,
-					`/admin/agents/${missingId}/resume`,
-					{},
-					T0 + 6,
-				)
-			).response.status,
-		).toBe(404);
-		expect(
-			(
-				await adminPost(
-					session,
-					`/admin/agents/${missingId}/delete`,
-					{},
-					T0 + 6,
-				)
-			).response.status,
-		).toBe(404);
-		expect(
-			(await adminPost(session, `/admin/agents/${missingId}/token`, {}, T0 + 6))
-				.response.status,
-		).toBe(404);
-		expect(
-			(
-				await adminPost(
-					session,
-					`/admin/agents/${missingId}/token/revoke`,
-					{},
-					T0 + 6,
-				)
-			).response.status,
-		).toBe(404);
+		for (const [path, fields] of [
+			[
+				`/admin/agents/${missingId}/update`,
+				{ description: "x", daily_question_limit: "1" },
+			],
+			[`/admin/agents/${missingId}/suspend`, {}],
+			[`/admin/agents/${missingId}/resume`, {}],
+			[`/admin/agents/${missingId}/delete`, {}],
+			[`/admin/agents/${missingId}/token`, {}],
+			[`/admin/agents/${missingId}/token/revoke`, {}],
+		] as const) {
+			const res = await adminPost(session, path, fields, T0 + 6);
+			expect(res.postResponse.status, path).toBe(303);
+			expect(res.location, path).toBe("/admin/agents");
+			expect(res.html, path).toContain('class="banner banner-error"');
+			expect(res.html, path).toContain("見つかりません");
+		}
 	});
 
 	it("counts only today's UTC questions in the agent list and enforces CSRF", async () => {

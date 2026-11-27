@@ -26,12 +26,14 @@ import {
 } from "../../../src/ui";
 import { createTestDb } from "../../helpers/db";
 import { seedCategory, T0 } from "../../helpers/fixtures";
+import { TestCookieJar } from "../../helpers/ui-cookies";
 import { call } from "../../mcp/support";
 
 const TEAM_DOMAIN = "paab-team.cloudflareaccess.com";
 const TEST_AUD = "adminbot-undo-ui-aud";
 const ADMIN_EMAIL = "owner-admin@example.com";
 const ADMIN_MCP_URL = "https://paab.test/mcp/admin";
+const ADMIN_ORIGIN = new URL("https://paab.test");
 
 interface SigningKeyPair {
 	kid: string;
@@ -126,10 +128,19 @@ function jwksFetcher(): JwksFetcher {
 }
 
 interface AdminSession {
+	jar: TestCookieJar;
 	cookie: string;
 	csrfToken: string;
 	jwt: string;
 	fetcher: JwksFetcher;
+}
+
+function syncSession(session: AdminSession): void {
+	session.cookie = session.jar.header();
+	const token = session.jar.csrfToken(ADMIN_ORIGIN);
+	if (token !== undefined) {
+		session.csrfToken = token;
+	}
 }
 
 function extractCsrfToken(htmlText: string): string {
@@ -154,11 +165,15 @@ async function openAdminBotSession(
 		now,
 		{ fetchJwks: fetcher },
 	);
-	const setCookie = response.headers.get("Set-Cookie") ?? "";
-	const cookie = setCookie.split(";", 1)[0] ?? "";
+	const jar = new TestCookieJar();
+	jar.applyResponse(response);
 	const html = await response.text();
 	const csrfToken = extractCsrfToken(html);
-	return { session: { cookie, csrfToken, jwt, fetcher }, response, html };
+	return {
+		session: { jar, cookie: jar.header(), csrfToken, jwt, fetcher },
+		response,
+		html,
+	};
 }
 
 async function adminGet(
@@ -170,7 +185,7 @@ async function adminGet(
 		new Request(`https://paab.test${path}`, {
 			method: "GET",
 			headers: {
-				Cookie: session.cookie,
+				Cookie: session.jar.header(),
 				"Cf-Access-Jwt-Assertion": session.jwt,
 			},
 		}),
@@ -178,6 +193,8 @@ async function adminGet(
 		now,
 		{ fetchJwks: session.fetcher },
 	);
+	session.jar.applyResponse(response);
+	syncSession(session);
 	return { response, html: await response.text() };
 }
 
@@ -186,12 +203,17 @@ async function adminPost(
 	path: string,
 	fields: Record<string, string> = {},
 	now = T0,
-): Promise<{ response: Response; html: string }> {
-	const response = await handleAdminRequest(
+): Promise<{
+	response: Response;
+	postResponse: Response;
+	location: string | null;
+	html: string;
+}> {
+	const postResponse = await handleAdminRequest(
 		new Request(`https://paab.test${path}`, {
 			method: "POST",
 			headers: {
-				Cookie: session.cookie,
+				Cookie: session.jar.header(),
 				Origin: "https://paab.test",
 				"Cf-Access-Jwt-Assertion": session.jwt,
 			},
@@ -204,7 +226,27 @@ async function adminPost(
 		now,
 		{ fetchJwks: session.fetcher },
 	);
-	return { response, html: await response.text() };
+	session.jar.applyResponse(postResponse);
+	syncSession(session);
+	if (postResponse.status === 303) {
+		const location = postResponse.headers.get("Location");
+		if (location === null) {
+			throw new Error("Expected Location header on 303 response");
+		}
+		const followed = await adminGet(session, location, now);
+		return {
+			response: followed.response,
+			postResponse,
+			location,
+			html: followed.html,
+		};
+	}
+	return {
+		response: postResponse,
+		postResponse,
+		location: null,
+		html: await postResponse.text(),
+	};
 }
 
 async function connectAdminMcp(token: string, now = T0): Promise<Client> {
@@ -345,7 +387,9 @@ describe("/admin/adminbot 1-click Undo UI", () => {
 			{},
 			T0 + 31,
 		);
-		expect(doubleUndo.response.status).toBe(409);
+		expect(doubleUndo.postResponse.status).toBe(303);
+		expect(doubleUndo.location).toBe("/admin/adminbot");
+		expect(doubleUndo.html).toContain('class="banner banner-error"');
 		expect(doubleUndo.html).toContain("すでに元に戻されています");
 
 		const undoRevoke = await adminPost(
@@ -440,41 +484,23 @@ describe("/admin/adminbot 1-click Undo UI", () => {
 			{},
 			T0 + 21,
 		);
-		expect(conflict.response.status).toBe(409);
+		expect(conflict.postResponse.status).toBe(303);
+		expect(conflict.location).toBe("/admin/adminbot");
+		expect(conflict.html).toContain('class="banner banner-error"');
 		expect(conflict.html).toContain("新しい変更があるため元に戻せません");
 		expect((await loadAgent(grok.id)).dailyQuestionLimit).toBe(30);
 		expect((await loadAgent(grok.id)).status).toBe("active");
 
-		expect(
-			(
-				await adminPost(
-					session,
-					"/admin/adminbot/changes/abc/revert",
-					{},
-					T0 + 22,
-				)
-			).response.status,
-		).toBe(400);
-		expect(
-			(
-				await adminPost(
-					session,
-					"/admin/adminbot/changes/999999/revert",
-					{},
-					T0 + 23,
-				)
-			).response.status,
-		).toBe(404);
-		expect(
-			(
-				await adminPost(
-					session,
-					`/admin/adminbot/changes/${grokReg.changeId}/revert`,
-					{},
-					T0 + 24,
-				)
-			).response.status,
-		).toBe(400);
+		for (const path of [
+			"/admin/adminbot/changes/abc/revert",
+			"/admin/adminbot/changes/999999/revert",
+			`/admin/adminbot/changes/${grokReg.changeId}/revert`,
+		]) {
+			const res = await adminPost(session, path, {}, T0 + 22);
+			expect(res.postResponse.status, path).toBe(303);
+			expect(res.location, path).toBe("/admin/adminbot");
+			expect(res.html, path).toContain('class="banner banner-error"');
+		}
 
 		const noCsrf = await handleAdminRequest(
 			new Request(

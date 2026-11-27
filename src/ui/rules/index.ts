@@ -1,5 +1,4 @@
 import {
-	type AdminErrorCode,
 	createCategory,
 	deleteCategory,
 	grantAllowRule,
@@ -9,10 +8,10 @@ import {
 	queryChangeLog,
 	revokeAllowRule,
 } from "../../admin";
-import { adminPageResponse, type FlashMessage } from "../layout";
+import { adminRedirectResponse, type FlashKind } from "../flash";
+import { adminPageResponse } from "../layout";
 import type { AdminGetContext, AdminPostContext, AdminRoute } from "../router";
 import {
-	type RulesPageFormValues,
 	renderCategoryNotFoundPage,
 	renderDeleteCategoryPage,
 	renderRulesPage,
@@ -21,36 +20,19 @@ import {
 const RULES_PATH = "/admin/rules";
 const RULES_TITLE = "ルール・カテゴリ";
 
-function statusForAdminError(code: AdminErrorCode): number {
-	switch (code) {
-		case "not_found":
-			return 404;
-		case "duplicate_name":
-		case "duplicate_rule":
-			return 409;
-		case "invalid_name":
-		case "invalid_description":
-		case "invalid_limit":
-		case "invalid_input":
-		case "already_suspended":
-		case "already_active":
-		case "self_addressed":
-			return 400;
-	}
-}
-
 function ownerActor(ctx: AdminGetContext) {
 	return { actorType: "owner" as const, actorId: ctx.user.email };
 }
 
-async function renderRulesScreen(
-	ctx: AdminGetContext,
-	options: {
-		status?: number;
-		flash?: FlashMessage;
-		formValues?: RulesPageFormValues;
-	} = {},
-): Promise<Response> {
+function redirectRules(
+	ctx: AdminPostContext,
+	kind: FlashKind,
+	message: string,
+): Response {
+	return adminRedirectResponse(RULES_PATH, ctx.url, { kind, message });
+}
+
+async function handleGetRules(ctx: AdminGetContext): Promise<Response> {
 	const db = ctx.env.DB;
 	const [ruleGroups, agents, categories, changeLog] = await Promise.all([
 		listAllowRulesGrouped(db),
@@ -59,28 +41,20 @@ async function renderRulesScreen(
 		queryChangeLog(db),
 	]);
 
-	return adminPageResponse(
-		{
-			title: RULES_TITLE,
-			currentPath: RULES_PATH,
-			user: ctx.user,
-			devMode: ctx.devMode,
-			flash: options.flash,
-			body: renderRulesPage({
-				csrfToken: ctx.csrfToken,
-				ruleGroups,
-				agents,
-				categories,
-				changeLog,
-				formValues: options.formValues,
-			}),
-		},
-		options.status ?? 200,
-	);
-}
-
-async function handleGetRules(ctx: AdminGetContext): Promise<Response> {
-	return renderRulesScreen(ctx);
+	return adminPageResponse({
+		title: RULES_TITLE,
+		currentPath: RULES_PATH,
+		user: ctx.user,
+		devMode: ctx.devMode,
+		flash: ctx.flash,
+		body: renderRulesPage({
+			csrfToken: ctx.csrfToken,
+			ruleGroups,
+			agents,
+			categories,
+			changeLog,
+		}),
+	});
 }
 
 async function handleGrantRule(ctx: AdminPostContext): Promise<Response> {
@@ -96,16 +70,10 @@ async function handleGrantRule(ctx: AdminPostContext): Promise<Response> {
 		now: ctx.now,
 	});
 	if (!result.ok) {
-		return renderRulesScreen(ctx, {
-			status: statusForAdminError(result.code),
-			flash: { kind: "error", message: result.message },
-			formValues: { fromAgentId, toAgentId, categoryId },
-		});
+		return redirectRules(ctx, "error", result.message);
 	}
 
-	return renderRulesScreen(ctx, {
-		flash: { kind: "success", message: "許可ルールを追加しました。" },
-	});
+	return redirectRules(ctx, "success", "許可ルールを追加しました。");
 }
 
 async function handleRevokeRule(ctx: AdminPostContext): Promise<Response> {
@@ -121,15 +89,10 @@ async function handleRevokeRule(ctx: AdminPostContext): Promise<Response> {
 		now: ctx.now,
 	});
 	if (!result.ok) {
-		return renderRulesScreen(ctx, {
-			status: statusForAdminError(result.code),
-			flash: { kind: "error", message: result.message },
-		});
+		return redirectRules(ctx, "error", result.message);
 	}
 
-	return renderRulesScreen(ctx, {
-		flash: { kind: "success", message: "許可ルールを取り消しました。" },
-	});
+	return redirectRules(ctx, "success", "許可ルールを取り消しました。");
 }
 
 async function handleCreateCategory(ctx: AdminPostContext): Promise<Response> {
@@ -140,19 +103,14 @@ async function handleCreateCategory(ctx: AdminPostContext): Promise<Response> {
 		now: ctx.now,
 	});
 	if (!result.ok) {
-		return renderRulesScreen(ctx, {
-			status: statusForAdminError(result.code),
-			flash: { kind: "error", message: result.message },
-			formValues: { categoryName: rawName },
-		});
+		return redirectRules(ctx, "error", result.message);
 	}
 
-	return renderRulesScreen(ctx, {
-		flash: {
-			kind: "success",
-			message: `カテゴリ「${result.data.category.name}」を追加しました。`,
-		},
-	});
+	return redirectRules(
+		ctx,
+		"success",
+		`カテゴリ「${result.data.category.name}」を追加しました。`,
+	);
 }
 
 async function handleGetDeleteCategory(
@@ -169,6 +127,7 @@ async function handleGetDeleteCategory(
 				currentPath: RULES_PATH,
 				user: ctx.user,
 				devMode: ctx.devMode,
+				flash: ctx.flash,
 				body: renderCategoryNotFoundPage(),
 			},
 			404,
@@ -180,6 +139,7 @@ async function handleGetDeleteCategory(
 		currentPath: RULES_PATH,
 		user: ctx.user,
 		devMode: ctx.devMode,
+		flash: ctx.flash,
 		body: renderDeleteCategoryPage({
 			csrfToken: ctx.csrfToken,
 			category: target.category,
@@ -198,31 +158,40 @@ async function handlePostDeleteCategory(
 		now: ctx.now,
 	});
 	if (!result.ok) {
-		return renderRulesScreen(ctx, {
-			status: statusForAdminError(result.code),
-			flash: { kind: "error", message: result.message },
-		});
+		return redirectRules(ctx, "error", result.message);
 	}
 
-	return renderRulesScreen(ctx, {
-		flash: {
-			kind: "success",
-			message: `カテゴリ「${result.data.category.name}」を削除しました（許可ルール ${result.data.deletedAllowRuleCount} 件も削除）。`,
-		},
-	});
+	return redirectRules(
+		ctx,
+		"success",
+		`カテゴリ「${result.data.category.name}」を削除しました（許可ルール ${result.data.deletedAllowRuleCount} 件も削除）。`,
+	);
 }
 
 /** Routes for editing directional allow rules and question categories under `/admin`. */
 export function ruleRoutes(): AdminRoute[] {
 	return [
 		{ pattern: RULES_PATH, get: handleGetRules },
-		{ pattern: "/admin/rules/grant", post: handleGrantRule },
-		{ pattern: "/admin/rules/revoke", post: handleRevokeRule },
-		{ pattern: "/admin/categories", post: handleCreateCategory },
+		{
+			pattern: "/admin/rules/grant",
+			post: handleGrantRule,
+			fallbackPath: RULES_PATH,
+		},
+		{
+			pattern: "/admin/rules/revoke",
+			post: handleRevokeRule,
+			fallbackPath: RULES_PATH,
+		},
+		{
+			pattern: "/admin/categories",
+			post: handleCreateCategory,
+			fallbackPath: RULES_PATH,
+		},
 		{
 			pattern: "/admin/categories/:id/delete",
 			get: handleGetDeleteCategory,
 			post: handlePostDeleteCategory,
+			fallbackPath: RULES_PATH,
 		},
 	];
 }

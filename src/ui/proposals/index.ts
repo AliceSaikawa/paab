@@ -7,42 +7,25 @@ import {
 	approveProposal,
 	listProposals,
 	MAX_PROPOSAL_LIST_LIMIT,
-	type ProposalErrorCode,
 	rejectProposal,
 } from "../../adminbot";
-import { adminPageResponse, type FlashMessage } from "../layout";
+import { adminRedirectResponse, type FlashKind } from "../flash";
+import { adminPageResponse } from "../layout";
 import type { AdminGetContext, AdminPostContext, AdminRoute } from "../router";
 import { renderProposalsPage } from "./render";
 
 const PROPOSALS_PATH = "/admin/proposals";
 const PROPOSALS_TITLE = "提案";
 
-function statusForProposalError(code: ProposalErrorCode): 400 | 404 | 409 {
-	switch (code) {
-		case "not_found":
-			return 404;
-		case "already_resolved":
-		case "expired":
-		case "premise_changed":
-		case "pending_limit_reached":
-		case "duplicate_name":
-		case "duplicate_rule":
-			return 409;
-		case "invalid_input":
-		case "invalid_name":
-		case "invalid_limit":
-		case "invalid_reason":
-		case "self_addressed":
-		case "already_active":
-		case "limit_not_raised":
-			return 400;
-	}
+function redirectProposals(
+	ctx: AdminPostContext,
+	kind: FlashKind,
+	message: string,
+): Response {
+	return adminRedirectResponse(PROPOSALS_PATH, ctx.url, { kind, message });
 }
 
-async function renderProposalsScreen(
-	ctx: AdminGetContext,
-	options: { status?: number; flash?: FlashMessage } = {},
-): Promise<Response> {
+async function handleGetProposals(ctx: AdminGetContext): Promise<Response> {
 	const db = ctx.env.DB;
 	const [pending, allProposals, agents, categories, changeLog] =
 		await Promise.all([
@@ -64,28 +47,21 @@ async function renderProposalsScreen(
 		(proposal) => proposal.status !== "pending",
 	);
 
-	return adminPageResponse(
-		{
-			title: PROPOSALS_TITLE,
-			currentPath: PROPOSALS_PATH,
-			user: ctx.user,
-			devMode: ctx.devMode,
-			flash: options.flash,
-			body: renderProposalsPage({
-				csrfToken: ctx.csrfToken,
-				pending,
-				history,
-				agents,
-				categories,
-				changeLog,
-			}),
-		},
-		options.status ?? 200,
-	);
-}
-
-async function handleGetProposals(ctx: AdminGetContext): Promise<Response> {
-	return renderProposalsScreen(ctx);
+	return adminPageResponse({
+		title: PROPOSALS_TITLE,
+		currentPath: PROPOSALS_PATH,
+		user: ctx.user,
+		devMode: ctx.devMode,
+		flash: ctx.flash,
+		body: renderProposalsPage({
+			csrfToken: ctx.csrfToken,
+			pending,
+			history,
+			agents,
+			categories,
+			changeLog,
+		}),
+	});
 }
 
 async function handleApproveProposal(ctx: AdminPostContext): Promise<Response> {
@@ -96,18 +72,14 @@ async function handleApproveProposal(ctx: AdminPostContext): Promise<Response> {
 		now: ctx.now,
 	});
 	if (!result.ok) {
-		return renderProposalsScreen(ctx, {
-			status: statusForProposalError(result.code),
-			flash: { kind: "error", message: result.message },
-		});
+		return redirectProposals(ctx, "error", result.message);
 	}
 
-	return renderProposalsScreen(ctx, {
-		flash: {
-			kind: "success",
-			message: `提案を承認し、変更を反映しました（変更履歴 #${result.data.changeId}）。`,
-		},
-	});
+	return redirectProposals(
+		ctx,
+		"success",
+		`提案を承認し、変更を反映しました（変更履歴 #${result.data.changeId}）。`,
+	);
 }
 
 async function handleRejectProposal(ctx: AdminPostContext): Promise<Response> {
@@ -118,25 +90,25 @@ async function handleRejectProposal(ctx: AdminPostContext): Promise<Response> {
 		now: ctx.now,
 	});
 	if (!result.ok) {
-		return renderProposalsScreen(ctx, {
-			status: statusForProposalError(result.code),
-			flash: { kind: "error", message: result.message },
-		});
+		return redirectProposals(ctx, "error", result.message);
 	}
 
-	return renderProposalsScreen(ctx, {
-		flash: {
-			kind: "success",
-			message: "提案を却下しました。",
-		},
-	});
+	return redirectProposals(ctx, "success", "提案を却下しました。");
 }
 
 /** Routes for reviewing, approving, and rejecting admin bot proposals under `/admin`. */
 export function proposalRoutes(): AdminRoute[] {
 	return [
 		{ pattern: PROPOSALS_PATH, get: handleGetProposals },
-		{ pattern: "/admin/proposals/:id/approve", post: handleApproveProposal },
-		{ pattern: "/admin/proposals/:id/reject", post: handleRejectProposal },
+		{
+			pattern: "/admin/proposals/:id/approve",
+			post: handleApproveProposal,
+			fallbackPath: PROPOSALS_PATH,
+		},
+		{
+			pattern: "/admin/proposals/:id/reject",
+			post: handleRejectProposal,
+			fallbackPath: PROPOSALS_PATH,
+		},
 	];
 }

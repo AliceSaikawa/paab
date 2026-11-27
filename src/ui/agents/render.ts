@@ -4,13 +4,6 @@ import { csrfInput } from "../csrf";
 import { html, rawHtml, type SafeHtml } from "../html";
 import { formatTimestamp } from "../layout";
 
-export interface RegisterFormDraft {
-	name: string;
-	description: string;
-	dailyQuestionLimit: string;
-	ownerId: string;
-}
-
 export interface IssuedTokenView {
 	agentName: string;
 	token: string;
@@ -399,15 +392,7 @@ export function renderAgentsPageBody(options: {
 	webhooksByAgentId?: ReadonlyMap<string, AgentWebhookSummary>;
 	defaultOwnerId: string;
 	csrfToken: string;
-	registerDraft?: RegisterFormDraft;
 }): SafeHtml {
-	const draft = options.registerDraft ?? {
-		name: "",
-		description: "",
-		dailyQuestionLimit: "20",
-		ownerId: "",
-	};
-
 	const listSection =
 		options.agents.length === 0
 			? html`
@@ -446,7 +431,7 @@ export function renderAgentsPageBody(options: {
 							name="name"
 							maxlength="64"
 							required
-							value="${draft.name}"
+							value=""
 						>
 						<div class="muted">1〜64文字。改行・制御文字・カンマ（,）は使えません。</div>
 					</div>
@@ -456,7 +441,7 @@ export function renderAgentsPageBody(options: {
 							id="register-description"
 							name="description"
 							maxlength="1000"
-						>${draft.description}</textarea>
+						></textarea>
 					</div>
 					<div class="field">
 						<label for="register-daily-limit">1日あたりの質問数上限</label>
@@ -467,7 +452,7 @@ export function renderAgentsPageBody(options: {
 							min="0"
 							step="1"
 							required
-							value="${draft.dailyQuestionLimit}"
+							value="20"
 						>
 					</div>
 					<div class="field">
@@ -478,7 +463,7 @@ export function renderAgentsPageBody(options: {
 							name="owner_id"
 							maxlength="64"
 							placeholder="${options.defaultOwnerId}"
-							value="${draft.ownerId}"
+							value=""
 						>
 						<div class="muted">
 							空欄の場合は既定の所有者 ID（<code>${options.defaultOwnerId}</code>）が使われます。

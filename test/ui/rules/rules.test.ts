@@ -11,9 +11,11 @@ import { issueToken } from "../../../src/auth";
 import { handleAdminRequest, type UiEnv } from "../../../src/ui";
 import { createTestDb } from "../../helpers/db";
 import { seedAgent, seedCategory, T0 } from "../../helpers/fixtures";
+import { TestCookieJar } from "../../helpers/ui-cookies";
 import { call, connect, withoutFooter } from "../../mcp/support";
 
 const OWNER_EMAIL = "owner@example.com";
+const ADMIN_ORIGIN = new URL("https://paab.test");
 
 let db: D1Database;
 
@@ -33,8 +35,17 @@ function devEnv(devUser = OWNER_EMAIL): UiEnv {
 }
 
 interface CsrfSession {
+	jar: TestCookieJar;
 	cookie: string;
 	token: string;
+}
+
+function syncSession(session: CsrfSession): void {
+	session.cookie = session.jar.header();
+	const token = session.jar.csrfToken(ADMIN_ORIGIN);
+	if (token !== undefined) {
+		session.token = token;
+	}
 }
 
 async function openRulesSession(now = T0): Promise<{
@@ -47,15 +58,15 @@ async function openRulesSession(now = T0): Promise<{
 		devEnv(),
 		now,
 	);
-	const setCookie = response.headers.get("Set-Cookie") ?? "";
-	const cookie = setCookie.split(";", 1)[0] ?? "";
+	const jar = new TestCookieJar();
+	jar.applyResponse(response);
 	const html = await response.text();
 	const tokenMatch = /name="csrf_token" value="([^"]+)"/.exec(html);
-	if (!cookie || !tokenMatch?.[1]) {
+	if (!jar.header() || !tokenMatch?.[1]) {
 		throw new Error("Expected CSRF cookie and hidden token on /admin/rules");
 	}
 	return {
-		session: { cookie, token: tokenMatch[1] },
+		session: { jar, cookie: jar.header(), token: tokenMatch[1] },
 		response,
 		html,
 	};
@@ -66,14 +77,19 @@ async function adminGet(
 	session?: CsrfSession,
 	now = T0,
 ): Promise<Response> {
-	return handleAdminRequest(
+	const response = await handleAdminRequest(
 		new Request(`https://paab.test${path}`, {
 			method: "GET",
-			headers: session ? { Cookie: session.cookie } : {},
+			headers: session ? { Cookie: session.jar.header() } : {},
 		}),
 		devEnv(),
 		now,
 	);
+	if (session) {
+		session.jar.applyResponse(response);
+		syncSession(session);
+	}
+	return response;
 }
 
 async function adminPost(
@@ -82,11 +98,11 @@ async function adminPost(
 	fields: Record<string, string>,
 	now = T0,
 ): Promise<Response> {
-	return handleAdminRequest(
+	const postResponse = await handleAdminRequest(
 		new Request(`https://paab.test${path}`, {
 			method: "POST",
 			headers: {
-				Cookie: session.cookie,
+				Cookie: session.jar.header(),
 				Origin: "https://paab.test",
 			},
 			body: new URLSearchParams({
@@ -97,6 +113,14 @@ async function adminPost(
 		devEnv(),
 		now,
 	);
+	session.jar.applyResponse(postResponse);
+	syncSession(session);
+	if (postResponse.status === 303) {
+		const location = postResponse.headers.get("Location");
+		expect(location).toBe("/admin/rules");
+		return adminGet(location ?? "/admin/rules", session, now);
+	}
+	return postResponse;
 }
 
 async function sha256HeaderValue(text: string): Promise<string> {
@@ -424,7 +448,10 @@ describe("Categories lifecycle and delete confirmation", () => {
 			session,
 			{},
 		);
-		expect(postMissing.status).toBe(404);
+		expect(postMissing.status).toBe(200);
+		const postMissingHtml = await postMissing.text();
+		expect(postMissingHtml).toContain('class="banner banner-error"');
+		expect(postMissingHtml).toContain("見つかりません");
 	});
 });
 
@@ -517,8 +544,10 @@ describe("change_log ordering, validation errors, CSRF, and XSS escaping", () =>
 			to_agent_id: alice.id,
 			category_id: work.id,
 		});
-		expect(selfRule.status).toBe(400);
-		expect(await selfRule.text()).toContain("自分自身への質問を許可するルール");
+		expect(selfRule.status).toBe(200);
+		const selfRuleHtml = await selfRule.text();
+		expect(selfRuleHtml).toContain('class="banner banner-error"');
+		expect(selfRuleHtml).toContain("自分自身への質問を許可するルール");
 
 		await adminPost("/admin/rules/grant", session, {
 			from_agent_id: alice.id,
@@ -530,21 +559,24 @@ describe("change_log ordering, validation errors, CSRF, and XSS escaping", () =>
 			to_agent_id: bob.id,
 			category_id: work.id,
 		});
-		expect(duplicateRule.status).toBe(409);
-		expect(await duplicateRule.text()).toContain(
-			"同じ許可ルールがすでに存在します",
-		);
+		expect(duplicateRule.status).toBe(200);
+		const duplicateRuleHtml = await duplicateRule.text();
+		expect(duplicateRuleHtml).toContain('class="banner banner-error"');
+		expect(duplicateRuleHtml).toContain("同じ許可ルールがすでに存在します");
 
 		const badCategory = await adminPost("/admin/categories", session, {
 			name: "a,b",
 		});
-		expect(badCategory.status).toBe(400);
-		expect(await badCategory.text()).toContain("カンマ");
+		expect(badCategory.status).toBe(200);
+		const badCategoryHtml = await badCategory.text();
+		expect(badCategoryHtml).toContain('class="banner banner-error"');
+		expect(badCategoryHtml).toContain("カンマ");
 
 		const dupCategory = await adminPost("/admin/categories", session, {
 			name: " 仕事 ",
 		});
-		expect(dupCategory.status).toBe(409);
+		expect(dupCategory.status).toBe(200);
+		expect(await dupCategory.text()).toContain('class="banner banner-error"');
 
 		const xssRes = await adminPost(
 			"/admin/categories",

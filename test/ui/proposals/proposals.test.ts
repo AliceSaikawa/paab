@@ -16,9 +16,11 @@ import type { Agent, Category } from "../../../src/types";
 import { handleAdminRequest, type UiEnv } from "../../../src/ui";
 import { createTestDb } from "../../helpers/db";
 import { DAY_MS, seedAgent, seedCategory, T0 } from "../../helpers/fixtures";
+import { TestCookieJar } from "../../helpers/ui-cookies";
 
 const OWNER_EMAIL = "owner@example.com";
 const OWNER = { actorType: "owner" as const, actorId: OWNER_EMAIL };
+const ADMIN_ORIGIN = new URL("https://paab.test");
 
 let db: D1Database;
 let muse: Agent;
@@ -51,8 +53,17 @@ function devEnv(devUser = OWNER_EMAIL): UiEnv {
 }
 
 interface CsrfSession {
+	jar: TestCookieJar;
 	cookie: string;
 	token: string;
+}
+
+function syncSession(session: CsrfSession): void {
+	session.cookie = session.jar.header();
+	const token = session.jar.csrfToken(ADMIN_ORIGIN);
+	if (token !== undefined) {
+		session.token = token;
+	}
 }
 
 async function openProposalsSession(now = T0): Promise<{
@@ -60,30 +71,21 @@ async function openProposalsSession(now = T0): Promise<{
 	response: Response;
 	html: string;
 }> {
-	// Ensure at least one CSRF cookie exists via GET /admin/proposals.
 	const response = await handleAdminRequest(
 		new Request("https://paab.test/admin/proposals", { method: "GET" }),
 		devEnv(),
 		now,
 	);
-	const setCookie = response.headers.get("Set-Cookie") ?? "";
-	const cookie = setCookie.split(";", 1)[0] ?? "";
+	const jar = new TestCookieJar();
+	jar.applyResponse(response);
 	const html = await response.text();
 	const tokenMatch = /name="csrf_token" value="([^"]+)"/.exec(html);
-	if (tokenMatch?.[1]) {
-		return {
-			session: { cookie, token: tokenMatch[1] },
-			response,
-			html,
-		};
-	}
-	// If no pending proposals rendered a form yet, extract token from cookie directly for tests.
-	const cookieVal = cookie.split("=", 2)[1] ?? "";
-	if (!cookie || !cookieVal) {
+	const token = tokenMatch?.[1] ?? jar.csrfToken(ADMIN_ORIGIN) ?? "";
+	if (!jar.header() || !token) {
 		throw new Error("Expected CSRF cookie on /admin/proposals");
 	}
 	return {
-		session: { cookie, token: cookieVal },
+		session: { jar, cookie: jar.header(), token },
 		response,
 		html,
 	};
@@ -94,14 +96,19 @@ async function adminGet(
 	session?: CsrfSession,
 	now = T0,
 ): Promise<Response> {
-	return handleAdminRequest(
+	const response = await handleAdminRequest(
 		new Request(`https://paab.test${path}`, {
 			method: "GET",
-			headers: session ? { Cookie: session.cookie } : {},
+			headers: session ? { Cookie: session.jar.header() } : {},
 		}),
 		devEnv(),
 		now,
 	);
+	if (session) {
+		session.jar.applyResponse(response);
+		syncSession(session);
+	}
+	return response;
 }
 
 async function adminPost(
@@ -110,11 +117,11 @@ async function adminPost(
 	fields: Record<string, string> = {},
 	now = T0,
 ): Promise<Response> {
-	return handleAdminRequest(
+	const postResponse = await handleAdminRequest(
 		new Request(`https://paab.test${path}`, {
 			method: "POST",
 			headers: {
-				Cookie: session.cookie,
+				Cookie: session.jar.header(),
 				Origin: "https://paab.test",
 			},
 			body: new URLSearchParams({
@@ -125,6 +132,14 @@ async function adminPost(
 		devEnv(),
 		now,
 	);
+	session.jar.applyResponse(postResponse);
+	syncSession(session);
+	if (postResponse.status === 303) {
+		const location = postResponse.headers.get("Location");
+		expect(location).toBe("/admin/proposals");
+		return adminGet(location ?? "/admin/proposals", session, now);
+	}
+	return postResponse;
 }
 
 async function loadAgent(id: string): Promise<Agent> {
@@ -403,8 +418,8 @@ describe("POST /admin/proposals/:id/approve and /reject", () => {
 				{},
 				T0 + 20,
 			);
-			expect(res.status).toBe(409);
-			expect(await res.text()).toContain("banner-error");
+			expect(res.status).toBe(200);
+			expect(await res.text()).toContain('class="banner banner-error"');
 		}
 
 		expect((await loadAgent(grok.id)).dailyQuestionLimit).toBe(20);
@@ -437,27 +452,30 @@ describe("POST /admin/proposals/:id/approve and /reject", () => {
 		expect(html).not.toContain("/approve");
 		expect(html).not.toContain("/reject");
 
-		// Direct POST to approve an overdue proposal fails with 409 without mutating state.
+		// Direct POST to approve an overdue proposal redirects with error flash without mutating state.
 		const approveRes = await adminPost(
 			`/admin/proposals/${encodeURIComponent(created.data.proposal.id)}/approve`,
 			session,
 			{},
 			expiredNow,
 		);
-		expect(approveRes.status).toBe(409);
-		expect(await approveRes.text()).toContain("有効期限");
+		expect(approveRes.status).toBe(200);
+		const approveHtml = await approveRes.text();
+		expect(approveHtml).toContain('class="banner banner-error"');
+		expect(approveHtml).toContain("有効期限");
 		expect(
 			(await listCategoriesWithUsage(db)).map((c) => c.category.name),
 		).not.toContain("expired-cat");
 
-		// Missing ID -> 404.
+		// Missing ID redirects with error flash.
 		const missingRes = await adminPost(
 			"/admin/proposals/nonexistent-id/approve",
 			session,
 			{},
 			expiredNow,
 		);
-		expect(missingRes.status).toBe(404);
+		expect(missingRes.status).toBe(200);
+		expect(await missingRes.text()).toContain('class="banner banner-error"');
 
 		// Missing CSRF token -> 403 on both approve and reject.
 		for (const action of ["approve", "reject"]) {

@@ -6,6 +6,7 @@ import { newId } from "../../../src/db";
 import { submitQuestion } from "../../../src/inbox";
 import { handleMcpRequest } from "../../../src/mcp";
 import {
+	csrfCookieName,
 	handleAdminRequest,
 	type JwkKey,
 	type JwksFetcher,
@@ -14,6 +15,7 @@ import {
 import { handleUnreadRequest } from "../../../src/unread";
 import { createTestDb } from "../../helpers/db";
 import { seedCategory, T0 } from "../../helpers/fixtures";
+import { findSetCookie, TestCookieJar } from "../../helpers/ui-cookies";
 import { MCP_URL } from "../../mcp/support";
 
 const TEAM_DOMAIN = "paab-team.cloudflareaccess.com";
@@ -27,11 +29,22 @@ interface SigningKeyPair {
 	jwk: JwkKey;
 }
 
+const ADMIN_ORIGIN = new URL("https://paab.test");
+
 interface AdminSession {
+	jar: TestCookieJar;
 	cookie: string;
 	csrfToken: string;
 	jwt: string;
 	fetcher: JwksFetcher;
+}
+
+function syncSession(session: AdminSession): void {
+	session.cookie = session.jar.header();
+	const token = session.jar.csrfToken(ADMIN_ORIGIN);
+	if (token !== undefined) {
+		session.csrfToken = token;
+	}
 }
 
 let signingKey: SigningKeyPair;
@@ -153,12 +166,12 @@ async function openAdminSession(
 		now,
 		{ fetchJwks: fetcher },
 	);
-	const setCookie = response.headers.get("Set-Cookie") ?? "";
-	const cookie = setCookie.split(";", 1)[0] ?? "";
+	const jar = new TestCookieJar();
+	jar.applyResponse(response);
 	const html = await response.text();
 	const csrfToken = extractCsrfToken(html);
 	return {
-		session: { cookie, csrfToken, jwt, fetcher },
+		session: { jar, cookie: jar.header(), csrfToken, jwt, fetcher },
 		response,
 		html,
 	};
@@ -173,7 +186,7 @@ async function adminGet(
 		new Request(`https://paab.test${path}`, {
 			method: "GET",
 			headers: {
-				Cookie: session.cookie,
+				Cookie: session.jar.header(),
 				"Cf-Access-Jwt-Assertion": session.jwt,
 			},
 		}),
@@ -181,6 +194,8 @@ async function adminGet(
 		now,
 		{ fetchJwks: session.fetcher },
 	);
+	session.jar.applyResponse(response);
+	syncSession(session);
 	return { response, html: await response.text() };
 }
 
@@ -189,16 +204,21 @@ async function adminPost(
 	path: string,
 	fields: Record<string, string>,
 	now = T0,
-): Promise<{ response: Response; html: string }> {
+): Promise<{
+	response: Response;
+	postResponse: Response;
+	location: string | null;
+	html: string;
+}> {
 	const body = new URLSearchParams({
 		csrf_token: session.csrfToken,
 		...fields,
 	});
-	const response = await handleAdminRequest(
+	const postResponse = await handleAdminRequest(
 		new Request(`https://paab.test${path}`, {
 			method: "POST",
 			headers: {
-				Cookie: session.cookie,
+				Cookie: session.jar.header(),
 				Origin: "https://paab.test",
 				"Cf-Access-Jwt-Assertion": session.jwt,
 			},
@@ -208,7 +228,27 @@ async function adminPost(
 		now,
 		{ fetchJwks: session.fetcher },
 	);
-	return { response, html: await response.text() };
+	session.jar.applyResponse(postResponse);
+	syncSession(session);
+	if (postResponse.status === 303) {
+		const location = postResponse.headers.get("Location");
+		if (location === null) {
+			throw new Error("Expected Location header on 303 response");
+		}
+		const followed = await adminGet(session, location, now);
+		return {
+			response: followed.response,
+			postResponse,
+			location,
+			html: followed.html,
+		};
+	}
+	return {
+		response: postResponse,
+		postResponse,
+		location: null,
+		html: await postResponse.text(),
+	};
 }
 
 async function findAgentIdByName(name: string): Promise<string> {
@@ -318,6 +358,7 @@ describe("/admin/agents unread_count token management UI", () => {
 		const participantToken = extractIssuedToken(issueParticipant.html);
 
 		// Issue unread_count token.
+		const csrfBeforeIssue = session.csrfToken;
 		const firstIssue = await adminPost(
 			session,
 			`/admin/agents/${museId}/unread-token`,
@@ -326,7 +367,12 @@ describe("/admin/agents unread_count token management UI", () => {
 		);
 		expect(firstIssue.response.status).toBe(200);
 		expect(firstIssue.response.headers.get("Cache-Control")).toBe("no-store");
-		expect(firstIssue.response.headers.get("Set-Cookie")).toBeNull();
+		const rotatedCookie = findSetCookie(
+			firstIssue.response,
+			csrfCookieName(ADMIN_ORIGIN),
+		);
+		expect(rotatedCookie).toBeTruthy();
+		expect(session.csrfToken).not.toBe(csrfBeforeIssue);
 		expect(firstIssue.response.headers.get("Location")).toBeNull();
 		expect(firstIssue.html).toContain("今この画面に一度だけ表示されます");
 		expect(firstIssue.html).toContain("GET https://paab.test/unread");
@@ -336,6 +382,8 @@ describe("/admin/agents unread_count token management UI", () => {
 		expect(firstIssue.html.match(/<script>/g)).toHaveLength(1);
 
 		const unreadToken1 = extractIssuedToken(firstIssue.html);
+		expect(rotatedCookie).not.toContain(unreadToken1);
+		expect(rotatedCookie).not.toContain(unreadToken1.slice("paab_".length));
 		await assertNoTokenLeakInDb(unreadToken1);
 
 		// Subsequent GET /admin/agents shows active metadata & warning, NEVER plaintext.
@@ -517,28 +565,29 @@ describe("/admin/agents unread_count token management UI", () => {
 		expect(badCsrfRevoke.status).toBe(403);
 		expect((await unreadRawGet(token, T0 + 5)).status).toBe(200);
 
-		// Missing agent IDs return 404 cleanly.
+		// Missing agent IDs redirect 303 to /admin/agents with error flash.
 		const missingId = newId();
-		expect(
-			(
-				await adminPost(
-					session,
-					`/admin/agents/${missingId}/unread-token`,
-					{},
-					T0 + 6,
-				)
-			).response.status,
-		).toBe(404);
-		expect(
-			(
-				await adminPost(
-					session,
-					`/admin/agents/${missingId}/unread-token/revoke`,
-					{},
-					T0 + 6,
-				)
-			).response.status,
-		).toBe(404);
+		const missingIssue = await adminPost(
+			session,
+			`/admin/agents/${missingId}/unread-token`,
+			{},
+			T0 + 6,
+		);
+		expect(missingIssue.postResponse.status).toBe(303);
+		expect(missingIssue.location).toBe("/admin/agents");
+		expect(missingIssue.html).toContain('class="banner banner-error"');
+		expect(missingIssue.html).toContain("見つかりません");
+
+		const missingRevoke = await adminPost(
+			session,
+			`/admin/agents/${missingId}/unread-token/revoke`,
+			{},
+			T0 + 6,
+		);
+		expect(missingRevoke.postResponse.status).toBe(303);
+		expect(missingRevoke.location).toBe("/admin/agents");
+		expect(missingRevoke.html).toContain('class="banner banner-error"');
+		expect(missingRevoke.html).toContain("見つかりません");
 
 		// Deleting the agent cascades unread_count token deletion.
 		const deleted = await adminPost(
@@ -547,6 +596,7 @@ describe("/admin/agents unread_count token management UI", () => {
 			{},
 			T0 + 7,
 		);
+		expect(deleted.postResponse.status).toBe(303);
 		expect(deleted.response.status).toBe(200);
 		expect((await unreadRawGet(token, T0 + 8)).status).toBe(401);
 	});
