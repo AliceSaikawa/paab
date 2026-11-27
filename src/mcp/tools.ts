@@ -10,6 +10,7 @@ import {
 	type AnswerQuestionInput,
 	answerQuestion,
 	fetchInbox,
+	INBOX_FETCH_MODES,
 	type InboxItem,
 	recordBlockedQuestion,
 	submitQuestion,
@@ -218,10 +219,23 @@ function renderInboxItem(
 const checkInbox = defineTool({
 	name: "check_inbox",
 	description:
-		"Receive the messages waiting for you: questions addressed to you, and answers and rejections to questions you asked. Each message is handed over once.",
-	inputSchema: z.object({}),
-	async run(ctx) {
-		const items = await fetchInbox(ctx.db, ctx.agent.id, ctx.now);
+		"Receive messages addressed to you: questions, answers, and rejections. Defaults to mode 'unread', which hands over each undelivered message once. Pass mode 'pending_questions' or 'recent' for read-only recovery of already-delivered messages if a response or context was lost.",
+	inputSchema: z.object({
+		mode: z
+			.enum(INBOX_FETCH_MODES)
+			.optional()
+			.default("unread")
+			.describe(
+				"unread (default): fetch undelivered messages and mark them received. pending_questions: read-only recovery of already-delivered, unanswered, unexpired questions. recent: read-only recovery of delivered pending questions and answers or rejections received within 24 hours while bodies remain.",
+			),
+	}),
+	async run(ctx, { mode }) {
+		const items = await fetchInbox(ctx.db, ctx.agent.id, ctx.now, mode);
+		if (items.length === 0) {
+			return ok(
+				mode === "unread" ? "no new messages" : "no recoverable messages",
+			);
+		}
 		const named = items.filter((item) => item.kind !== "rejection");
 		const [agentNames, categoryNames] = await Promise.all([
 			namesById(
@@ -236,26 +250,26 @@ const checkInbox = defineTool({
 			),
 		]);
 
-		// One batched write for every delivery, not one statement per
-		// question: D1 caps the statements a Worker invocation may run.
-		await recordAuditEvents(
-			ctx.db,
-			ctx.audit,
-			items
-				.filter((item) => item.kind === "question")
-				.map((item) => ({
-					eventType: "question_delivered" as const,
-					occurredAt: ctx.now,
-					fromAgentId: item.fromAgentId,
-					toAgentId: ctx.agent.id,
-					categoryId: item.categoryId,
-					messageId: item.id,
-				})),
-		);
-
-		if (items.length === 0) {
-			return ok("no new messages");
+		// Log question_delivered on initial delivery only; recovery modes are read-only.
+		if (mode === "unread") {
+			// One batched write for every delivery, not one statement per
+			// question: D1 caps the statements a Worker invocation may run.
+			await recordAuditEvents(
+				ctx.db,
+				ctx.audit,
+				items
+					.filter((item) => item.kind === "question")
+					.map((item) => ({
+						eventType: "question_delivered" as const,
+						occurredAt: ctx.now,
+						fromAgentId: item.fromAgentId,
+						toAgentId: ctx.agent.id,
+						categoryId: item.categoryId,
+						messageId: item.id,
+					})),
+			);
 		}
+
 		return ok(
 			renderFramed((frame) =>
 				[

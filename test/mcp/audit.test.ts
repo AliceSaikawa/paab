@@ -152,4 +152,21 @@ describe("audit log", () => {
 		});
 		expect(await queryAuditLog(world.db)).toEqual([]);
 	});
+
+	it("logs question_delivered once even when recovery modes re-fetch the question", async () => {
+		const alice = await connect(world.alice.token);
+		const bob = await connect(world.bob.token);
+		const questionId = await askBob(alice, "When are you free?");
+
+		await call(bob, "check_inbox");
+		await call(bob, "check_inbox", { mode: "pending_questions" });
+		await call(bob, "check_inbox", { mode: "recent" });
+		await call(bob, "check_inbox", { mode: "pending_questions" });
+
+		const delivered = (await queryAuditLog(world.db)).filter(
+			(row) => row.eventType === "question_delivered",
+		);
+		expect(delivered).toHaveLength(1);
+		expect(delivered[0]?.messageId).toBe(questionId);
+	});
 });

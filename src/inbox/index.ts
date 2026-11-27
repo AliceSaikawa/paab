@@ -15,7 +15,9 @@ export { BODY_RETENTION_MS, QUESTION_TTL_MS } from "./constants";
 export {
 	countUnread,
 	fetchInbox,
+	INBOX_FETCH_MODES,
 	type InboxAnswer,
+	type InboxFetchMode,
 	type InboxItem,
 	type InboxQuestion,
 	type InboxRejection,
