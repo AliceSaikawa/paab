@@ -2,6 +2,8 @@ export {
 	type AccessResult,
 	type AccessUser,
 	clearJwksCache,
+	JWKS_CACHE_TTL_MS,
+	JWKS_UNKNOWN_KID_REFETCH_COOLDOWN_MS,
 	type JwkKey,
 	type JwksDocument,
 	type JwksFetcher,

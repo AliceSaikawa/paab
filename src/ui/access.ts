@@ -40,7 +40,8 @@ export interface VerifyAccessOptions {
 	fetchJwks?: JwksFetcher;
 }
 
-const JWKS_CACHE_TTL_MS = 5 * 60 * 1000;
+export const JWKS_CACHE_TTL_MS = 5 * 60 * 1000;
+export const JWKS_UNKNOWN_KID_REFETCH_COOLDOWN_MS = 60 * 1000;
 const BASE64URL_PATTERN = /^[A-Za-z0-9_-]+$/;
 const HOSTNAME_LABEL = "[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?";
 const TEAM_DOMAIN_PATTERN = new RegExp(
@@ -51,7 +52,13 @@ const TEAM_DOMAIN_PATTERN = new RegExp(
 interface CachedJwks {
 	fetchedAt: UnixMillis;
 	keysByKid: Map<string, CryptoKey>;
+	lastUnknownKidRefetchAt: UnixMillis | null;
 }
+
+type KeyResolution =
+	| { kind: "found"; key: CryptoKey }
+	| { kind: "missing" }
+	| { kind: "fetch_failed" };
 
 // Key cache per fetcher function so custom test fetchers stay isolated without disabling cache tests.
 const jwksCacheByFetcher = new WeakMap<JwksFetcher, Map<string, CachedJwks>>();
@@ -66,8 +73,8 @@ async function defaultFetchJwks(jwksUrl: string): Promise<unknown> {
 	return response.json();
 }
 
-export function clearJwksCache(): void {
-	jwksCacheByFetcher.delete(defaultFetchJwks);
+export function clearJwksCache(fetcher: JwksFetcher = defaultFetchJwks): void {
+	jwksCacheByFetcher.delete(fetcher);
 }
 
 export function normalizeTeamDomain(raw: string): string | null {
@@ -297,7 +304,32 @@ async function importJwks(
 			// Skip malformed or unsupported keys so other valid keys in the set still load.
 		}
 	}
-	return keysByKid;
+	return keysByKid.size > 0 ? keysByKid : null;
+}
+
+function latestTimestamp(
+	a: UnixMillis | null,
+	b: UnixMillis | null,
+): UnixMillis | null {
+	if (a === null) {
+		return b;
+	}
+	if (b === null) {
+		return a;
+	}
+	return Math.max(a, b);
+}
+
+async function fetchAndImportJwks(
+	jwksUrl: string,
+	fetcher: JwksFetcher,
+): Promise<Map<string, CryptoKey> | null> {
+	try {
+		const raw = await fetcher(jwksUrl);
+		return await importJwks(raw);
+	} catch {
+		return null;
+	}
 }
 
 async function resolvePublicKey(
@@ -305,29 +337,53 @@ async function resolvePublicKey(
 	kid: string,
 	now: UnixMillis,
 	fetcher: JwksFetcher,
-): Promise<{ ok: true; key: CryptoKey | null } | { ok: false }> {
+): Promise<KeyResolution> {
 	const cache = getFetcherCache(fetcher);
 	const cached = cache.get(jwksUrl);
-	if (cached !== undefined && now - cached.fetchedAt < JWKS_CACHE_TTL_MS) {
+	const isFresh =
+		cached !== undefined && now - cached.fetchedAt < JWKS_CACHE_TTL_MS;
+
+	if (isFresh) {
 		const hit = cached.keysByKid.get(kid);
 		if (hit !== undefined) {
-			return { ok: true, key: hit };
+			return { kind: "found", key: hit };
 		}
+		if (
+			cached.lastUnknownKidRefetchAt !== null &&
+			now - cached.lastUnknownKidRefetchAt <
+				JWKS_UNKNOWN_KID_REFETCH_COOLDOWN_MS
+		) {
+			return { kind: "missing" };
+		}
+		cached.lastUnknownKidRefetchAt = now;
 	}
 
-	let keysByKid: Map<string, CryptoKey> | null;
-	try {
-		const raw = await fetcher(jwksUrl);
-		keysByKid = await importJwks(raw);
-	} catch {
-		return { ok: false };
-	}
+	const keysByKid = await fetchAndImportJwks(jwksUrl, fetcher);
 	if (keysByKid === null) {
-		return { ok: false };
+		const fallback = cache.get(jwksUrl) ?? cached;
+		const staleKey = fallback?.keysByKid.get(kid);
+		if (staleKey !== undefined) {
+			return { kind: "found", key: staleKey };
+		}
+		return { kind: "fetch_failed" };
 	}
 
-	cache.set(jwksUrl, { fetchedAt: now, keysByKid });
-	return { ok: true, key: keysByKid.get(kid) ?? null };
+	const key = keysByKid.get(kid);
+	const latest = cache.get(jwksUrl);
+	const lastUnknownKidRefetchAt = latestTimestamp(
+		isFresh || key === undefined ? now : null,
+		latest?.lastUnknownKidRefetchAt ?? null,
+	);
+	if (latest === undefined || now >= latest.fetchedAt) {
+		cache.set(jwksUrl, {
+			fetchedAt: now,
+			keysByKid,
+			lastUnknownKidRefetchAt,
+		});
+	} else {
+		latest.lastUnknownKidRefetchAt = lastUnknownKidRefetchAt;
+	}
+	return key !== undefined ? { kind: "found", key } : { kind: "missing" };
 }
 
 /**
@@ -431,14 +487,14 @@ export async function verifyAccessRequest(
 	const jwksUrl = `https://${teamDomain}/cdn-cgi/access/certs`;
 	const fetcher = options.fetchJwks ?? defaultFetchJwks;
 	const resolved = await resolvePublicKey(jwksUrl, parsed.kid, now, fetcher);
-	if (!resolved.ok) {
+	if (resolved.kind === "fetch_failed") {
 		return {
 			ok: false,
 			status: 503,
 			message: "Cloudflare Access の公開鍵を取得できませんでした",
 		};
 	}
-	if (resolved.key === null) {
+	if (resolved.kind === "missing") {
 		return {
 			ok: false,
 			status: 403,
