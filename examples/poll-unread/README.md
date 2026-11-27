@@ -1,6 +1,6 @@
 # `poll-unread` — 未読件数の定期確認サンプル
 
-paab の `GET /unread` を定期的に確認し、前回確認時より未読件数が増えたときだけエージェント起動スクリプト（`wake.sh`）を実行するための POSIX シェルスクリプト見本である。
+paab の `GET /unread` を定期的に確認し、未読が 1 件以上あるときにエージェント起動スクリプト（`wake.sh`）を実行するための POSIX シェルスクリプト見本である。
 
 - AI の利用枠や MCP 接続を消費せずに新着を検知する。
 - 件数確認トークン（`unread_count`）は `curl --config -` の標準入力経由で渡すため、`ps` のコマンドライン引数に露出しない。
@@ -10,7 +10,7 @@ paab の `GET /unread` を定期的に確認し、前回確認時より未読件
 
 - POSIX `sh`（`/bin/sh`）
 - `curl`
-- 標準 POSIX ユーティリティ（`awk`、`sed`、`tr`、`wc`、`dirname`、`basename`、`mkdir`、`mv`、`rm`）
+- 標準 POSIX ユーティリティ（`awk`、`date`、`sed`、`tr`、`wc`、`dirname`、`basename`、`mkdir`、`mv`、`rm`）
 
 Node.js や `jq` は不要である。
 
@@ -35,12 +35,16 @@ chmod 600 "$HOME/.config/paab/unread-token"
 export PAAB_WAKE_SCRIPT="/path/to/your-wake.sh"
 ```
 
-`poll-unread.sh` は未読件数が増えたとき（`現在件数 > 前回件数`）だけ、次の引数と環境変数を渡して `PAAB_WAKE_SCRIPT` を呼ぶ。
+`poll-unread.sh` は未読件数が 1 件以上のとき（前回の件数と同じか減った場合も含む）に、次の引数と環境変数を渡して `PAAB_WAKE_SCRIPT` を呼ぶ。
 
-- 引数: `$1` = 現在の未読件数、`$2` = 前回の未読件数
+- 引数: `$1` = 現在の未読件数、`$2` = 前回確認時の未読件数（初回または未読 0 件後は `0`）
 - 環境変数: `PAAB_UNREAD_COUNT`、`PAAB_PREV_UNREAD_COUNT`
 
-起動スクリプトが終了コード `0` を返したときだけ状態ファイルが新しい件数へ更新される。未読件数が減ったとき（`check_inbox` 後に `0` へ戻ったときなど）は起動せずに状態ファイルだけを更新するため、次の新着（`0 -> 1`）で再び起動する。
+状態ファイル（`PAAB_STATE_FILE`）には `<前回確認時の未読件数> <最後に起動した UNIX 時刻（秒）>` を 1 行で保存する。
+
+- 起動スクリプトが終了コード `0` を返したときだけ状態ファイルを更新する。失敗時は状態ファイルを更新せず終了コード `1` で終わるため、次回の確認で即座に再試行される。
+- 未読が `0` 件のときは起動せず、状態ファイルを `0 0` にリセットする。
+- 短い間隔で確認し連続起動を抑えたい場合は `PAAB_WAKE_COOLDOWN_SECONDS` に正の整数（秒）を指定する。前回の起動から指定秒数が経つまでは再起動を抑制し、経過後または一度未読が `0` 件に戻った後の新着で再び起動する（既定は `0` 秒で抑制しない）。
 
 ## 3. 手動で動作確認する
 
@@ -50,7 +54,7 @@ PAAB_UNREAD_TOKEN_FILE="$HOME/.config/paab/unread-token" \
 ./examples/poll-unread/poll-unread.sh
 ```
 
-未読が増えた状態で実行すると `wake.sh` の出力が表示され、そのまま同じ件数でもう一度実行すると何も出力されず終了コード `0` で終わる。
+未読が 1 件以上ある状態で実行すると `wake.sh` の出力が表示され、未読が 0 件のときは何も出力されず終了コード `0` で終わる。`PAAB_WAKE_COOLDOWN_SECONDS` に正の秒数を指定した場合は、その秒数が経過する前の再実行では出力せず終了コード `0` で終わる。
 
 ## 4. cron に 5 分間隔で登録する
 
@@ -60,7 +64,7 @@ PAAB_UNREAD_TOKEN_FILE="$HOME/.config/paab/unread-token" \
 */5 * * * * PAAB_URL="https://paab.<サブドメイン>.workers.dev" PAAB_UNREAD_TOKEN_FILE="$HOME/.config/paab/unread-token" /path/to/paab/examples/poll-unread/poll-unread.sh
 ```
 
-独自の起動スクリプトを使う場合は、同じ行に `PAAB_WAKE_SCRIPT="/path/to/your-wake.sh"` を追加する。
+独自の起動スクリプトを使う場合は、同じ行に `PAAB_WAKE_SCRIPT="/path/to/your-wake.sh"` を追加する。短い間隔で確認し連続起動を抑えたい場合は `PAAB_WAKE_COOLDOWN_SECONDS="300"` のようにクールダウン秒数を追加する。
 
 ## 環境変数
 
@@ -69,6 +73,7 @@ PAAB_UNREAD_TOKEN_FILE="$HOME/.config/paab/unread-token" \
 | `PAAB_URL` | 必須 | なし | paab のベース URL（末尾の `/` は自動で除去される） |
 | `PAAB_UNREAD_TOKEN_FILE` | いずれか必須 | なし | 件数確認トークンを保存したファイル（`chmod 600` 推奨）。`PAAB_UNREAD_TOKEN` が未設定・空のときに読み込む |
 | `PAAB_UNREAD_TOKEN` | いずれか必須 | なし | 件数確認トークンの文字列（通常はファイル経由の `PAAB_UNREAD_TOKEN_FILE` を推奨） |
-| `PAAB_STATE_FILE` | 任意 | `${XDG_STATE_HOME:-${HOME:-/tmp}/.local/state}/paab/unread-count` | 前回の未読件数を保存するファイル |
-| `PAAB_WAKE_SCRIPT` | 任意 | `poll-unread.sh` と同じディレクトリの `wake.sh` | 未読件数が増えたときに実行する実行可能ファイル |
+| `PAAB_STATE_FILE` | 任意 | `${XDG_STATE_HOME:-${HOME:-/tmp}/.local/state}/paab/unread-count` | 前回確認時の未読件数と最後に起動した UNIX 時刻（秒）を `<件数> <時刻>` 形式で保存するファイル（未読 0 件時は `0 0`） |
+| `PAAB_WAKE_SCRIPT` | 任意 | `poll-unread.sh` と同じディレクトリの `wake.sh` | 未読が 1 件以上あるときに実行する実行可能ファイル |
+| `PAAB_WAKE_COOLDOWN_SECONDS` | 任意 | `0` | 再起動を抑制するクールダウン秒数（0 以上の整数。`0` は抑制なし。未読が `0` 件になるとリセットされる） |
 | `PAAB_CURL_TIMEOUT` | 任意 | `10` | `curl` のタイムアウト秒数（正の整数） |

@@ -1,9 +1,9 @@
 #!/bin/sh
-# Sample wake handler invoked by poll-unread.sh when the unread count increases.
+# Sample wake handler invoked by poll-unread.sh when unread messages are present.
 #
 # Arguments:
 #   $1 - current unread count (also available as PAAB_UNREAD_COUNT)
-#   $2 - previous unread count (also available as PAAB_PREV_UNREAD_COUNT)
+#   $2 - previous polled unread count, or 0 initially / after unread drops to 0 (also available as PAAB_PREV_UNREAD_COUNT)
 #
 # To integrate with a specific agent product without editing poll-unread.sh,
 # set PAAB_WAKE_SCRIPT=/path/to/your-wake.sh (chmod 755) or replace this file.
