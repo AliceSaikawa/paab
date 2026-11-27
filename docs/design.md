@@ -47,9 +47,9 @@ paab（Personal SI Agent Bridge）は、同一人物が使う複数のパーソ�
 - どのツールの返り値にも、末尾に未読件数を付ける。
 - 対応しているエージェントには、新着時に登録済みの呼び出し先URLを叩いて起こす。
   - 本文は送らず、新着があることだけを伝える。
-  - 署名を付ける。失敗時は数回だけ再試行して諦める（メッセージは受信箱に残る）。
-  - 呼び出し先URLは画面から利用者だけが登録する。
-- エージェントのVM上で動く定期確認スクリプトからも新着を確認できるようにする（2.5 節）。製品ごとに、呼び出し先URL方式とスクリプト方式のうち使える方を選ぶ。
+  - 署名または認証ヘッダーを付ける（Standard Webhooks、Bearer・任意ヘッダー、paab独自HMACの選択。詳細は [docs/agent-trigger-design.md](agent-trigger-design.md)）。失敗時は数回だけ再試行して諦める（メッセージは受信箱に残る）。
+  - 呼び出し先URLと認証設定は画面から利用者だけが登録する。
+- エージェントのVM上で動く定期確認スクリプトやフックからも新着を確認できるようにする（2.5 節）。製品ごとに、呼び出し先URL方式と定期確認方式のうち使える方を選ぶ。
 
 ### 2.4 受信箱方式の代替手段（2026-11-16 調査）
 
@@ -77,7 +77,7 @@ paab（Personal SI Agent Bridge）は、同一人物が使う複数のパーソ�
 - エージェントごとに、この窓口専用の「件数確認トークン」を発行する。件数しか取れず、質問・回答・本文の取得はできない。コネクタ用のトークンとは別物で、VM内に置くことを前提とする。
 - 5分おきに件数を確認し、新着があればエージェントを起こすサンプルスクリプトを同梱する。起こし方は製品ごとに違うので、その部分は差し替えられるようにする。
 
-成立条件は 8 節の未確認事項を参照。
+成立条件は 8 節の未確認事項と [docs/agent-trigger-design.md](agent-trigger-design.md) を参照（例として Meta Muse の公式フックはシークレットやコネクタ資格情報を持てない制約があるため、フックから件数確認トークン付きで叩けるかは実機で確認する）。
 
 ## 3. 開示の制御
 
@@ -200,12 +200,15 @@ paab（Personal SI Agent Bridge）は、同一人物が使う複数のパーソ�
 
 ### 6.2 対象エージェント
 
-| 製品 | 扱い | 調査で分かったこと（2026-11-16、いずれも第三者の記事による） |
+| 製品 | 扱い | 調査で分かったこと（2026-11-16 初期調査、2026-11-27 追記） |
 | --- | --- | --- |
-| Muse（Meta） | 最初の実機 | URLを貼る設定欄はなく、チャットで依頼してカスタムコネクタを作らせる。Streamable HTTPと `Authorization` ヘッダーに対応するとの記事がある。ツール呼び出しごとに承認ダイアログが出るとの記述がある |
-| Grok Bot（xAI） | 2体目の実機 | 名前、URL、任意のHTTPヘッダーでリモートMCPサーバーを追加できるとの記事がある。定期実行とWebhookを起点に動けるとの記事があり、4段階目の起こす仕組みと合う見込み |
+| Muse（Meta） | 最初の実機 | URLを貼る設定欄はなく、`credentials.request_api_access` でカスタムコネクタを作る。単一APIキーのヘッダー配置（`Authorization: Bearer` 相当）に対応し、接続先ホストは登録制。公式のインバウンドWebhook受信口とサイドチャットへの外部投稿APIはなく、ランタイム管理のcron（公式例 `5m`・`15m`・`1h`）とフック（最短5秒・既定60秒、`wake` でワーカー起動。資格情報は持てない）が常駐する。`Background sync` の Allow・Deny 行はユーザー作成のcron・フックの対象外（2026-11-27 実環境で確認）。Muse Mail（`@muse.ai`）もある |
+| Grok Bot（xAI） | 2体目の実機 | Automation・Routine に公式の Webhook Trigger（`whsec_` 鍵の Standard Webhooks 署名）と定期実行がある。API・CLI は `Authorization` ヘッダー対応だが、`grok.com/connectors` UI は OAuth 前提の記述と食い違う。Webhook 起動ルーチンからプライベート Custom MCP を呼ぶ際のスコープ制限報告がある |
+| Cue（Manus 2.0） | 3体目の候補 | Manus 2.0 Automations に URL と認証ヘッダーで起動する公式 Webhook Trigger があり、Cue エージェントごとに専用メールアドレス・クラウド環境・定期実行が付与される。Custom MCP は Bearer・API キー認証に対応。Automations Webhook が Cue 個人エージェントの記憶と文脈を引き継ぐかは未確認 |
 | instinct | 対象外 | 独自ツールを追加する手段がない（利用者が製品内で確認） |
 | Claude Duet、Pickle | 未調査 | — |
+
+各製品の起動トリガー比較と詳細設計は [docs/agent-trigger-design.md](agent-trigger-design.md) を参照。
 
 出典：
 - https://www.cdata.com/kb/tech/onedrive-cloud-muse.rst
@@ -228,8 +231,9 @@ paab（Personal SI Agent Bridge）は、同一人物が使う複数のパーソ�
 実装時に確かめ、結果をこの文書に追記する。
 
 - **確認済み**: 使用するライブラリのバージョンと対応状況（`@modelcontextprotocol/server` 2.4.0 の `createMcpHandler` による Web Standard Fetch Streamable HTTP と `zod` 4.6.7 を直接利用。Cloudflare の `agents` 補助パッケージは不要）。
-- **未確認**: Museでヘッダー方式が通るか。承認ダイアログが自発的な受信箱確認を妨げるか（実機未試験）。
-- **未確認**: Grok Botでヘッダー方式が通るか。「コネクタの認証はOAuthのみ」とするフォーラム投稿があり、ヘッダーで接続できたとする記事と食い違っている（実機未試験）。
-- **未確認**: MuseとGrok Botそれぞれで、VMとその上のスクリプトが会話の外でも動き続けるか（実機未試験）。
-- **未確認**: MuseとGrok Botそれぞれで、VM上のスクリプトからエージェント本体を起こせるか（実機未試験）。
+- **確認済み（2026-11-27、Muse 実環境）**: Muse に公式のインバウンド Webhook とサイドチャット外部投稿 API はない。ランタイム管理の cron とフックはアプリ終了や VM 入れ替え後も常駐し、フックが `wake` を返すとワーカーエージェントが起動する。ただしフック自体はシークレットやコネクタ資格情報を持てない。`credentials.request_api_access` は単一 API キーのヘッダー配置に対応し、`Background sync` の Allow・Deny 行はユーザー作成の cron・フックには適用されない。
+- **未確認**: Muse で実際に paab の `/mcp` へ Bearer 接続したとき、カスタム MCP ツールが権限ツリーと事前承認（preapproval）に対応して無人実行できるか。またフックから `GET /unread` 相当の外部 HTTP GET（低権限トークン付き）と `wake` 後のワーカーからのカスタム MCP 呼び出しが通るか（実機未試験。検証手順は [docs/agent-trigger-design.md](agent-trigger-design.md#5-第-4-段階実装前の実機検証ゲート)）。
+- **未確認**: Grok Bot の `grok.com/connectors` UI でヘッダー方式が通るか（OAuth のみとする報告と食い違い）。また Webhook Trigger 起動のルーチンからプライベート Custom MCP を承認・スコープ制限なしで呼べるか（実機未試験）。
+- **未確認**: Cue（Manus 2.0）で Automations の Webhook Trigger が Cue 個人エージェントの記憶と Custom MCP 接続を引き継いで動くか、別タスクになるか（実機未試験）。
+- **未確認**: Grok Bot で VM とその上のスクリプトが会話の外でも動き続け、エージェント本体を起こせるか（実機未試験）。
 - **未確認**: GitHubにパスキーでログインした場合にCloudflare Accessを通るか。拒否されたという未解決の報告が1件ある（https://community.cloudflare.com/t/zero-trust-access-github-oauth-with-username-pass-ok-but-not-passkey-for-same-acc/908415 ）。
