@@ -15,7 +15,10 @@ export const WEBHOOK_BLOCKED_DELAY_MS = 60_000;
 export const WEBHOOK_TIMEOUT_MS = 5_000;
 export const DEFAULT_DUE_WEBHOOK_LIMIT = 8;
 export const WEBHOOK_IN_FLIGHT_LEASE_MS = 10_000;
+export const WEBHOOK_DELIVERY_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
+const WEBHOOK_PURGE_CHUNK = 500;
+const MAX_WEBHOOK_PURGE_CHUNKS = 5;
 const MAX_ERROR_LENGTH = 200;
 
 function stripControlChars(text: string): string {
@@ -687,4 +690,37 @@ export async function scheduleDelayedWake(
 			// Never throw to the caller.
 		}
 	}
+}
+
+/**
+ * Deletes finished (`delivered` or `abandoned`) webhook delivery rows whose
+ * `updated_at` is at or before `now - WEBHOOK_DELIVERY_RETENTION_MS`. Pending
+ * rows are never touched.
+ */
+export async function purgeFinishedWebhookDeliveries(
+	db: D1Database,
+	now: UnixMillis,
+): Promise<number> {
+	const cutoff = now - WEBHOOK_DELIVERY_RETENTION_MS;
+	const statement = db
+		.prepare(
+			`DELETE FROM webhook_deliveries
+			WHERE id IN (
+				SELECT id FROM webhook_deliveries
+				WHERE status IN ('delivered', 'abandoned') AND updated_at <= ?1
+				ORDER BY updated_at ASC
+				LIMIT ?2
+			)`,
+		)
+		.bind(cutoff, WEBHOOK_PURGE_CHUNK);
+	let deleted = 0;
+	for (let chunk = 0; chunk < MAX_WEBHOOK_PURGE_CHUNKS; chunk += 1) {
+		const result = await statement.run();
+		const changes = result.meta.changes ?? 0;
+		deleted += changes;
+		if (changes < WEBHOOK_PURGE_CHUNK) {
+			break;
+		}
+	}
+	return deleted;
 }

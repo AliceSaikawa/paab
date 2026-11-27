@@ -1,7 +1,13 @@
 import { env } from "cloudflare:workers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { queryAuditLog, recordAuditEvent } from "../../src/audit";
-import { submitQuestion } from "../../src/inbox";
+import { issueToken } from "../../src/auth";
+import {
+	answerQuestion,
+	fetchInbox,
+	recordBlockedQuestion,
+	submitQuestion,
+} from "../../src/inbox";
 import { runScheduledMaintenance } from "../../src/mcp";
 import { DAY_MS, T0 } from "../helpers/fixtures";
 import {
@@ -262,7 +268,7 @@ describe("check_inbox", () => {
 		const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
 		const prepare = world.db.prepare.bind(world.db);
 		vi.spyOn(world.db, "prepare").mockImplementation((query: string) => {
-			if (query.includes("FROM messages")) {
+			if (query.includes("SELECT * FROM messages")) {
 				throw new Error("expiry failed");
 			}
 			if (query.includes("UPDATE audit_log")) {
@@ -307,7 +313,7 @@ describe("check_inbox", () => {
 		vi.spyOn(console, "error").mockImplementation(() => {});
 		const prepare = world.db.prepare.bind(world.db);
 		vi.spyOn(world.db, "prepare").mockImplementation((query: string) => {
-			if (query.includes("FROM messages")) {
+			if (query.includes("SELECT * FROM messages")) {
 				throw new Error("expiry failed");
 			}
 			return prepare(query);
@@ -329,6 +335,178 @@ describe("check_inbox", () => {
 			["expired-audit-body", null],
 			["fresh-audit-body", "recent secret"],
 		]);
+	});
+
+	it("returns full MaintenanceResult counts across all retention steps and honors AUDIT_LOG_RETENTION_DAYS", async () => {
+		// 1. Old blocked question + rejection (will be purged at 90+ days).
+		await recordBlockedQuestion(world.db, {
+			fromAgentId: world.alice.agent.id,
+			toAgentId: world.bob.agent.id,
+			categoryId: world.schedule.id,
+			now: T0,
+		});
+		// 2. Unfetched answer created 7 days before runNow (body deleted in inbox step).
+		const runNow = T0 + 400 * DAY_MS;
+		const recentQ = await submitQuestion(world.db, {
+			fromAgentId: world.alice.agent.id,
+			toAgentId: world.bob.agent.id,
+			categoryId: world.schedule.id,
+			body: "Recent question",
+			now: runNow - 8 * DAY_MS,
+		});
+		await fetchInbox(world.db, world.bob.agent.id, runNow - 8 * DAY_MS + 1);
+		await answerQuestion(world.db, {
+			questionId: recentQ.questionId,
+			responderAgentId: world.bob.agent.id,
+			reply: { kind: "answer", body: "Unfetched answer body" },
+			now: runNow - 7 * DAY_MS,
+		});
+		// 3. Old audit_log entry (occurred at T0 -> > 365 days old) and a recent one.
+		await recordAuditEvent(
+			world.db,
+			{ recordBodies: true, bodyRetentionDays: 30 },
+			{
+				occurredAt: T0,
+				eventType: "question_accepted",
+				fromAgentId: world.alice.agent.id,
+				toAgentId: world.bob.agent.id,
+				categoryId: world.schedule.id,
+				messageId: "ancient-audit",
+				body: "old audit body",
+			},
+		);
+		await recordAuditEvent(
+			world.db,
+			{ recordBodies: true, bodyRetentionDays: 30 },
+			{
+				occurredAt: runNow - 10 * DAY_MS,
+				eventType: "question_accepted",
+				fromAgentId: world.alice.agent.id,
+				toAgentId: world.bob.agent.id,
+				categoryId: world.schedule.id,
+				messageId: "recent-audit",
+				body: "recent audit body",
+			},
+		);
+		// 4. Revoked token (> 30 days old).
+		await issueToken(world.db, {
+			agentId: world.alice.agent.id,
+			purpose: "participant",
+			now: T0 + DAY_MS,
+		});
+		// 5. Finished webhook_deliveries row (> 30 days old).
+		await world.db
+			.prepare(
+				`INSERT INTO webhook_deliveries
+					(id, agent_id, status, attempts, next_attempt_at, last_error, created_at, updated_at)
+				VALUES ('old-wh', ?, 'delivered', 1, ?, NULL, ?, ?)`,
+			)
+			.bind(world.bob.agent.id, T0, T0, T0)
+			.run();
+
+		// First run with AUDIT_LOG_RETENTION_DAYS="0": keeps ancient-audit row while running all other purges.
+		const keepLogsResult = await runScheduledMaintenance(
+			{
+				...env,
+				AUDIT_RECORD_BODIES: "true",
+				AUDIT_BODY_RETENTION_DAYS: "30",
+				AUDIT_LOG_RETENTION_DAYS: "0",
+			},
+			runNow,
+		);
+		expect(keepLogsResult).toEqual({
+			expiredQuestions: 0,
+			messageBodiesDeleted: 2, // recentQ + its unfetched answer
+			messagesPurged: 2, // old blocked question + its rejection
+			auditBodiesDeleted: 1, // ancient-audit body
+			auditLogsPurged: 0, // disabled via "0"
+			revokedTokensPurged: 1,
+			expiredProposals: 0,
+			webhooksProcessed: 0,
+			webhookDeliveriesPurged: 1,
+		});
+
+		// Second run with default AUDIT_LOG_RETENTION_DAYS (365): deletes ancient-audit row only.
+		const defaultResult = await runScheduledMaintenance(
+			{
+				...env,
+				AUDIT_RECORD_BODIES: "true",
+				AUDIT_BODY_RETENTION_DAYS: "30",
+			},
+			runNow,
+		);
+		expect(defaultResult).toEqual({
+			expiredQuestions: 0,
+			messageBodiesDeleted: 0,
+			messagesPurged: 0,
+			auditBodiesDeleted: 0,
+			auditLogsPurged: 1,
+			revokedTokensPurged: 0,
+			expiredProposals: 0,
+			webhooksProcessed: 0,
+			webhookDeliveriesPurged: 0,
+		});
+		expect((await queryAuditLog(world.db)).map((r) => r.messageId)).toEqual([
+			"recent-audit",
+		]);
+	});
+
+	it("isolates failures in new retention purge steps so sibling purges still run", async () => {
+		await recordAuditEvent(
+			world.db,
+			{ recordBodies: false, bodyRetentionDays: 0 },
+			{
+				occurredAt: T0,
+				eventType: "question_accepted",
+				fromAgentId: world.alice.agent.id,
+				toAgentId: world.bob.agent.id,
+				categoryId: world.schedule.id,
+				messageId: "old-audit",
+			},
+		);
+		await issueToken(world.db, {
+			agentId: world.alice.agent.id,
+			purpose: "participant",
+			now: T0 + DAY_MS,
+		});
+		await world.db
+			.prepare(
+				`INSERT INTO webhook_deliveries
+					(id, agent_id, status, attempts, next_attempt_at, last_error, created_at, updated_at)
+				VALUES ('old-wh-iso', ?, 'abandoned', 3, ?, 'HTTP 500', ?, ?)`,
+			)
+			.bind(world.bob.agent.id, T0, T0, T0)
+			.run();
+
+		const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
+		const prepare = world.db.prepare.bind(world.db);
+		vi.spyOn(world.db, "prepare").mockImplementation((query: string) => {
+			if (query.includes("DELETE FROM messages")) {
+				throw new Error("message purge boom");
+			}
+			if (query.includes("DELETE FROM tokens")) {
+				throw new Error("token purge boom");
+			}
+			return prepare(query);
+		});
+
+		const err = await runScheduledMaintenance(env, T0 + 400 * DAY_MS).catch(
+			(e: unknown) => e,
+		);
+		expect(err).toBeInstanceOf(AggregateError);
+		expect((err as AggregateError).errors).toHaveLength(2);
+		expect(errorLog.mock.calls.map((c) => c[1])).toMatchObject([
+			{ step: "message_purge", error: "message purge boom" },
+			{ step: "token_purge", error: "token purge boom" },
+		]);
+
+		// Sibling retention purges (audit_log and webhook_deliveries) still succeeded!
+		vi.restoreAllMocks();
+		expect(await queryAuditLog(world.db)).toEqual([]);
+		const whCount = await world.db
+			.prepare("SELECT COUNT(*) AS n FROM webhook_deliveries")
+			.first<{ n: number }>();
+		expect(whCount?.n).toBe(0);
 	});
 });
 

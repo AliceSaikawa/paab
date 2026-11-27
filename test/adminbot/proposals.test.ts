@@ -511,7 +511,7 @@ describe("proposal domain lifecycle", () => {
 		const errorLog = vi.spyOn(console, "error").mockImplementation(() => {});
 		const prepare = db.prepare.bind(db);
 		const spy = vi.spyOn(db, "prepare").mockImplementation((query: string) => {
-			if (query.includes("FROM messages")) {
+			if (query.includes("SELECT * FROM messages")) {
 				throw new Error("inbox boom");
 			}
 			return prepare(query);
