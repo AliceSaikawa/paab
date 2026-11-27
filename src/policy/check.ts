@@ -1,7 +1,7 @@
 import type { AgentRow, CategoryRow } from "../db";
 import type { ReasonCode, UnixMillis } from "../types";
 
-const DAY_MS = 24 * 60 * 60 * 1000;
+export const UTC_DAY_MS = 24 * 60 * 60 * 1000;
 
 /** The reasons the policy check itself can give for a denial. */
 export type PolicyReasonCode = Extract<
@@ -48,7 +48,7 @@ export type QuestionDecision =
 
 /** Returns the start of the UTC day that contains `now`. */
 export function utcDayStart(now: UnixMillis): UnixMillis {
-	return Math.floor(now / DAY_MS) * DAY_MS;
+	return Math.floor(now / UTC_DAY_MS) * UTC_DAY_MS;
 }
 
 /**
@@ -68,7 +68,7 @@ export function countDailyQuestions(
 			WHERE kind = 'question' AND from_agent_id = ?
 				AND created_at >= ? AND created_at < ?`,
 		)
-		.bind(fromAgentId, dayStart, dayStart + DAY_MS);
+		.bind(fromAgentId, dayStart, dayStart + UTC_DAY_MS);
 }
 
 /**
@@ -83,13 +83,10 @@ export function countDailyQuestions(
  *   6. no_allow_rule
  *   7. daily_limit_exceeded
  *
- * The daily limit compares the number of questions the sender already has
- * on the current UTC day, not counting the one being checked, against
- * `daily_question_limit`. This function only reads. The caller inserts the
- * question row afterwards (`pending` when allowed, `blocked` when denied),
- * and that row is what makes the question count. Because the check and the
- * insert are separate, questions checked concurrently can each see the same
- * count and exceed the limit by the number of concurrent requests minus one.
+ * This function only reads. The daily limit compares the sender's existing
+ * questions on the current UTC day against `daily_question_limit`, and
+ * `submitQuestion` enforces the same bound atomically when inserting so
+ * concurrent `ask` calls cannot exceed it.
  *
  * Throws if `fromAgentId` does not exist, since the sender comes from
  * authentication and not from the caller's input.

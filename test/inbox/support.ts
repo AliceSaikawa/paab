@@ -25,18 +25,22 @@ export async function createWorld(): Promise<World> {
 }
 
 /** Stores a question from the asker to the responder at `now`. */
-export function ask(
+export async function ask(
 	world: World,
 	now: number = T0,
 	body = "When are you free?",
 ) {
-	return submitQuestion(world.db, {
+	const result = await submitQuestion(world.db, {
 		fromAgentId: world.asker.id,
 		toAgentId: world.responder.id,
 		categoryId: world.category.id,
 		body,
 		now,
 	});
+	if (!result.ok) {
+		throw new Error(`submitQuestion failed: ${result.reason}`);
+	}
+	return result;
 }
 
 export async function getRow(db: D1Database, id: string): Promise<MessageRow> {

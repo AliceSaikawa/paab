@@ -157,14 +157,19 @@ describe("check_inbox", () => {
 	});
 
 	it("records a long expiry backlog with batched writes", async () => {
+		await world.db
+			.prepare("UPDATE agents SET daily_question_limit = 30 WHERE id = ?")
+			.bind(world.alice.agent.id)
+			.run();
 		for (let i = 0; i < 30; i++) {
-			await submitQuestion(world.db, {
+			const submitted = await submitQuestion(world.db, {
 				fromAgentId: world.alice.agent.id,
 				toAgentId: world.bob.agent.id,
 				categoryId: world.schedule.id,
 				body: `question ${i}`,
 				now: T0,
 			});
+			expect(submitted.ok).toBe(true);
 		}
 
 		const batchSizes = spyAuditWriteBatches(world.db);
