@@ -3,6 +3,7 @@ import {
 	type ChangeActor,
 	deleteAgent,
 	grantAllowRule,
+	lowerAgentDailyLimit,
 	queryChangeLog,
 	registerAgent,
 	resumeAgent,
@@ -277,6 +278,100 @@ describe("updateAgent", () => {
 		).toMatchObject({ ok: false, code: "invalid_limit" });
 
 		expect(await tableSnapshot()).toEqual(before);
+	});
+
+	it("only writes modified columns so concurrent edits to untouched fields are preserved", async () => {
+		let intercepted = false;
+		const racedDb = new Proxy(db, {
+			get(target, prop) {
+				if (prop === "batch") {
+					return async <T = unknown>(
+						statements: D1PreparedStatement[],
+					): Promise<D1Result<T>[]> => {
+						if (!intercepted) {
+							intercepted = true;
+							await db
+								.prepare(
+									"UPDATE agents SET name = ?, description = ? WHERE id = ?",
+								)
+								.bind("muse-renamed", "concurrent bio", muse.id)
+								.run();
+						}
+						return target.batch<T>(statements);
+					};
+				}
+				const value = Reflect.get(target, prop, target);
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		});
+
+		const res = await updateAgent(racedDb, {
+			agentId: muse.id,
+			dailyQuestionLimit: 8,
+			actor: OWNER,
+			now: T0 + 50,
+		});
+		expect(res.ok).toBe(true);
+		if (!res.ok || !res.data.changed) return;
+		expect(res.data.agent).toMatchObject({
+			name: "muse-renamed",
+			description: "concurrent bio",
+			dailyQuestionLimit: 8,
+		});
+
+		const row = await db
+			.prepare("SELECT * FROM agents WHERE id = ?")
+			.bind(muse.id)
+			.first<AgentRow>();
+		expect(row && agentFromRow(row)).toEqual(res.data.agent);
+	});
+});
+
+describe("lowerAgentDailyLimit", () => {
+	it("atomically lowers only daily_question_limit, refuses equal or higher limits, and handles missing agents", async () => {
+		const muse = await seedAgent(db, {
+			name: "muse",
+			description: "initial",
+			dailyQuestionLimit: 10,
+		});
+
+		const lowered = await lowerAgentDailyLimit(db, {
+			agentId: muse.id,
+			newLimit: 4,
+			actor: BOT,
+			now: T0 + 1,
+		});
+		expect(lowered.ok).toBe(true);
+		if (!lowered.ok) return;
+		expect(lowered.data.previousLimit).toBe(10);
+		expect(lowered.data.agent.dailyQuestionLimit).toBe(4);
+
+		const beforeRejected = await tableSnapshot();
+		expect(
+			await lowerAgentDailyLimit(db, {
+				agentId: muse.id,
+				newLimit: 4,
+				actor: BOT,
+				now: T0 + 2,
+			}),
+		).toMatchObject({ ok: false, code: "limit_not_lower", currentLimit: 4 });
+		expect(
+			await lowerAgentDailyLimit(db, {
+				agentId: muse.id,
+				newLimit: 8,
+				actor: BOT,
+				now: T0 + 3,
+			}),
+		).toMatchObject({ ok: false, code: "limit_not_lower", currentLimit: 4 });
+		expect(
+			await lowerAgentDailyLimit(db, {
+				agentId: newId(),
+				newLimit: 1,
+				actor: BOT,
+				now: T0 + 4,
+			}),
+		).toMatchObject({ ok: false, code: "not_found" });
+		expect(await tableSnapshot()).toEqual(beforeRejected);
 	});
 });
 

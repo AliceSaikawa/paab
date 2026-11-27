@@ -41,6 +41,31 @@ async function loadAgent(id: string) {
 	return row ? agentFromRow(row) : null;
 }
 
+function interceptNthBatch(
+	baseDb: D1Database,
+	targetCall: number,
+	beforeBatch: () => Promise<void>,
+): D1Database {
+	let callCount = 0;
+	return new Proxy(baseDb, {
+		get(target, prop) {
+			if (prop === "batch") {
+				return async <T = unknown>(
+					statements: D1PreparedStatement[],
+				): Promise<D1Result<T>[]> => {
+					callCount += 1;
+					if (callCount === targetCall) {
+						await beforeBatch();
+					}
+					return target.batch<T>(statements);
+				};
+			}
+			const value = Reflect.get(target, prop, target);
+			return typeof value === "function" ? value.bind(target) : value;
+		},
+	});
+}
+
 describe("listAdminBotChanges", () => {
 	it("returns only admin_bot change_log rows, newest first, honoring limit", async () => {
 		const a = await registerAgent(db, {
@@ -651,5 +676,299 @@ describe("revertAdminBotChange", () => {
 			}),
 		).toMatchObject({ ok: true });
 		expect((await loadAgent(grok.id))?.description).toBe("original bio");
+	});
+
+	it("allows only one concurrent revertAdminBotChange to succeed and records a single change_reverted row", async () => {
+		const muse = await seedAgent(db, { name: "muse" });
+		const grok = await seedAgent(db, { name: "grok", status: "active" });
+		const schedule = await seedCategory(db, { name: "schedule" });
+
+		const suspended = await suspendAgent(db, {
+			agentId: grok.id,
+			actor: BOT,
+			now: T0 + 1,
+		});
+		if (!suspended.ok) throw new Error("suspend failed");
+
+		const suspendResults = await Promise.all([
+			revertAdminBotChange(db, {
+				changeId: suspended.changeId,
+				actor: OWNER,
+				now: T0 + 2,
+			}),
+			revertAdminBotChange(db, {
+				changeId: suspended.changeId,
+				actor: OWNER,
+				now: T0 + 2,
+			}),
+		]);
+		expect(suspendResults.filter((r) => r.ok)).toHaveLength(1);
+		expect(
+			suspendResults.filter((r) => !r.ok && r.code === "already_reverted"),
+		).toHaveLength(1);
+		expect((await loadAgent(grok.id))?.status).toBe("active");
+
+		const logsAfterSuspend = await queryChangeLog(db);
+		const suspendReverts = logsAfterSuspend.filter(
+			(e) => e.action === "change_reverted",
+		);
+		expect(suspendReverts).toHaveLength(1);
+		expect(suspendReverts[0]?.revertedAt).toBeNull();
+		expect(
+			logsAfterSuspend.find((e) => e.id === suspended.changeId)?.revertedAt,
+		).toBe(T0 + 2);
+
+		await grantAllowRule(db, {
+			fromAgentId: muse.id,
+			toAgentId: grok.id,
+			categoryId: schedule.id,
+			actor: OWNER,
+			now: T0 + 3,
+		});
+		const revoked = await revokeAllowRule(db, {
+			fromAgentId: muse.id,
+			toAgentId: grok.id,
+			categoryId: schedule.id,
+			actor: BOT,
+			now: T0 + 4,
+		});
+		if (!revoked.ok) throw new Error("revoke failed");
+
+		const ruleResults = await Promise.all([
+			revertAdminBotChange(db, {
+				changeId: revoked.changeId,
+				actor: OWNER,
+				now: T0 + 5,
+			}),
+			revertAdminBotChange(db, {
+				changeId: revoked.changeId,
+				actor: OWNER,
+				now: T0 + 5,
+			}),
+		]);
+		expect(ruleResults.filter((r) => r.ok)).toHaveLength(1);
+		expect(
+			ruleResults.filter((r) => !r.ok && r.code === "already_reverted"),
+		).toHaveLength(1);
+		expect(
+			(await queryChangeLog(db)).filter((e) => e.action === "change_reverted"),
+		).toHaveLength(2);
+	});
+
+	it("aborts without overwriting when an intervening edit occurs between conflict check and restore batch", async () => {
+		const muse = await seedAgent(db, { name: "muse" });
+		const grok = await seedAgent(db, {
+			name: "grok",
+			status: "active",
+			description: "initial bio",
+			dailyQuestionLimit: 20,
+		});
+		const schedule = await seedCategory(db, { name: "schedule" });
+
+		// 1. Intervening resumeAgent (with change_log) between check and write batch.
+		const suspended = await suspendAgent(db, {
+			agentId: grok.id,
+			actor: BOT,
+			now: T0 + 1,
+		});
+		if (!suspended.ok) throw new Error("suspend failed");
+
+		const racedResumeDb = interceptNthBatch(db, 2, async () => {
+			const resumed = await resumeAgent(db, {
+				agentId: grok.id,
+				actor: OWNER,
+				now: T0 + 2,
+			});
+			expect(resumed.ok).toBe(true);
+		});
+		const failedResumeUndo = await revertAdminBotChange(racedResumeDb, {
+			changeId: suspended.changeId,
+			actor: OWNER,
+			now: T0 + 3,
+		});
+		expect(failedResumeUndo).toMatchObject({
+			ok: false,
+			code: "conflict_newer_change",
+		});
+		expect((await loadAgent(grok.id))?.status).toBe("active");
+		const logsAfterResumeRace = await queryChangeLog(db);
+		expect(
+			logsAfterResumeRace.find((e) => e.id === suspended.changeId)?.revertedAt,
+		).toBeNull();
+		expect(
+			logsAfterResumeRace.filter((e) => e.action === "change_reverted"),
+		).toHaveLength(0);
+
+		// 2. Intervening ABA edit (suspended -> active -> suspended) with change_log rows.
+		const suspended2 = await suspendAgent(db, {
+			agentId: grok.id,
+			actor: BOT,
+			now: T0 + 4,
+		});
+		if (!suspended2.ok) throw new Error("suspend2 failed");
+
+		const racedAbaDb = interceptNthBatch(db, 2, async () => {
+			await resumeAgent(db, { agentId: grok.id, actor: OWNER, now: T0 + 5 });
+			await suspendAgent(db, { agentId: grok.id, actor: OWNER, now: T0 + 6 });
+		});
+		expect(
+			await revertAdminBotChange(racedAbaDb, {
+				changeId: suspended2.changeId,
+				actor: OWNER,
+				now: T0 + 7,
+			}),
+		).toMatchObject({ ok: false, code: "conflict_newer_change" });
+		expect((await loadAgent(grok.id))?.status).toBe("suspended");
+		expect(
+			(await queryChangeLog(db)).filter((e) => e.action === "change_reverted"),
+		).toHaveLength(0);
+
+		// 3. Intervening direct SQL edit (without change_log) between check and write batch.
+		const limitLowered = await updateAgent(db, {
+			agentId: grok.id,
+			dailyQuestionLimit: 8,
+			actor: BOT,
+			now: T0 + 8,
+		});
+		if (!limitLowered.ok || limitLowered.changeId === null) {
+			throw new Error("limitLowered failed");
+		}
+
+		const racedDirectSqlDb = interceptNthBatch(db, 2, async () => {
+			await db
+				.prepare("UPDATE agents SET daily_question_limit = ? WHERE id = ?")
+				.bind(3, grok.id)
+				.run();
+		});
+		expect(
+			await revertAdminBotChange(racedDirectSqlDb, {
+				changeId: limitLowered.changeId,
+				actor: OWNER,
+				now: T0 + 9,
+			}),
+		).toMatchObject({ ok: false, code: "conflict_newer_change" });
+		expect((await loadAgent(grok.id))?.dailyQuestionLimit).toBe(3);
+		expect(
+			(await queryChangeLog(db)).find((e) => e.id === limitLowered.changeId)
+				?.revertedAt,
+		).toBeNull();
+		expect(
+			(await queryChangeLog(db)).filter((e) => e.action === "change_reverted"),
+		).toHaveLength(0);
+
+		// 4. Subsequent undo call also fails when state diverged without change_log.
+		expect(
+			await revertAdminBotChange(db, {
+				changeId: limitLowered.changeId,
+				actor: OWNER,
+				now: T0 + 10,
+			}),
+		).toMatchObject({ ok: false, code: "conflict_newer_change" });
+		expect((await loadAgent(grok.id))?.dailyQuestionLimit).toBe(3);
+
+		// 5. Unrelated concurrent edit (description update) does not block or get clobbered by limit undo.
+		const limitLowered2 = await updateAgent(db, {
+			agentId: grok.id,
+			dailyQuestionLimit: 1,
+			actor: BOT,
+			now: T0 + 11,
+		});
+		if (!limitLowered2.ok || limitLowered2.changeId === null) {
+			throw new Error("limitLowered2 failed");
+		}
+		const racedUnrelatedDb = interceptNthBatch(db, 2, async () => {
+			const descRes = await updateAgent(db, {
+				agentId: grok.id,
+				description: "concurrent bio update",
+				actor: OWNER,
+				now: T0 + 12,
+			});
+			expect(descRes.ok).toBe(true);
+		});
+		expect(
+			await revertAdminBotChange(racedUnrelatedDb, {
+				changeId: limitLowered2.changeId,
+				actor: OWNER,
+				now: T0 + 13,
+			}),
+		).toMatchObject({ ok: true });
+		expect(await loadAgent(grok.id)).toMatchObject({
+			dailyQuestionLimit: 3,
+			description: "concurrent bio update",
+		});
+
+		// 6. Concurrent allow_rule grant blocks category_created undo without deleting category.
+		const createdCat = await createCategory(db, {
+			name: "racing-cat",
+			actor: BOT,
+			now: T0 + 14,
+		});
+		if (!createdCat.ok) throw new Error("createCategory failed");
+
+		const racedCatDb = interceptNthBatch(db, 2, async () => {
+			const granted = await grantAllowRule(db, {
+				fromAgentId: muse.id,
+				toAgentId: grok.id,
+				categoryId: createdCat.data.category.id,
+				actor: OWNER,
+				now: T0 + 15,
+			});
+			expect(granted.ok).toBe(true);
+		});
+		expect(
+			await revertAdminBotChange(racedCatDb, {
+				changeId: createdCat.changeId,
+				actor: OWNER,
+				now: T0 + 16,
+			}),
+		).toMatchObject({ ok: false, code: "conflict_newer_change" });
+		const catStillThere = await db
+			.prepare("SELECT id FROM categories WHERE id = ?")
+			.bind(createdCat.data.category.id)
+			.first();
+		expect(catStillThere).not.toBeNull();
+		expect(
+			(await queryChangeLog(db)).find((e) => e.id === createdCat.changeId)
+				?.revertedAt,
+		).toBeNull();
+
+		// 7. Concurrent re-grant blocks allow_rule_revoked undo without duplicating change_reverted.
+		await grantAllowRule(db, {
+			fromAgentId: muse.id,
+			toAgentId: grok.id,
+			categoryId: schedule.id,
+			actor: OWNER,
+			now: T0 + 17,
+		});
+		const revokedRule = await revokeAllowRule(db, {
+			fromAgentId: muse.id,
+			toAgentId: grok.id,
+			categoryId: schedule.id,
+			actor: BOT,
+			now: T0 + 18,
+		});
+		if (!revokedRule.ok) throw new Error("revokeAllowRule failed");
+
+		const racedRuleDb = interceptNthBatch(db, 2, async () => {
+			const regranted = await grantAllowRule(db, {
+				fromAgentId: muse.id,
+				toAgentId: grok.id,
+				categoryId: schedule.id,
+				actor: OWNER,
+				now: T0 + 19,
+			});
+			expect(regranted.ok).toBe(true);
+		});
+		expect(
+			await revertAdminBotChange(racedRuleDb, {
+				changeId: revokedRule.changeId,
+				actor: OWNER,
+				now: T0 + 20,
+			}),
+		).toMatchObject({ ok: false, code: "conflict_newer_change" });
+		expect(
+			(await queryChangeLog(db)).find((e) => e.id === revokedRule.changeId)
+				?.revertedAt,
+		).toBeNull();
 	});
 });

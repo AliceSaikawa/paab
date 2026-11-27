@@ -3,7 +3,6 @@ import {
 	agentFromRow,
 	type ChangeLogRow,
 	changeLogEntryFromRow,
-	insertAllowRule,
 } from "../db";
 import {
 	AGENT_STATUSES,
@@ -17,7 +16,6 @@ import { queryChangeLog } from "./query";
 import type { AdminErrorCode, ChangeActor } from "./types";
 import {
 	isUniqueConstraintError,
-	runWithChangeLog,
 	validateContext,
 	validateDailyLimit,
 	validateDescription,
@@ -250,13 +248,75 @@ function newerTargetChangeQuery(
 		.bind(targetType, targetId, afterChangeId);
 }
 
+interface SqlCondition {
+	sql: string;
+	binds: unknown[];
+}
+
 type PreparedRestore =
 	| {
 			ok: true;
-			statement: D1PreparedStatement;
-			extraStatements?: D1PreparedStatement[];
+			precondition: SqlCondition;
+			buildStatements: (
+				claimSql: string,
+				claimTag: number,
+			) => {
+				restore: D1PreparedStatement;
+				extras?: D1PreparedStatement[];
+			};
 	  }
 	| UndoFailure;
+
+const REVERT_CLAIM_SQL =
+	"EXISTS (SELECT 1 FROM change_log WHERE action = 'change_reverted' AND reverted_at = ?)";
+
+function newerAgentConflictCondition(
+	agentId: string,
+	afterChangeId: number,
+	fieldsToRestore: ReadonlySet<AgentField>,
+): SqlCondition {
+	const actionClauses: string[] = ["action = 'agent_deleted'"];
+	if (fieldsToRestore.has("status")) {
+		actionClauses.push("action IN ('agent_suspended', 'agent_resumed')");
+	}
+	if (fieldsToRestore.has("description")) {
+		actionClauses.push("action = 'description_approved'");
+	}
+	const updateFields = AGENT_UPDATE_FIELDS.filter((field) =>
+		fieldsToRestore.has(field),
+	);
+	if (updateFields.length > 0) {
+		const fieldDiffs = updateFields
+			.map(
+				(field) =>
+					`json_extract(before_json, '$.${field}') IS NOT json_extract(after_json, '$.${field}')`,
+			)
+			.join(" OR ");
+		actionClauses.push(
+			`(action = 'agent_updated' AND (CASE
+				WHEN before_json IS NULL OR after_json IS NULL
+					OR NOT json_valid(before_json) OR NOT json_valid(after_json)
+				THEN 1
+				WHEN json_type(before_json) <> 'object' OR json_type(after_json) <> 'object'
+				THEN 1
+				WHEN ${fieldDiffs}
+				THEN 1
+				ELSE 0
+			END) = 1)`,
+		);
+	}
+	return {
+		sql: `NOT EXISTS (
+			SELECT 1 FROM change_log
+			WHERE target_type IN ('agent', 'description')
+				AND target_id = ?
+				AND id > ?
+				AND reverted_at IS NULL
+				AND (${actionClauses.join(" OR ")})
+		)`,
+		binds: [agentId, afterChangeId],
+	};
+}
 
 async function prepareAgentRestore(
 	db: D1Database,
@@ -266,6 +326,7 @@ async function prepareAgentRestore(
 	if (snapshot === null) {
 		return undoFail("invalid_input", "変更前スナップショットが不正です");
 	}
+	const afterSnapshot = parseJsonRecord(entry.afterJson);
 
 	const fieldsToRestore = changedAgentFields(entry);
 	if (entry.action === "agent_updated" && fieldsToRestore.size === 0) {
@@ -294,6 +355,11 @@ async function prepareAgentRestore(
 		return undoFail("not_found", "対象のエージェントが見つかりません");
 	}
 	const current = agentFromRow(agentRow);
+	const newerConflict = newerAgentConflictCondition(
+		entry.targetId,
+		entry.id,
+		fieldsToRestore,
+	);
 
 	if (entry.action === "agent_suspended" || entry.action === "agent_resumed") {
 		const rawStatus = snapshot.status;
@@ -304,31 +370,68 @@ async function prepareAgentRestore(
 			return undoFail("invalid_input", "変更前のエージェント状態が不正です");
 		}
 		const prevStatus = rawStatus as AgentStatus;
+		const rawAfterStatus = afterSnapshot?.status;
+		const expectedStatus: AgentStatus =
+			typeof rawAfterStatus === "string" &&
+			(AGENT_STATUSES as readonly string[]).includes(rawAfterStatus)
+				? (rawAfterStatus as AgentStatus)
+				: entry.action === "agent_suspended"
+					? "suspended"
+					: "active";
+		if (current.status !== expectedStatus) {
+			return undoFail(
+				"conflict_newer_change",
+				"対象エージェントの状態が変更されているため元に戻せません",
+			);
+		}
 		return {
 			ok: true,
-			statement: db
-				.prepare("UPDATE agents SET status = ? WHERE id = ?")
-				.bind(prevStatus, current.id),
-			extraStatements:
-				prevStatus === "suspended"
-					? [
-							db
-								.prepare(
-									"DELETE FROM webhook_deliveries WHERE agent_id = ? AND status = 'pending'",
-								)
-								.bind(current.id),
-						]
-					: undefined,
+			precondition: {
+				sql: `${newerConflict.sql}
+					AND EXISTS (SELECT 1 FROM agents WHERE id = ? AND status = ?)`,
+				binds: [...newerConflict.binds, current.id, expectedStatus],
+			},
+			buildStatements: (claimSql, claimTag) => ({
+				restore: db
+					.prepare(
+						`UPDATE agents SET status = ? WHERE id = ? AND status = ? AND ${claimSql}`,
+					)
+					.bind(prevStatus, current.id, expectedStatus, claimTag),
+				extras:
+					prevStatus === "suspended"
+						? [
+								db
+									.prepare(
+										`DELETE FROM webhook_deliveries
+										WHERE agent_id = ? AND status = 'pending' AND ${claimSql}`,
+									)
+									.bind(current.id, claimTag),
+							]
+						: undefined,
+			}),
 		};
 	}
 
 	const setClauses: string[] = [];
-	const binds: (string | number)[] = [];
+	const setBinds: (string | number)[] = [];
+	const whereClauses: string[] = [];
+	const whereBinds: (string | number)[] = [];
+	let duplicateNameGuard: string | null = null;
 
 	if (fieldsToRestore.has("name")) {
 		const rawName = snapshot.name;
 		if (typeof rawName !== "string") {
 			return undoFail("invalid_input", "変更前のエージェント名が不正です");
+		}
+		const expectedName =
+			typeof afterSnapshot?.name === "string"
+				? afterSnapshot.name
+				: current.name;
+		if (current.name !== expectedName) {
+			return undoFail(
+				"conflict_newer_change",
+				"対象エージェントの状態が変更されているため元に戻せません",
+			);
 		}
 		let nextName = current.name;
 		if (rawName !== current.name) {
@@ -347,15 +450,28 @@ async function prepareAgentRestore(
 					`エージェント「${nextName}」はすでに別のエージェントで使われています`,
 				);
 			}
+			duplicateNameGuard = nextName;
 		}
 		setClauses.push("name = ?");
-		binds.push(nextName);
+		setBinds.push(nextName);
+		whereClauses.push("name = ?");
+		whereBinds.push(expectedName);
 	}
 
 	if (fieldsToRestore.has("description")) {
 		const rawDescription = snapshot.description;
 		if (typeof rawDescription !== "string") {
 			return undoFail("invalid_input", "変更前の説明文が不正です");
+		}
+		const expectedDescription =
+			typeof afterSnapshot?.description === "string"
+				? afterSnapshot.description
+				: current.description;
+		if (current.description !== expectedDescription) {
+			return undoFail(
+				"conflict_newer_change",
+				"対象エージェントの状態が変更されているため元に戻せません",
+			);
 		}
 		const nextDescription =
 			rawDescription === current.description
@@ -368,7 +484,9 @@ async function prepareAgentRestore(
 			return undoFail("invalid_input", "変更前の説明文が不正です");
 		}
 		setClauses.push("description = ?");
-		binds.push(nextDescription);
+		setBinds.push(nextDescription);
+		whereClauses.push("description = ?");
+		whereBinds.push(expectedDescription);
 	}
 
 	if (fieldsToRestore.has("dailyQuestionLimit")) {
@@ -376,23 +494,62 @@ async function prepareAgentRestore(
 		if (typeof rawLimit !== "number") {
 			return undoFail("invalid_input", "変更前のエージェント設定が不正です");
 		}
+		const expectedLimit =
+			typeof afterSnapshot?.dailyQuestionLimit === "number" &&
+			Number.isSafeInteger(afterSnapshot.dailyQuestionLimit)
+				? afterSnapshot.dailyQuestionLimit
+				: current.dailyQuestionLimit;
+		if (current.dailyQuestionLimit !== expectedLimit) {
+			return undoFail(
+				"conflict_newer_change",
+				"対象エージェントの状態が変更されているため元に戻せません",
+			);
+		}
 		const limitCheck = validateDailyLimit(rawLimit);
 		if (!limitCheck.ok) {
 			return undoFail("invalid_input", limitCheck.message);
 		}
 		setClauses.push("daily_question_limit = ?");
-		binds.push(limitCheck.value);
+		setBinds.push(limitCheck.value);
+		whereClauses.push("daily_question_limit = ?");
+		whereBinds.push(expectedLimit);
 	}
 
 	if (setClauses.length === 0) {
 		return undoFail("invalid_input", "変更前のエージェント設定が不正です");
 	}
 
+	const expectedWhereSql = whereClauses.join(" AND ");
+	const preconditionClauses = [
+		newerConflict.sql,
+		`EXISTS (SELECT 1 FROM agents WHERE id = ? AND ${expectedWhereSql})`,
+	];
+	const preconditionBinds: unknown[] = [
+		...newerConflict.binds,
+		current.id,
+		...whereBinds,
+	];
+	if (duplicateNameGuard !== null) {
+		preconditionClauses.push(
+			"NOT EXISTS (SELECT 1 FROM agents WHERE name = ? AND id <> ?)",
+		);
+		preconditionBinds.push(duplicateNameGuard, current.id);
+	}
+
 	return {
 		ok: true,
-		statement: db
-			.prepare(`UPDATE agents SET ${setClauses.join(", ")} WHERE id = ?`)
-			.bind(...binds, current.id),
+		precondition: {
+			sql: preconditionClauses.join("\n\t\t\tAND "),
+			binds: preconditionBinds,
+		},
+		buildStatements: (claimSql, claimTag) => ({
+			restore: db
+				.prepare(
+					`UPDATE agents SET ${setClauses.join(", ")}
+					WHERE id = ? AND ${expectedWhereSql} AND ${claimSql}`,
+				)
+				.bind(...setBinds, current.id, ...whereBinds, claimTag),
+		}),
 	};
 }
 
@@ -465,18 +622,77 @@ async function prepareAllowRuleRestore(
 		);
 	}
 
+	const basePreconditionSql = `NOT EXISTS (
+		SELECT 1 FROM change_log
+		WHERE target_type = 'allow_rule' AND target_id = ? AND id > ?
+			AND reverted_at IS NULL AND action <> 'change_reverted'
+	)
+	AND NOT EXISTS (
+		SELECT 1 FROM change_log
+		WHERE id > ? AND reverted_at IS NULL
+			AND (
+				(target_type = 'agent' AND target_id IN (?, ?) AND action = 'agent_deleted')
+				OR (target_type = 'category' AND target_id = ? AND action = 'category_deleted')
+			)
+	)
+	AND EXISTS (SELECT 1 FROM agents WHERE id = ?)
+	AND EXISTS (SELECT 1 FROM agents WHERE id = ?)
+	AND EXISTS (SELECT 1 FROM categories WHERE id = ?)`;
+	const basePreconditionBinds: unknown[] = [
+		entry.targetId,
+		entry.id,
+		entry.id,
+		rule.fromAgentId,
+		rule.toAgentId,
+		rule.categoryId,
+		rule.fromAgentId,
+		rule.toAgentId,
+		rule.categoryId,
+	];
+
 	const ruleExists = (existingRule?.results.length ?? 0) > 0;
 	if (entry.action === "allow_rule_revoked") {
 		if (ruleExists) {
 			return undoFail("duplicate_rule", "同じ許可ルールがすでに存在します");
 		}
+		const createdAt = rule.createdAt ?? now;
 		return {
 			ok: true,
-			statement: insertAllowRule(db, {
-				fromAgentId: rule.fromAgentId,
-				toAgentId: rule.toAgentId,
-				categoryId: rule.categoryId,
-				createdAt: rule.createdAt ?? now,
+			precondition: {
+				sql: `${basePreconditionSql}
+					AND NOT EXISTS (
+						SELECT 1 FROM allow_rules
+						WHERE from_agent_id = ? AND to_agent_id = ? AND category_id = ?
+					)`,
+				binds: [
+					...basePreconditionBinds,
+					rule.fromAgentId,
+					rule.toAgentId,
+					rule.categoryId,
+				],
+			},
+			buildStatements: (claimSql, claimTag) => ({
+				restore: db
+					.prepare(
+						`INSERT INTO allow_rules
+							(from_agent_id, to_agent_id, category_id, created_at)
+						SELECT ?, ?, ?, ?
+						WHERE ${claimSql}
+							AND NOT EXISTS (
+								SELECT 1 FROM allow_rules
+								WHERE from_agent_id = ? AND to_agent_id = ? AND category_id = ?
+							)`,
+					)
+					.bind(
+						rule.fromAgentId,
+						rule.toAgentId,
+						rule.categoryId,
+						createdAt,
+						claimTag,
+						rule.fromAgentId,
+						rule.toAgentId,
+						rule.categoryId,
+					),
 			}),
 		};
 	}
@@ -486,12 +702,28 @@ async function prepareAllowRuleRestore(
 	}
 	return {
 		ok: true,
-		statement: db
-			.prepare(
-				`DELETE FROM allow_rules
-				WHERE from_agent_id = ? AND to_agent_id = ? AND category_id = ?`,
-			)
-			.bind(rule.fromAgentId, rule.toAgentId, rule.categoryId),
+		precondition: {
+			sql: `${basePreconditionSql}
+				AND EXISTS (
+					SELECT 1 FROM allow_rules
+					WHERE from_agent_id = ? AND to_agent_id = ? AND category_id = ?
+				)`,
+			binds: [
+				...basePreconditionBinds,
+				rule.fromAgentId,
+				rule.toAgentId,
+				rule.categoryId,
+			],
+		},
+		buildStatements: (claimSql, claimTag) => ({
+			restore: db
+				.prepare(
+					`DELETE FROM allow_rules
+					WHERE from_agent_id = ? AND to_agent_id = ? AND category_id = ?
+						AND ${claimSql}`,
+				)
+				.bind(rule.fromAgentId, rule.toAgentId, rule.categoryId, claimTag),
+		}),
 	};
 }
 
@@ -505,15 +737,17 @@ async function prepareCategoryRestore(
 	if (categoryId === null || categoryId !== entry.targetId) {
 		return undoFail("invalid_input", "カテゴリのスナップショットが不正です");
 	}
+	const expectedName =
+		snapshot !== null ? readNonEmptyString(snapshot, "name") : null;
 
-	const [catConflict, existingRule, categoryRow] = await db.batch([
+	const [catConflict, existingRule, categoryResult] = await db.batch([
 		newerTargetChangeQuery(db, "category", entry.targetId, entry.id),
 		db
 			.prepare(
 				"SELECT 1 AS found FROM allow_rules WHERE category_id = ? LIMIT 1",
 			)
 			.bind(categoryId),
-		db.prepare("SELECT id FROM categories WHERE id = ?").bind(categoryId),
+		db.prepare("SELECT id, name FROM categories WHERE id = ?").bind(categoryId),
 	]);
 
 	if (
@@ -526,16 +760,93 @@ async function prepareCategoryRestore(
 		);
 	}
 
-	if ((categoryRow?.results.length ?? 0) === 0) {
+	const categoryRow = (categoryResult?.results[0] ?? null) as {
+		id: string;
+		name: string;
+	} | null;
+	if (categoryRow === null) {
 		return undoFail("not_found", "対象のカテゴリが見つかりません");
 	}
+	if (expectedName !== null && categoryRow.name !== expectedName) {
+		return undoFail(
+			"conflict_newer_change",
+			"対象カテゴリの状態が変更されているため元に戻せません",
+		);
+	}
+
+	const categoryWhereSql =
+		expectedName !== null ? "id = ? AND name = ?" : "id = ?";
+	const categoryWhereBinds =
+		expectedName !== null ? [categoryId, expectedName] : [categoryId];
 
 	return {
 		ok: true,
-		statement: db
-			.prepare("DELETE FROM categories WHERE id = ?")
-			.bind(categoryId),
+		precondition: {
+			sql: `NOT EXISTS (
+				SELECT 1 FROM change_log
+				WHERE target_type = 'category' AND target_id = ? AND id > ?
+					AND reverted_at IS NULL AND action <> 'change_reverted'
+			)
+			AND NOT EXISTS (
+				SELECT 1 FROM allow_rules WHERE category_id = ?
+			)
+			AND EXISTS (
+				SELECT 1 FROM categories WHERE ${categoryWhereSql}
+			)`,
+			binds: [entry.targetId, entry.id, categoryId, ...categoryWhereBinds],
+		},
+		buildStatements: (claimSql, claimTag) => ({
+			restore: db
+				.prepare(
+					`DELETE FROM categories WHERE ${categoryWhereSql} AND ${claimSql}`,
+				)
+				.bind(...categoryWhereBinds, claimTag),
+		}),
 	};
+}
+
+async function prepareRestoreForAction(
+	db: D1Database,
+	entry: ChangeLogEntry & { action: UndoableChangeAction },
+	now: UnixMillis,
+): Promise<PreparedRestore> {
+	switch (entry.action) {
+		case "agent_suspended":
+		case "agent_resumed":
+		case "agent_updated":
+		case "description_approved":
+			return prepareAgentRestore(db, entry);
+		case "allow_rule_revoked":
+		case "allow_rule_granted":
+			return prepareAllowRuleRestore(db, entry, now);
+		case "category_created":
+			return prepareCategoryRestore(db, entry);
+	}
+}
+
+async function diagnoseUndoFailure(
+	db: D1Database,
+	entry: ChangeLogEntry & { action: UndoableChangeAction },
+	now: UnixMillis,
+): Promise<UndoFailure> {
+	const latest = await db
+		.prepare("SELECT reverted_at FROM change_log WHERE id = ?")
+		.bind(entry.id)
+		.first<{ reverted_at: number | null }>();
+	if (latest === null) {
+		return undoFail("not_found", "指定された変更履歴が見つかりません");
+	}
+	if (latest.reverted_at !== null) {
+		return undoFail("already_reverted", "この変更はすでに元に戻されています");
+	}
+	const rechecked = await prepareRestoreForAction(db, entry, now);
+	if (!rechecked.ok) {
+		return rechecked;
+	}
+	return undoFail(
+		"conflict_newer_change",
+		"競合する変更が発生したため元に戻せませんでした",
+	);
 }
 
 /**
@@ -577,51 +888,84 @@ export async function revertAdminBotChange(
 		return undoFail("not_undoable", "この種類の変更は元に戻せません");
 	}
 
-	let prepared: PreparedRestore;
-	switch (entry.action) {
-		case "agent_suspended":
-		case "agent_resumed":
-		case "agent_updated":
-		case "description_approved":
-			prepared = await prepareAgentRestore(db, entry);
-			break;
-		case "allow_rule_revoked":
-		case "allow_rule_granted":
-			prepared = await prepareAllowRuleRestore(db, entry, ctx.value.now);
-			break;
-		case "category_created":
-			prepared = await prepareCategoryRestore(db, entry);
-			break;
-	}
+	const undoableEntry: ChangeLogEntry & { action: UndoableChangeAction } = {
+		...entry,
+		action: entry.action,
+	};
+	const prepared = await prepareRestoreForAction(
+		db,
+		undoableEntry,
+		ctx.value.now,
+	);
 	if (!prepared.ok) {
 		return prepared;
 	}
 
-	try {
-		const changeId = await runWithChangeLog(
-			db,
-			[
-				prepared.statement,
-				...(prepared.extraStatements ?? []),
-				db
-					.prepare(
-						"UPDATE change_log SET reverted_at = ? WHERE id = ? AND reverted_at IS NULL",
-					)
-					.bind(ctx.value.now, entry.id),
-			],
-			{
-				occurredAt: ctx.value.now,
-				actorType: "owner",
-				actorId: ctx.value.actorId,
-				approverId: ctx.value.approverId,
-				action: "change_reverted",
-				targetType: entry.targetType,
-				targetId: entry.targetId,
-				beforeJson: entry.afterJson,
-				afterJson: entry.beforeJson,
-				revertedAt: null,
-			},
+	const claimTag = -entry.id;
+	const { restore, extras = [] } = prepared.buildStatements(
+		REVERT_CLAIM_SQL,
+		claimTag,
+	);
+
+	// The new `change_reverted` row holds `-entry.id` in `reverted_at` only
+	// inside this transaction so every later statement in the batch can verify
+	// that this transaction (and not a concurrent one) claimed the revert.
+	const insertRevertLogStmt = db
+		.prepare(
+			`INSERT INTO change_log
+				(occurred_at, actor_type, actor_id, approver_id, action,
+				target_type, target_id, before_json, after_json, reverted_at)
+			SELECT ?, 'owner', ?, ?, 'change_reverted', ?, ?, ?, ?, ?
+			WHERE EXISTS (SELECT 1 FROM change_log WHERE id = ? AND reverted_at IS NULL)
+				AND ${prepared.precondition.sql}`,
+		)
+		.bind(
+			ctx.value.now,
+			ctx.value.actorId,
+			ctx.value.approverId,
+			entry.targetType,
+			entry.targetId,
+			entry.afterJson,
+			entry.beforeJson,
+			claimTag,
+			entry.id,
+			...prepared.precondition.binds,
 		);
+	const markRevertedStmt = db
+		.prepare(
+			`UPDATE change_log
+			SET reverted_at = ?
+			WHERE id = ? AND reverted_at IS NULL AND ${REVERT_CLAIM_SQL}`,
+		)
+		.bind(ctx.value.now, entry.id, claimTag);
+	const clearClaimStmt = db
+		.prepare(
+			`UPDATE change_log
+			SET reverted_at = NULL
+			WHERE action = 'change_reverted' AND reverted_at = ?`,
+		)
+		.bind(claimTag);
+
+	try {
+		const results = await db.batch([
+			insertRevertLogStmt,
+			restore,
+			...extras,
+			markRevertedStmt,
+			clearClaimStmt,
+		]);
+		const insertResult = results[0];
+		const markRevertedResult = results.at(-2);
+		if (
+			(insertResult?.meta.changes ?? 0) === 0 ||
+			(markRevertedResult?.meta.changes ?? 0) === 0
+		) {
+			return diagnoseUndoFailure(db, undoableEntry, ctx.value.now);
+		}
+		const changeId = Number(insertResult?.meta.last_row_id);
+		if (!Number.isSafeInteger(changeId) || changeId <= 0) {
+			throw new Error("change_log insert did not return a valid last_row_id");
+		}
 
 		return {
 			ok: true,
