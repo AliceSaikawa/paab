@@ -32,9 +32,11 @@ import {
 	enqueueWake,
 	notifyAgentImmediately,
 	processDueWebhooks,
+	purgeFinishedWebhookDeliveries,
 	sanitizeWebhookError,
 	WAKE_PAYLOAD,
 	WEBHOOK_BLOCKED_DELAY_MS,
+	WEBHOOK_DELIVERY_RETENTION_MS,
 	WEBHOOK_IN_FLIGHT_LEASE_MS,
 	WEBHOOK_RETRY_DELAYS_MS,
 	type WebhookFetcher,
@@ -1202,5 +1204,133 @@ describe("coalescing, suspended agents, retries, redirect rejection, and secret 
 			skipped: 0,
 		});
 		expect(fetcher).toHaveBeenCalledTimes(10);
+	});
+
+	it("purges delivered and abandoned webhook_deliveries at the 30-day boundary while keeping pending rows", async () => {
+		expect(WEBHOOK_DELIVERY_RETENTION_MS).toBe(30 * DAY_MS);
+
+		await world.db.batch([
+			world.db
+				.prepare(
+					`INSERT INTO webhook_deliveries
+						(id, agent_id, status, attempts, next_attempt_at, last_error, created_at, updated_at)
+					VALUES (?, ?, 'delivered', 1, ?, NULL, ?, ?)`,
+				)
+				.bind("d-delivered-old", world.bob.agent.id, T0, T0, T0),
+			world.db
+				.prepare(
+					`INSERT INTO webhook_deliveries
+						(id, agent_id, status, attempts, next_attempt_at, last_error, created_at, updated_at)
+					VALUES (?, ?, 'abandoned', 3, ?, 'HTTP 503', ?, ?)`,
+				)
+				.bind("d-abandoned-old", world.bob.agent.id, T0, T0, T0),
+			world.db
+				.prepare(
+					`INSERT INTO webhook_deliveries
+						(id, agent_id, status, attempts, next_attempt_at, last_error, created_at, updated_at)
+					VALUES (?, ?, 'delivered', 1, ?, NULL, ?, ?)`,
+				)
+				.bind("d-delivered-fresh", world.bob.agent.id, T0, T0, T0 + 1),
+			world.db
+				.prepare(
+					`INSERT INTO webhook_deliveries
+						(id, agent_id, status, attempts, next_attempt_at, last_error, created_at, updated_at)
+					VALUES (?, ?, 'pending', 0, ?, NULL, ?, ?)`,
+				)
+				.bind("d-pending-old", world.alice.agent.id, T0 + 60 * DAY_MS, T0, T0),
+		]);
+
+		// One millisecond before 30 days: nothing deleted.
+		expect(
+			await purgeFinishedWebhookDeliveries(
+				world.db,
+				T0 + WEBHOOK_DELIVERY_RETENTION_MS - 1,
+			),
+		).toBe(0);
+		expect(await listDeliveries()).toHaveLength(4);
+
+		// At 30 days: old delivered and abandoned rows are deleted; fresh and pending stay.
+		expect(
+			await purgeFinishedWebhookDeliveries(
+				world.db,
+				T0 + WEBHOOK_DELIVERY_RETENTION_MS,
+			),
+		).toBe(2);
+		expect((await listDeliveries()).map((d) => d.id).sort()).toEqual([
+			"d-delivered-fresh",
+			"d-pending-old",
+		]);
+
+		// Re-running is idempotent, and even 100 days later the pending row is never touched.
+		expect(
+			await purgeFinishedWebhookDeliveries(world.db, T0 + 100 * DAY_MS),
+		).toBe(1);
+		expect((await listDeliveries()).map((d) => d.id)).toEqual([
+			"d-pending-old",
+		]);
+		expect(
+			await purgeFinishedWebhookDeliveries(world.db, T0 + 100 * DAY_MS),
+		).toBe(0);
+	});
+
+	it("keeps finished webhook_deliveries and other retention purges out of the per-minute cron", async () => {
+		await world.db
+			.prepare(
+				`INSERT INTO webhook_deliveries
+					(id, agent_id, status, attempts, next_attempt_at, last_error, created_at, updated_at)
+				VALUES ('d-old-done', ?, 'delivered', 1, ?, NULL, ?, ?)`,
+			)
+			.bind(world.bob.agent.id, T0, T0, T0)
+			.run();
+		await world.db
+			.prepare("UPDATE tokens SET revoked_at = ? WHERE agent_id = ?")
+			.bind(T0, world.carol.agent.id)
+			.run();
+
+		const later = T0 + 30 * DAY_MS;
+		vi.useFakeTimers({ toFake: ["Date"], now: later });
+		try {
+			const minuteCtx = createExecutionContext();
+			await worker.scheduled(
+				createScheduledController({
+					cron: WEBHOOK_POLL_CRON,
+					scheduledTime: later,
+				}),
+				env,
+				minuteCtx,
+			);
+			await waitOnExecutionContext(minuteCtx);
+
+			// Per-minute cron did NOT purge finished webhook deliveries or revoked tokens.
+			expect((await listDeliveries()).map((d) => d.id)).toEqual(["d-old-done"]);
+			const revokedCount = await world.db
+				.prepare(
+					"SELECT COUNT(*) AS n FROM tokens WHERE revoked_at IS NOT NULL",
+				)
+				.first<{ n: number }>();
+			expect(revokedCount?.n).toBe(1);
+
+			// Hourly cron purges both.
+			const hourCtx = createExecutionContext();
+			await worker.scheduled(
+				createScheduledController({
+					cron: HOURLY_MAINTENANCE_CRON,
+					scheduledTime: later,
+				}),
+				env,
+				hourCtx,
+			);
+			await waitOnExecutionContext(hourCtx);
+
+			expect(await listDeliveries()).toEqual([]);
+			const revokedAfterHour = await world.db
+				.prepare(
+					"SELECT COUNT(*) AS n FROM tokens WHERE revoked_at IS NOT NULL",
+				)
+				.first<{ n: number }>();
+			expect(revokedAfterHour?.n).toBe(0);
+		} finally {
+			vi.useRealTimers();
+		}
 	});
 });

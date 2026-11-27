@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
 	AUDIT_BODY_RECORDING_DISABLED,
+	DEFAULT_AUDIT_LOG_RETENTION_DAYS,
 	isBodyRecordingEnabled,
 	parseAuditBodyConfig,
+	parseAuditLogRetentionDays,
 } from "../../src/audit";
 
 describe("parseAuditBodyConfig", () => {
@@ -68,5 +70,43 @@ describe("isBodyRecordingEnabled", () => {
 		expect(
 			isBodyRecordingEnabled({ recordBodies: true, bodyRetentionDays: 1 }),
 		).toBe(true);
+	});
+});
+
+describe("parseAuditLogRetentionDays", () => {
+	it("defaults to 365 days when unset or blank", () => {
+		expect(DEFAULT_AUDIT_LOG_RETENTION_DAYS).toBe(365);
+		for (const raw of [undefined, null, "", "   "]) {
+			expect(parseAuditLogRetentionDays(raw)).toBe(365);
+		}
+	});
+
+	it("returns 0 to retain audit logs indefinitely", () => {
+		expect(parseAuditLogRetentionDays(0)).toBe(0);
+		expect(parseAuditLogRetentionDays("0")).toBe(0);
+		expect(parseAuditLogRetentionDays(" 0 ")).toBe(0);
+	});
+
+	it("accepts positive integer days", () => {
+		expect(parseAuditLogRetentionDays(1)).toBe(1);
+		expect(parseAuditLogRetentionDays(90)).toBe(90);
+		expect(parseAuditLogRetentionDays("180")).toBe(180);
+		expect(parseAuditLogRetentionDays(" 365 ")).toBe(365);
+	});
+
+	it.each([
+		["negative string", "-1"],
+		["negative number", -7],
+		["fractional string", "1.5"],
+		["fractional number", 1.5],
+		["unit suffix", "90d"],
+		["exponent form", "1e2"],
+		["non-numeric", "never"],
+		["NaN", Number.NaN],
+		["Infinity", Infinity],
+		["ms overflow", Number.MAX_SAFE_INTEGER],
+		["huge digits", "9".repeat(30)],
+	])("falls back to default 365 for malformed input: %s", (_name, raw) => {
+		expect(parseAuditLogRetentionDays(raw)).toBe(365);
 	});
 });

@@ -8,11 +8,13 @@ import {
 	issueToken,
 	isWellFormedToken,
 	parseBearerToken,
+	purgeRevokedTokens,
+	REVOKED_TOKEN_RETENTION_MS,
 	TOKEN_PREFIX,
 } from "../../src/auth";
 import { REASON_CODES } from "../../src/types";
 import { createTestDb } from "../helpers/db";
-import { seedAgent, T0 } from "../helpers/fixtures";
+import { DAY_MS, seedAgent, T0 } from "../helpers/fixtures";
 
 let db: D1Database;
 
@@ -372,5 +374,85 @@ describe("createToken", () => {
 			.prepare("SELECT COUNT(*) AS n FROM tokens")
 			.first<{ n: number }>();
 		expect(count?.n).toBe(0);
+	});
+});
+
+describe("purgeRevokedTokens", () => {
+	async function tokenIds(): Promise<string[]> {
+		const { results } = await db
+			.prepare("SELECT id FROM tokens ORDER BY id")
+			.all<{ id: string }>();
+		return results.map((r) => r.id);
+	}
+
+	it("deletes revoked tokens at the 30-day boundary and never deletes active tokens", async () => {
+		expect(REVOKED_TOKEN_RETENTION_MS).toBe(30 * DAY_MS);
+
+		const agent = await seedAgent(db);
+		const oldParticipant = await issueToken(db, {
+			agentId: agent.id,
+			purpose: "participant",
+			now: T0,
+		});
+		const revokedAt = T0 + DAY_MS;
+		const activeParticipant = await issueToken(db, {
+			agentId: agent.id,
+			purpose: "participant",
+			now: revokedAt,
+		});
+		const oldAdmin = await issueToken(db, {
+			agentId: agent.id,
+			purpose: "admin",
+			now: T0,
+		});
+		await db
+			.prepare("UPDATE tokens SET revoked_at = ? WHERE id = ?")
+			.bind(revokedAt + 1, oldAdmin.record.id)
+			.run();
+		const activeUnread = await issueToken(db, {
+			agentId: agent.id,
+			purpose: "unread_count",
+			now: T0,
+		});
+
+		// One millisecond before 30 days from revokedAt: nothing deleted.
+		expect(
+			await purgeRevokedTokens(db, revokedAt + REVOKED_TOKEN_RETENTION_MS - 1),
+		).toBe(0);
+		expect(await tokenIds()).toHaveLength(4);
+
+		// At revokedAt + 30 days: oldParticipant is deleted, oldAdmin (revoked 1ms later)
+		// and both active tokens remain.
+		expect(
+			await purgeRevokedTokens(db, revokedAt + REVOKED_TOKEN_RETENTION_MS),
+		).toBe(1);
+		expect(await tokenIds()).toEqual(
+			[
+				activeParticipant.record.id,
+				oldAdmin.record.id,
+				activeUnread.record.id,
+			].sort(),
+		);
+		expect(
+			await authenticate(db, bearer(oldParticipant.token), "participant"),
+		).toEqual({ ok: false, reason: "token_unknown", agentId: null });
+
+		// At revokedAt + 1 + 30 days: oldAdmin is deleted too; active tokens survive even
+		// well past 30 days since created_at.
+		expect(
+			await purgeRevokedTokens(db, revokedAt + 1 + REVOKED_TOKEN_RETENTION_MS),
+		).toBe(1);
+		expect(await tokenIds()).toEqual(
+			[activeParticipant.record.id, activeUnread.record.id].sort(),
+		);
+
+		// Idempotent on repeat run.
+		expect(await purgeRevokedTokens(db, revokedAt + 100 * DAY_MS)).toBe(0);
+		expect(
+			await authenticate(db, bearer(activeParticipant.token), "participant"),
+		).toMatchObject({ ok: true, agent });
+		expect(
+			await authenticate(db, bearer(activeUnread.token), "unread_count"),
+		).toMatchObject({ ok: true, agent });
 	});
 });

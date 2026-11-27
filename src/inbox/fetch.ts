@@ -1,5 +1,6 @@
 import type { MessageRow } from "../db";
 import type { UnixMillis } from "../types";
+import { UNFETCHED_REPLY_TTL_MS } from "./constants";
 
 /** A question addressed to the fetching agent. */
 export interface InboxQuestion {
@@ -40,16 +41,21 @@ export type InboxItem = InboxQuestion | InboxAnswer | InboxRejection;
 
 /*
  * What an agent can still receive: undelivered questions that are waiting
- * for an answer and have not passed their deadline, and undelivered replies.
- * A question past its deadline is left out even before the maintenance run
- * marks it expired, because it can no longer be answered.
+ * for an answer and have not passed their deadline, and undelivered replies
+ * within their unfetched TTL whose body has not been cleared. Overdue items
+ * are excluded even before the maintenance run marks or clears them.
  *
- * Binds: ?1 = agent ID, ?2 = now.
+ * Binds: ?1 = agent ID, ?2 = now, ?3 = now - UNFETCHED_REPLY_TTL_MS.
  */
 const DELIVERABLE = `to_agent_id = ?1
 	AND status IN ('pending', 'sent')
 	AND received_at IS NULL
-	AND (expires_at IS NULL OR expires_at > ?2)`;
+	AND body_deleted_at IS NULL
+	AND (
+		(kind = 'question' AND body IS NOT NULL AND expires_at > ?2)
+		OR (kind = 'answer' AND body IS NOT NULL AND created_at > ?3)
+		OR (kind = 'rejection' AND created_at > ?3)
+	)`;
 
 function required<T>(value: T | null, column: string, id: string): T {
 	if (value === null) {
@@ -106,7 +112,7 @@ export async function fetchInbox(
 		.prepare(
 			`UPDATE messages SET received_at = ?2 WHERE ${DELIVERABLE} RETURNING *`,
 		)
-		.bind(agentId, now)
+		.bind(agentId, now, now - UNFETCHED_REPLY_TTL_MS)
 		.all<MessageRow>();
 	return results
 		.sort(
@@ -124,7 +130,7 @@ export async function countUnread(
 ): Promise<number> {
 	const row = await db
 		.prepare(`SELECT COUNT(*) AS n FROM messages WHERE ${DELIVERABLE}`)
-		.bind(agentId, now)
+		.bind(agentId, now, now - UNFETCHED_REPLY_TTL_MS)
 		.first<{ n: number }>();
 	return row?.n ?? 0;
 }

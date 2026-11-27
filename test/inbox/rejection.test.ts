@@ -58,33 +58,14 @@ describe("a question the bridge blocked", () => {
 });
 
 describe("the three kinds of rejection", () => {
-	/** Produces every kind of rejection and returns the question IDs. */
-	async function rejectInEveryWay(): Promise<Record<string, string>> {
-		const blocked = await recordBlockedQuestion(db, {
-			fromAgentId: world.asker.id,
-			toAgentId: world.responder.id,
-			categoryId: world.category.id,
-			now: T0,
-		});
-		const blockedUnknown = await recordBlockedQuestion(db, {
-			fromAgentId: world.asker.id,
-			toAgentId: null,
-			categoryId: null,
-			now: T0,
-		});
-
-		const declined = await ask(world, T0);
-		await fetchInbox(db, world.responder.id, T0 + HOUR_MS);
-		const result = await answerQuestion(db, {
-			questionId: declined.questionId,
-			responderAgentId: world.responder.id,
-			reply: { kind: "decline" },
-			now: T0 + 2 * HOUR_MS,
-		});
-		expect(result.ok).toBe(true);
-
-		const expired = await ask(world, T0 + 3 * HOUR_MS);
-		const maintenance = await runInboxMaintenance(db, expired.expiresAt);
+	/** Produces every kind of rejection within the 7-day reply TTL and returns the question IDs. */
+	async function rejectInEveryWay(): Promise<{
+		questions: Record<string, string>;
+		readyAt: number;
+	}> {
+		const expired = await ask(world, T0);
+		const tBase = expired.expiresAt;
+		const maintenance = await runInboxMaintenance(db, tBase);
 		expect(maintenance.expiredQuestions).toEqual([
 			{
 				questionId: expired.questionId,
@@ -94,17 +75,43 @@ describe("the three kinds of rejection", () => {
 			},
 		]);
 
+		const blocked = await recordBlockedQuestion(db, {
+			fromAgentId: world.asker.id,
+			toAgentId: world.responder.id,
+			categoryId: world.category.id,
+			now: tBase,
+		});
+		const blockedUnknown = await recordBlockedQuestion(db, {
+			fromAgentId: world.asker.id,
+			toAgentId: null,
+			categoryId: null,
+			now: tBase,
+		});
+
+		const declined = await ask(world, tBase);
+		await fetchInbox(db, world.responder.id, tBase + HOUR_MS);
+		const result = await answerQuestion(db, {
+			questionId: declined.questionId,
+			responderAgentId: world.responder.id,
+			reply: { kind: "decline" },
+			now: tBase + 2 * HOUR_MS,
+		});
+		expect(result.ok).toBe(true);
+
 		return {
-			blocked: blocked.questionId,
-			blockedUnknown: blockedUnknown.questionId,
-			declined: declined.questionId,
-			expired: expired.questionId,
+			questions: {
+				blocked: blocked.questionId,
+				blockedUnknown: blockedUnknown.questionId,
+				declined: declined.questionId,
+				expired: expired.questionId,
+			},
+			readyAt: tBase + 3 * HOUR_MS,
 		};
 	}
 
 	it("look the same in the asker's inbox", async () => {
-		const questions = await rejectInEveryWay();
-		const items = await fetchInbox(db, world.asker.id, T0 + 30 * DAY_MS);
+		const { questions, readyAt } = await rejectInEveryWay();
+		const items = await fetchInbox(db, world.asker.id, readyAt);
 		expect(items).toHaveLength(4);
 
 		const byQuestion = new Map<string, InboxItem>(
@@ -130,7 +137,7 @@ describe("the three kinds of rejection", () => {
 	});
 
 	it("are stored the same way, apart from IDs and creation time", async () => {
-		const questions = await rejectInEveryWay();
+		const { questions } = await rejectInEveryWay();
 		for (const questionId of Object.values(questions)) {
 			const [rejection, ...rest] = await repliesTo(db, questionId);
 			expect(rest).toEqual([]);

@@ -1,3 +1,11 @@
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Default retention period in days for audit log metadata rows (design 4).
+ * Set `AUDIT_LOG_RETENTION_DAYS=0` to retain rows indefinitely.
+ */
+export const DEFAULT_AUDIT_LOG_RETENTION_DAYS = 365;
+
 /**
  * Settings for recording message bodies in the audit log (design section 4).
  * Bodies are not recorded by default. When recording is on, a retention
@@ -67,4 +75,37 @@ export function parseAuditBodyConfig(raw: {
 		return AUDIT_BODY_RECORDING_DISABLED;
 	}
 	return { recordBodies: true, bodyRetentionDays: days };
+}
+
+/**
+ * Parses `AUDIT_LOG_RETENTION_DAYS` into a non-negative whole number of days.
+ * - `0` / `"0"`: retain audit log metadata rows indefinitely.
+ * - Positive whole number (whose millisecond span is a safe integer): delete
+ *   rows once `occurred_at <= now - days * DAY_MS`.
+ * - Missing, empty, or malformed values fall back to
+ *   `DEFAULT_AUDIT_LOG_RETENTION_DAYS`.
+ */
+export function parseAuditLogRetentionDays(value: unknown): number {
+	if (value === undefined || value === null) {
+		return DEFAULT_AUDIT_LOG_RETENTION_DAYS;
+	}
+	if (typeof value === "string" && value.trim() === "") {
+		return DEFAULT_AUDIT_LOG_RETENTION_DAYS;
+	}
+	let days: number;
+	if (typeof value === "number") {
+		days = value;
+	} else if (typeof value === "string" && /^\s*[0-9]+\s*$/.test(value)) {
+		days = Number(value);
+	} else {
+		return DEFAULT_AUDIT_LOG_RETENTION_DAYS;
+	}
+	if (
+		!Number.isSafeInteger(days) ||
+		days < 0 ||
+		!Number.isSafeInteger(days * DAY_MS)
+	) {
+		return DEFAULT_AUDIT_LOG_RETENTION_DAYS;
+	}
+	return days;
 }

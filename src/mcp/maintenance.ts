@@ -1,15 +1,22 @@
 import { expireProposals } from "../adminbot/proposals";
-import { purgeExpiredAuditBodies, recordAuditEvents } from "../audit";
-import { runInboxMaintenance } from "../inbox";
+import {
+	purgeExpiredAuditBodies,
+	purgeExpiredAuditLogs,
+	recordAuditEvents,
+} from "../audit";
+import { purgeRevokedTokens } from "../auth";
+import { purgeOldMessages, runInboxMaintenance } from "../inbox";
 import {
 	enqueueWake,
 	processDueWebhooks,
+	purgeFinishedWebhookDeliveries,
 	type WebhookFetcher,
 } from "../notify";
 import type { UnixMillis } from "../types";
 import {
 	allowInsecureLocalhostWebhook,
 	auditBodyConfig,
+	auditLogRetentionDays,
 	type McpEnv,
 } from "./config";
 
@@ -20,10 +27,29 @@ export interface ScheduledMaintenanceOptions {
 	webhookFetcher?: WebhookFetcher;
 }
 
-function reportMaintenanceFailure(
-	step: "inbox" | "audit_purge" | "proposals" | "webhooks",
-	error: unknown,
-): void {
+export interface MaintenanceResult {
+	expiredQuestions: number;
+	messageBodiesDeleted: number;
+	messagesPurged: number;
+	auditBodiesDeleted: number;
+	auditLogsPurged: number;
+	revokedTokensPurged: number;
+	expiredProposals: number;
+	webhooksProcessed: number;
+	webhookDeliveriesPurged: number;
+}
+
+type MaintenanceStep =
+	| "inbox"
+	| "message_purge"
+	| "audit_purge"
+	| "audit_log_purge"
+	| "token_purge"
+	| "proposals"
+	| "webhooks"
+	| "webhook_purge";
+
+function reportMaintenanceFailure(step: MaintenanceStep, error: unknown): void {
 	try {
 		console.error("scheduled maintenance step failed", {
 			step,
@@ -37,7 +63,7 @@ function reportMaintenanceFailure(
 /**
  * The per-minute cron job: processes due webhook deliveries and purges pending
  * deliveries for suspended or unconfigured agents without querying `messages`,
- * `audit_log`, or `proposals`.
+ * `audit_log`, `tokens`, or `proposals`.
  */
 export async function runWebhookMaintenance(
 	env: McpEnv,
@@ -58,23 +84,40 @@ export async function runWebhookMaintenance(
 }
 
 /**
- * The scheduled job: expires overdue questions, records them in the audit
- * log with one batched write per chunk, enqueues wakes for expired-question
- * askers, removes audit log bodies past their retention, expires overdue
- * proposals, and delivers due webhooks. Each step is fault-isolated so a
- * failure in one does not starve the others.
+ * The hourly scheduled job: expires overdue questions, deletes message bodies
+ * past their retention, purges terminal message rows, removes audit log bodies
+ * and rows past their retention, purges old revoked tokens, expires overdue
+ * proposals, delivers due webhooks, and purges finished webhook delivery rows.
+ * Each step is fault-isolated so a failure in one does not starve the others.
  */
 export async function runScheduledMaintenance(
 	env: McpEnv,
 	now: UnixMillis,
 	options?: ScheduledMaintenanceOptions,
-): Promise<void> {
+): Promise<MaintenanceResult> {
 	const db = env.DB;
 	const audit = auditBodyConfig(env);
+	const logRetentionDays = auditLogRetentionDays(env);
 	const errors: unknown[] = [];
+	const result: MaintenanceResult = {
+		expiredQuestions: 0,
+		messageBodiesDeleted: 0,
+		messagesPurged: 0,
+		auditBodiesDeleted: 0,
+		auditLogsPurged: 0,
+		revokedTokensPurged: 0,
+		expiredProposals: 0,
+		webhooksProcessed: 0,
+		webhookDeliveriesPurged: 0,
+	};
 
 	try {
-		const { expiredQuestions } = await runInboxMaintenance(db, now);
+		const { expiredQuestions, bodiesDeleted } = await runInboxMaintenance(
+			db,
+			now,
+		);
+		result.expiredQuestions = expiredQuestions.length;
+		result.messageBodiesDeleted = bodiesDeleted;
 		await recordAuditEvents(
 			db,
 			audit,
@@ -103,28 +146,64 @@ export async function runScheduledMaintenance(
 	}
 
 	try {
-		await purgeExpiredAuditBodies(db, audit, now);
+		result.messagesPurged = await purgeOldMessages(db, now);
+	} catch (error) {
+		reportMaintenanceFailure("message_purge", error);
+		errors.push(error);
+	}
+
+	try {
+		result.auditBodiesDeleted = await purgeExpiredAuditBodies(db, audit, now);
 	} catch (error) {
 		reportMaintenanceFailure("audit_purge", error);
 		errors.push(error);
 	}
 
 	try {
-		await expireProposals(db, now);
+		result.auditLogsPurged = await purgeExpiredAuditLogs(
+			db,
+			now,
+			logRetentionDays,
+		);
+	} catch (error) {
+		reportMaintenanceFailure("audit_log_purge", error);
+		errors.push(error);
+	}
+
+	try {
+		result.revokedTokensPurged = await purgeRevokedTokens(db, now);
+	} catch (error) {
+		reportMaintenanceFailure("token_purge", error);
+		errors.push(error);
+	}
+
+	try {
+		result.expiredProposals = await expireProposals(db, now);
 	} catch (error) {
 		reportMaintenanceFailure("proposals", error);
 		errors.push(error);
 	}
 
 	try {
-		await processDueWebhooks(db, {
+		const webhooks = await processDueWebhooks(db, {
 			now,
 			audit,
 			allowInsecureLocalhost: allowInsecureLocalhostWebhook(env),
 			fetcher: options?.webhookFetcher,
 		});
+		result.webhooksProcessed = webhooks.processed;
 	} catch (error) {
 		reportMaintenanceFailure("webhooks", error);
+		errors.push(error);
+	}
+
+	try {
+		result.webhookDeliveriesPurged = await purgeFinishedWebhookDeliveries(
+			db,
+			now,
+		);
+	} catch (error) {
+		reportMaintenanceFailure("webhook_purge", error);
 		errors.push(error);
 	}
 
@@ -134,4 +213,5 @@ export async function runScheduledMaintenance(
 	if (errors.length > 1) {
 		throw new AggregateError(errors, "scheduled maintenance failed");
 	}
+	return result;
 }

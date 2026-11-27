@@ -1,6 +1,10 @@
 import { type MessageRow, newId } from "../db";
 import type { UnixMillis } from "../types";
-import { BODY_RETENTION_MS } from "./constants";
+import {
+	BODY_RETENTION_MS,
+	MESSAGE_RETENTION_MS,
+	UNFETCHED_REPLY_TTL_MS,
+} from "./constants";
 
 /** A question the maintenance run just expired, for the audit log. */
 export interface ExpiredQuestion {
@@ -18,6 +22,10 @@ export interface InboxMaintenanceResult {
 
 /** Questions expired per transaction (two statements each). */
 const EXPIRY_CHUNK = 25;
+
+/** Maximum rows deleted per purge statement and chunks per maintenance run. */
+const MESSAGE_PURGE_CHUNK = 500;
+const MAX_MESSAGE_PURGE_CHUNKS = 5;
 
 /**
  * Expires unanswered questions whose deadline has passed, then deletes
@@ -109,13 +117,13 @@ async function expireQuestions(
 }
 
 /**
- * Deletes bodies that are no longer needed. The rows stay.
+ * Deletes bodies that are no longer needed. The rows stay until
+ * `purgeOldMessages` removes terminal metadata rows past `MESSAGE_RETENTION_MS`.
  *
  * - Closed questions (answered, declined or expired) and answers:
  *   `BODY_RETENTION_MS` after the recipient received them.
- * - Expired questions nobody ever fetched: at once. They can no longer be
- *   delivered, and without a receipt time the 24 hour rule would keep them
- *   forever.
+ * - Expired questions nobody ever fetched: at once.
+ * - Unfetched answers and rejections: `UNFETCHED_REPLY_TTL_MS` after creation.
  */
 async function deleteBodies(db: D1Database, now: UnixMillis): Promise<number> {
 	const result = await db
@@ -123,6 +131,11 @@ async function deleteBodies(db: D1Database, now: UnixMillis): Promise<number> {
 			`UPDATE messages SET body = NULL, body_deleted_at = ?1
 			WHERE body IS NOT NULL AND (
 				(kind = 'question' AND status = 'expired' AND received_at IS NULL)
+				OR (
+					kind IN ('answer', 'rejection')
+					AND received_at IS NULL
+					AND created_at <= ?3
+				)
 				OR (
 					received_at <= ?2
 					AND (
@@ -132,7 +145,81 @@ async function deleteBodies(db: D1Database, now: UnixMillis): Promise<number> {
 				)
 			)`,
 		)
-		.bind(now, now - BODY_RETENTION_MS)
+		.bind(now, now - BODY_RETENTION_MS, now - UNFETCHED_REPLY_TTL_MS)
 		.run();
 	return result.meta.changes;
+}
+
+async function runBoundedDelete(
+	statement: D1PreparedStatement,
+	chunkSize: number,
+	maxChunks: number,
+): Promise<number> {
+	let deleted = 0;
+	for (let chunk = 0; chunk < maxChunks; chunk += 1) {
+		const result = await statement.run();
+		const changes = result.meta.changes ?? 0;
+		deleted += changes;
+		if (changes < chunkSize) {
+			break;
+		}
+	}
+	return deleted;
+}
+
+/**
+ * Deletes terminal `messages` metadata rows older than `MESSAGE_RETENTION_MS`
+ * whose body has already been cleared. Deletes child replies (`in_reply_to IS
+ * NOT NULL`) first, then parent questions that have no remaining children, so
+ * foreign keys are respected and younger replies are never cascade-deleted
+ * prematurely.
+ */
+export async function purgeOldMessages(
+	db: D1Database,
+	now: UnixMillis,
+): Promise<number> {
+	const cutoff = now - MESSAGE_RETENTION_MS;
+	const deleteChildren = db
+		.prepare(
+			`DELETE FROM messages
+			WHERE id IN (
+				SELECT id FROM messages
+				WHERE in_reply_to IS NOT NULL
+					AND body IS NULL
+					AND created_at <= ?1
+				ORDER BY created_at ASC
+				LIMIT ?2
+			)`,
+		)
+		.bind(cutoff, MESSAGE_PURGE_CHUNK);
+	const deleteParents = db
+		.prepare(
+			`DELETE FROM messages
+			WHERE id IN (
+				SELECT m.id FROM messages AS m
+				WHERE m.kind = 'question'
+					AND m.status <> 'pending'
+					AND m.body IS NULL
+					AND m.created_at <= ?1
+					AND NOT EXISTS (
+						SELECT 1 FROM messages AS child
+						WHERE child.in_reply_to = m.id
+					)
+				ORDER BY m.created_at ASC
+				LIMIT ?2
+			)`,
+		)
+		.bind(cutoff, MESSAGE_PURGE_CHUNK);
+
+	const childrenDeleted = await runBoundedDelete(
+		deleteChildren,
+		MESSAGE_PURGE_CHUNK,
+		MAX_MESSAGE_PURGE_CHUNKS,
+	);
+	const parentsDeleted = await runBoundedDelete(
+		deleteParents,
+		MESSAGE_PURGE_CHUNK,
+		MAX_MESSAGE_PURGE_CHUNKS,
+	);
+	return childrenDeleted + parentsDeleted;
 }

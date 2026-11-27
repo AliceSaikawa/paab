@@ -2026,6 +2026,11 @@ describe("partial body-retention indexes (migration 0008)", () => {
 			WHERE body IS NOT NULL AND (
 				(kind = 'question' AND status = 'expired' AND received_at IS NULL)
 				OR (
+					kind IN ('answer', 'rejection')
+					AND received_at IS NULL
+					AND created_at <= ?3
+				)
+				OR (
 					received_at <= ?2
 					AND (
 						kind = 'answer'
@@ -2033,7 +2038,8 @@ describe("partial body-retention indexes (migration 0008)", () => {
 					)
 				)
 			)`,
-			T0 + DAY_MS,
+			T0 + 7 * DAY_MS,
+			T0 + 6 * DAY_MS,
 			T0,
 		);
 		expect(plan).toContain("messages_with_body_idx");
@@ -2053,5 +2059,21 @@ describe("partial body-retention indexes (migration 0008)", () => {
 		);
 		expect(disabledPlan).toContain("audit_log_with_body_idx");
 		expect(disabledPlan).not.toMatch(/\bSCAN audit_log(?! USING INDEX)/);
+	});
+
+	it("uses audit_log_occurred_at_idx for purgeExpiredAuditLogs", async () => {
+		const purgePlan = await queryPlan(
+			`DELETE FROM audit_log
+			WHERE id IN (
+				SELECT id FROM audit_log
+				WHERE occurred_at <= ?1
+				ORDER BY occurred_at ASC, id ASC
+				LIMIT ?2
+			)`,
+			T0,
+			500,
+		);
+		expect(purgePlan).toContain("audit_log_occurred_at_idx");
+		expect(purgePlan).not.toMatch(/\bSCAN audit_log\b/);
 	});
 });
