@@ -1,10 +1,27 @@
+import { expireProposals } from "../adminbot/proposals";
 import { purgeExpiredAuditBodies, recordAuditEvents } from "../audit";
 import { runInboxMaintenance } from "../inbox";
+import {
+	enqueueWake,
+	processDueWebhooks,
+	type WebhookFetcher,
+} from "../notify";
 import type { UnixMillis } from "../types";
-import { auditBodyConfig, type McpEnv } from "./config";
+import {
+	allowInsecureLocalhostWebhook,
+	auditBodyConfig,
+	type McpEnv,
+} from "./config";
+
+export const WEBHOOK_POLL_CRON = "* * * * *";
+export const HOURLY_MAINTENANCE_CRON = "0 * * * *";
+
+export interface ScheduledMaintenanceOptions {
+	webhookFetcher?: WebhookFetcher;
+}
 
 function reportMaintenanceFailure(
-	step: "inbox" | "audit_purge",
+	step: "inbox" | "audit_purge" | "proposals" | "webhooks",
 	error: unknown,
 ): void {
 	try {
@@ -18,15 +35,39 @@ function reportMaintenanceFailure(
 }
 
 /**
+ * The per-minute cron job: processes due webhook deliveries and purges pending
+ * deliveries for suspended or unconfigured agents without querying `messages`,
+ * `audit_log`, or `proposals`.
+ */
+export async function runWebhookMaintenance(
+	env: McpEnv,
+	now: UnixMillis,
+	options?: ScheduledMaintenanceOptions,
+): Promise<void> {
+	try {
+		await processDueWebhooks(env.DB, {
+			now,
+			audit: auditBodyConfig(env),
+			allowInsecureLocalhost: allowInsecureLocalhostWebhook(env),
+			fetcher: options?.webhookFetcher,
+		});
+	} catch (error) {
+		reportMaintenanceFailure("webhooks", error);
+		throw error;
+	}
+}
+
+/**
  * The scheduled job: expires overdue questions, records them in the audit
- * log with one batched write per chunk, then removes audit log bodies past
- * their retention. Expiry and body removal are independent: a failure of
- * one does not skip the other, so a broken half is retried by the next run
- * instead of silently starving the other.
+ * log with one batched write per chunk, enqueues wakes for expired-question
+ * askers, removes audit log bodies past their retention, expires overdue
+ * proposals, and delivers due webhooks. Each step is fault-isolated so a
+ * failure in one does not starve the others.
  */
 export async function runScheduledMaintenance(
 	env: McpEnv,
 	now: UnixMillis,
+	options?: ScheduledMaintenanceOptions,
 ): Promise<void> {
 	const db = env.DB;
 	const audit = auditBodyConfig(env);
@@ -46,6 +87,16 @@ export async function runScheduledMaintenance(
 				messageId: question.questionId,
 			})),
 		);
+		const expiredAskerIds = new Set(
+			expiredQuestions.map((question) => question.fromAgentId),
+		);
+		for (const agentId of expiredAskerIds) {
+			try {
+				await enqueueWake(db, { agentId, now, delayMs: 0 });
+			} catch (error) {
+				reportMaintenanceFailure("webhooks", error);
+			}
+		}
 	} catch (error) {
 		reportMaintenanceFailure("inbox", error);
 		errors.push(error);
@@ -55,6 +106,25 @@ export async function runScheduledMaintenance(
 		await purgeExpiredAuditBodies(db, audit, now);
 	} catch (error) {
 		reportMaintenanceFailure("audit_purge", error);
+		errors.push(error);
+	}
+
+	try {
+		await expireProposals(db, now);
+	} catch (error) {
+		reportMaintenanceFailure("proposals", error);
+		errors.push(error);
+	}
+
+	try {
+		await processDueWebhooks(db, {
+			now,
+			audit,
+			allowInsecureLocalhost: allowInsecureLocalhostWebhook(env),
+			fetcher: options?.webhookFetcher,
+		});
+	} catch (error) {
+		reportMaintenanceFailure("webhooks", error);
 		errors.push(error);
 	}
 

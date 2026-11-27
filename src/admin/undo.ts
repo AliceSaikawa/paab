@@ -31,6 +31,7 @@ export const UNDOABLE_CHANGE_ACTIONS = [
 	"allow_rule_revoked",
 	"allow_rule_granted",
 	"category_created",
+	"description_approved",
 ] as const satisfies readonly ChangeAction[];
 
 export type UndoableChangeAction = (typeof UNDOABLE_CHANGE_ACTIONS)[number];
@@ -190,6 +191,8 @@ export function changedAgentFields(
 			}
 			return changed;
 		}
+		case "description_approved":
+			return new Set<AgentField>(["description"]);
 		case "agent_registered":
 		case "token_issued":
 		case "token_revoked":
@@ -200,6 +203,10 @@ export function changedAgentFields(
 		case "admin_bot_designated":
 		case "admin_bot_cleared":
 		case "admin_bot_switches_updated":
+		case "description_rejected":
+		case "webhook_configured":
+		case "webhook_secret_rotated":
+		case "webhook_deleted":
 		case "change_reverted":
 			return EMPTY_AGENT_FIELDS;
 	}
@@ -244,7 +251,11 @@ function newerTargetChangeQuery(
 }
 
 type PreparedRestore =
-	| { ok: true; statement: D1PreparedStatement }
+	| {
+			ok: true;
+			statement: D1PreparedStatement;
+			extraStatements?: D1PreparedStatement[];
+	  }
 	| UndoFailure;
 
 async function prepareAgentRestore(
@@ -298,6 +309,16 @@ async function prepareAgentRestore(
 			statement: db
 				.prepare("UPDATE agents SET status = ? WHERE id = ?")
 				.bind(prevStatus, current.id),
+			extraStatements:
+				prevStatus === "suspended"
+					? [
+							db
+								.prepare(
+									"DELETE FROM webhook_deliveries WHERE agent_id = ? AND status = 'pending'",
+								)
+								.bind(current.id),
+						]
+					: undefined,
 		};
 	}
 
@@ -561,6 +582,7 @@ export async function revertAdminBotChange(
 		case "agent_suspended":
 		case "agent_resumed":
 		case "agent_updated":
+		case "description_approved":
 			prepared = await prepareAgentRestore(db, entry);
 			break;
 		case "allow_rule_revoked":
@@ -580,6 +602,7 @@ export async function revertAdminBotChange(
 			db,
 			[
 				prepared.statement,
+				...(prepared.extraStatements ?? []),
 				db
 					.prepare(
 						"UPDATE change_log SET reverted_at = ? WHERE id = ? AND reverted_at IS NULL",

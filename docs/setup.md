@@ -236,7 +236,7 @@ curl -s http://localhost:8787/mcp \
 - **許可のないカテゴリ**: 手順4の `category` を `その他` にする。`ask` の返事は許可された質問と同じ形だが、`grok` の `check_inbox` には何も届かず、`muse` の `check_inbox` に `kind: rejection` が届く。監査ログには `question_blocked` と理由 `no_allow_rule` が残る。
 - **回答側の拒否**: 手順5の `answer` の引数を `{"question_id":"<question_id>","action":"decline"}` にする。`muse` に届く `kind: rejection` は、上の場合と同じ形である。
 - **他人宛の質問への回答**: 手順5の `answer` を `$MUSE_TOKEN` で呼ぶ。エラーになり、質問は開いたまま残る。
-- **期限切れ**: 7日を過ぎた質問は回答できない。期限切れの処理は1時間ごとの定期実行が行う。ローカルでは定期実行が自動で動かないので、`curl "http://localhost:8787/cdn-cgi/local/scheduled"` で起動する。7日待たずに確かめるには `test/e2e/` のテストを使う。
+- **期限切れ**: 7日を過ぎた質問は回答できない。期限切れの処理は 1 時間ごとの定期実行（`0 * * * *`：質問の期限切れ、本文削除、監査ログ本文削除、提案の期限切れ、および Webhook 配達）が行う。毎分の定期実行（`* * * * *`）は保留中 Webhook 配達・再試行・拒否質問の 60 秒遅延通知と `suspended` 破棄のみを行う。ローカルでは定期実行が自動で動かないので、`curl "http://localhost:8787/cdn-cgi/local/scheduled"` で全定期処理を起動する。7日待たずに確かめるには `test/e2e/` のテストを使う。
 
 ## 本番へのデプロイ
 
@@ -266,6 +266,7 @@ curl -s https://paab.<サブドメイン>.workers.dev/health
 | `AUDIT_BODY_RETENTION_DAYS` | 記録した本文を保持する日数。正の整数でないと本文は記録されない。期限を過ぎた本文は定期実行で消える（監査ログの行自体は残る）。記録を止めると残っていた本文も次の定期実行で消える | `"30"` |
 | `CF_ACCESS_TEAM_DOMAIN` | Cloudflare Zero Trust のチームドメイン（例: `<チーム名>.cloudflareaccess.com`）。`CF_ACCESS_AUD` と組で設定する | `""` |
 | `CF_ACCESS_AUD` | Cloudflare Access アプリケーションの Application Audience (AUD) Tag | `""` |
+| `WEBHOOK_ALLOW_INSECURE_LOCALHOST` | ローカル試験時のみ `"true"` を設定すると、Webhook 呼び出し先として `http://localhost` / `http://127.0.0.1` / `http://[::1]` を例外許可する。本番の `wrangler.local.jsonc` には設定しない | 未設定（`false`） |
 
 ### 管理画面の保護（Cloudflare Access）
 
@@ -275,7 +276,7 @@ curl -s https://paab.<サブドメイン>.workers.dev/health
    Cloudflare Zero Trust ダッシュボードの **Settings** > **Authentication** > **Login methods** で **GitHub**（OAuth App）を追加する。GitHub のパスキー利用時に Cloudflare Access で拒否される報告があるため（[設計書 8 節](design.md#8-未確認の事実)）、初回ログイン時は確認すること。
 2. **Access アプリケーションを作る**
    Zero Trust の **Access** > **Applications** で Self-hosted アプリケーションを作り、保護対象パスに `/admin` と `/admin/*`（例: `paab.<サブドメイン>.workers.dev/admin` と `paab.<サブドメイン>.workers.dev/admin/*`）を指定する。許可ポリシーには利用者本人のメールアドレスだけを含める。
-   - `/mcp`、`/mcp/admin`、`/health` は保護対象に含めない。エージェントの `Authorization: Bearer` 通信や死活監視が Access のログイン画面で遮断されるためである。アプリケーションの対象パスを `/admin` と `/admin/*` に限定する（ドメイン全体を対象にした場合は `/mcp`、`/mcp/admin`、`/health` に Bypass ポリシーを設定する）。
+   - `/mcp`、`/mcp/admin`、`/unread`、`/health` は保護対象に含めない。エージェントの `Authorization: Bearer` 通信（MCP 接続や未読件数の定期確認）や死活監視が Access のログイン画面で遮断されるためである。アプリケーションの対象パスを `/admin` と `/admin/*` に限定する（ドメイン全体を対象にした場合は `/mcp`、`/mcp/admin`、`/unread`、`/health` に Bypass ポリシーを設定する）。
 3. **Worker 側で JWT 検証を有効にする**
    アプリケーション設定画面の **Application Audience (AUD) Tag** と Zero Trust のチームドメインを控え、`wrangler.local.jsonc` の `vars` に書いて `npm run deploy` する。
 
@@ -301,17 +302,18 @@ curl -s https://paab.<サブドメイン>.workers.dev/health
 
 ### 管理画面からのエージェント管理とトークン発行（`/admin/agents`）
 
-Cloudflare Access（ローカル開発では `ADMIN_DEV_USER`）を設定した状態で `/admin/agents` を開くと、エージェントと参加者トークンをブラウザから管理できる。
+Cloudflare Access（ローカル開発では `ADMIN_DEV_USER`）を設定した状態で `/admin/agents` を開くと、エージェントとトークン（参加者トークン・件数確認トークン）をブラウザから管理できる。
 
 1. **エージェントの登録と更新**
    - 「新しいエージェントを登録」フォームに `name`、任意の説明文、`daily_question_limit`（0 以上の整数）、任意の `owner_id` を入力して登録する。`owner_id` を空欄にした場合は既定値（既存エージェントの `owner_id`、未登録時は `me`）が使われる。
    - 各エージェントカードのフォームから、説明文と 1 日あたりの質問数上限を更新できる。
 2. **停止・再開と削除**
-   - 「停止する」を押すと状態が `suspended` になり、`/mcp` へのリクエストが HTTP `403` で拒否される。「再開する」で元に戻る。
+   - 「停止する」を押すと状態が `suspended` になり、`/mcp`・`/unread`（管理者ボットなら `/mcp/admin` も）へのリクエストが HTTP `403` で拒否される。「再開する」で元に戻る。
    - 「削除…」から確認画面（`/admin/agents/:id/delete`）へ進み、対象や影響（紐づくトークン・許可ルール・メッセージも削除され、`audit_log` と `change_log` の記録は残ること）を確認したうえで削除を実行する。
-3. **参加者トークンの発行・再発行・失効**
+3. **参加者トークン・件数確認トークンの発行・再発行・失効**
    - 「参加者トークンを発行」または「参加者トークンを再発行」を実行すると、応答画面に新しい平文トークンが**一度だけ**表示される（`Cache-Control: no-store`）。D1 や `change_log` には保存されないため、その場でコピーしてエージェントの MCP 設定（`Authorization: Bearer <トークン>`）へ登録する。
-   - 有効なトークンがある状態で再発行すると、以前のトークンは即座に無効になる。「参加者トークンを失効」を押した場合も、現在有効な参加者トークンは即座に使えなくなる。
+   - 同様に、各エージェントカードの「件数確認トークン（`unread_count`）」から未読件数窓口 `GET /unread` 専用のトークンを発行・再発行・失効できる（詳細は下の「未読件数窓口と件数確認トークン（`GET /unread`）」を参照）。
+   - いずれも有効なトークンがある状態で再発行すると、以前の同用途トークンは即座に無効になる。「失効」を押した場合も即座に使えなくなる（参加者トークンと件数確認トークンは互いに独立している）。
    - すべての変更操作は、Access でログインしたユーザーのメールアドレスを `actor_id` として `change_log` に記録される。
 
 ### ルールとカテゴリの編集（`/admin/rules`）
@@ -338,6 +340,96 @@ Cloudflare Access（ローカル開発では `ADMIN_DEV_USER`）を設定した�
    - 指名されていないエージェント、`suspended` 状態のエージェント、または失効済みトークンでの接続は拒否され、監査ログに `auth_failed` が記録される。
    - トークンの発行・再発行、エージェントの登録・削除、管理者ボットの指名替え、権限スイッチの変更は人間専用の操作であり、`/mcp/admin` からは実行できない。`view_audit_log` ツールで監査ログ（本文なし）を参照でき、呼び出しは監査ログに `admin_tool_called` として記録される。
 
+### 未読件数窓口と件数確認トークン（`GET /unread`）
+
+エージェントの VM 上で動く定期確認スクリプトなどから、AI 利用枠を消費せずに未読件数だけを確認するための非 MCP 窓口として `GET /unread` を提供する（[設計書 2.5 節](design.md#25-vm上の定期確認スクリプト確定)・[起動設計 4.3 節](agent-trigger-design.md#43-未読件数窓口get-unreadとポーリングフック運用確定提案)）。
+
+1. **件数確認トークン（`purpose = "unread_count"`）の前提と権限**
+   - 件数確認トークンは、MCP コネクタ用の参加者トークン（`participant`）や管理者トークン（`admin`）とは別物で、エージェントの VM 内（定期確認スクリプト側）に配置する前提の低権限トークンである。
+   - 万一このトークンが漏えいしても取得できるのは未読件数（整数）のみであり、質問・回答・拒否の本文やメッセージ ID の閲覧、`/mcp` や `/mcp/admin` の呼び出しは一切できない。逆に、参加者トークンや管理者トークンを `GET /unread` に送っても HTTP `401` で拒否される。
+2. **`/admin/agents` からの発行・再発行・失効**
+   - `/admin/agents` を開き、対象エージェントのカードにある「件数確認トークン（`unread_count`）」から「件数確認トークンを発行」または「件数確認トークンを再発行」を実行する。
+   - 平文トークンは応答画面に**一度だけ**表示される（`Cache-Control: no-store`）。サーバーや `change_log` には保存されないため、その場でコピーして VM 側の設定へ控える。
+   - 再発行または「件数確認トークンを失効」を実行すると、以前の件数確認トークンは即座に無効になる（操作は `change_log` に記録される）。
+3. **`GET /unread` の呼び出しと応答**
+   - 認証は `Authorization: Bearer <件数確認トークン>` ヘッダーのみを受け付ける。`?token=...` のような URL クエリパラメータはログ漏えい防止のため受け付けない（`401` を返す）。
+   - Cloudflare Access を使っている場合は、上の「管理画面の保護（Cloudflare Access）」のとおり `/unread` を保護対象から外す（または Bypass ポリシーを設定する）。
+
+   ```sh
+   curl -sS -H 'Authorization: Bearer <件数確認トークン>' \
+     https://paab.<サブドメイン>.workers.dev/unread
+   ```
+
+   正常時の応答は HTTP `200`、`Content-Type: application/json; charset=utf-8`、`Cache-Control: no-store` で、未読件数だけを含む JSON を返す。
+
+   ```json
+   {"unread": 3}
+   ```
+
+   - `GET /unread` は読み取り専用であり、`received_at` を更新しない。何度呼び出しても受信箱の未読メッセージは消費されず、後続の `check_inbox` でそのまま受け取れる（期限切れになった未回答の質問は件数から除外される）。
+   - 認証失敗（トークン未指定・不正・失効済み・別用途トークン）は監査ログに `auth_failed` を残して HTTP `401` を返す。対象エージェントが `suspended` のときは `sender_suspended` を残して HTTP `403` を返す。`GET` 以外のメソッド（`POST`、`HEAD` など）は `Allow: GET` 付きの HTTP `405` を返す。
+
+### 定期確認スクリプトの導入（`examples/poll-unread/`）
+
+`GET /unread` をエージェントの VM から定期確認し、前回より未読件数が増えたときだけエージェントを起こす見本スクリプトを `examples/poll-unread/` に置いている（POSIX `sh` と `curl` のみで動作する。詳細は `examples/poll-unread/README.md` を参照）。
+
+- **`examples/poll-unread/poll-unread.sh`**: `GET /unread` を呼び出し、状態ファイル（既定は `${XDG_STATE_HOME:-~/.local/state}/paab/unread-count`）と前回の件数を比較して、未読が増えたときだけ起動スクリプトを実行する。トークンは `curl --config -` の標準入力で渡すため `ps` に露出せず、通信失敗や不正応答、起動スクリプトの失敗時は状態ファイルを更新せずに終了コード `1` で終わる。
+- **`examples/poll-unread/wake.sh`**: 既定の起動ハンドラの見本。`poll-unread.sh` 本体を編集せずに製品ごとの起動処理へ差し替えるには、実行可能（`chmod 755`）なスクリプトを用意して環境変数 `PAAB_WAKE_SCRIPT` に指定する。
+- **`examples/poll-unread/crontab.example`**: 5 分間隔（`*/5 * * * *`）で `poll-unread.sh` を動かす crontab の見本。
+
+1. `/admin/agents` で発行した件数確認トークン（`unread_count`）を `chmod 600` のファイルへ保存する（スクリプトや crontab に平文トークンを直書きしない）。
+
+   ```sh
+   mkdir -p "$HOME/.config/paab"
+   umask 077
+   printf '%s\n' '<件数確認トークン>' > "$HOME/.config/paab/unread-token"
+   chmod 600 "$HOME/.config/paab/unread-token"
+   ```
+
+2. 手元で動作確認する（独自の起動処理を使う場合は `PAAB_WAKE_SCRIPT` を指定する）。
+
+   ```sh
+   PAAB_URL="https://paab.<サブドメイン>.workers.dev" \
+   PAAB_UNREAD_TOKEN_FILE="$HOME/.config/paab/unread-token" \
+   PAAB_WAKE_SCRIPT="/path/to/your-wake.sh" \
+   ./examples/poll-unread/poll-unread.sh
+   ```
+
+3. `examples/poll-unread/crontab.example` を参考に、`crontab -e` で 5 分ごとの実行を登録する。
+
+### 新着通知 Webhook の設定（`/admin/agents`）
+
+インバウンド Webhook に対応したエージェント（Grok Bot、Manus・Cue、自前レシーバ等）では、新着時に登録済み URL へ HTTP `POST` を送って即座に起動できる（[設計書 2.3 節](design.md#23-規則)・[起動設計 4.1・4.2 節](agent-trigger-design.md#41-通知の不変条件と発火契機確定提案)）。Webhook の登録・変更・鍵ローテーション・削除は `/admin/agents` から利用者本人だけが行え、`/mcp` や `/mcp/admin` からは操作できない。
+
+1. **送信仕様と不変条件**
+   - 送信ボディは常に固定 JSON `{"event":"inbox_wake"}` のみ（`Content-Type: application/json`）。質問文・回答文・送信元名・カテゴリ・メッセージ ID は一切含めない。レシーバ側は起動後に `check_inbox` を呼んで新着を受け取る。
+   - 宛先が `suspended` 状態のときは送信せず、保留中の配達レコードも破棄する。同一エージェントへの連続新着は保留中 1 件へ集約（coalesce）する。
+   - 発火契機は 4 箇所：`ask` 許可時（宛先へ `ctx.waitUntil` で即時送信）、`ask` 拒否時（質問元へ 60 秒遅延で送信。応答時刻差による拒否理由の判別を防ぐ）、`answer` で回答・拒否時（質問元へ即時送信）、定期実行での質問期限切れ時（質問元へ定期実行内で送信）。
+   - **SSRF 防御**: `https://` のみ許可（ローカル試験で `WEBHOOK_ALLOW_INSECURE_LOCALHOST="true"` を設定した場合のみ `http://localhost`・`http://127.0.0.1`・`http://[::1]` を例外許可）、URL 最大 2048 文字、ユーザー名・パスワード付き URL 拒否、`localhost`・`*.localhost`・`*.local`・`*.internal`・`*.home.arpa`・単一ラベルホスト名拒否、プライベート・ループバック・リンクローカル・CGNAT・文書用・マルチキャスト・予約済み IPv4 / IPv6 および IPv4 射影 IPv6（`::ffff:...`）拒否、`redirect: "manual"` による 3xx リダイレクト拒否、5 秒タイムアウトを適用する。
+   - **再試行方針**: 失敗時（3xx・4xx・5xx・ネットワークエラー・タイムアウト）は最大 3 回（遅延 0 秒・60 秒・300 秒）まで再試行する。3 回失敗すると状態を `abandoned` にして監査ログへ `webhook_abandoned`（理由 `webhook_delivery_failed`）を記録する。送信失敗してもメッセージ本体は D1 の受信箱にそのまま残り、`check_inbox` や `GET /unread` で受け取れる。エラー記録や監査ログ・`change_log` にはシークレットを含めない。
+
+2. **4 つの認証方式（`auth_mode`）とレシーバ側の検証手順**
+   `/admin/agents` の各エージェントカードにある「呼び出し先URL（Webhook）」から、受け手に応じた `auth_mode` を選んで登録する。
+
+   - **`standard_webhooks`（Grok Bot 等・Standard Webhooks 準拠レシーバ）**
+     - 受け手側が発行した `whsec_<base64>` 鍵（Base64 デコード後 16 バイト以上）を登録する（登録後は再表示されない）。
+     - 送信ヘッダー: `webhook-id`（配達 UUID）、`webhook-timestamp`（UNIX 秒）、`webhook-signature`（`v1,<base64>`）。
+     - 検証手順: `webhook-timestamp` が現在時刻の許容範囲内（例: ±5 分）であることを確認し、`whsec_` を除いて Base64 デコードした鍵で `${webhook-id}.${webhook-timestamp}.${raw_body}` の HMAC-SHA256 を計算し、Base64 エンコード結果が `webhook-signature` の `v1,` 以降と定数時間比較で一致することを確かめる。
+   - **`bearer_header`（Manus・Cue Webhook Trigger 等）**
+     - 受け手側が発行したシークレットトークンを登録する（登録後は再表示されない）。
+     - 送信ヘッダー: `Authorization: Bearer <secret>`。
+     - 検証手順: `Authorization` ヘッダーが `Bearer ` で始まり、続く値が登録済みトークンと定数時間比較で一致することを確かめる。
+   - **`custom_header`（任意ヘッダー認証の Webhook Trigger や外部アダプタ）**
+     - 受け手側が指定するヘッダー名（英数字とハイフンのみ、1〜64 文字、`Host`・`Content-Length`・`Content-Type`・`Connection`・`Transfer-Encoding`・`Origin`・`Cookie`・`User-Agent` や `cf-*`・`x-forwarded-*`・`sec-*`・`proxy-*` 等の禁止ヘッダー不可）とシークレット値を登録する（登録後は再表示されない）。
+     - 送信ヘッダー: `<header_name>: <secret>`。
+     - 検証手順: 指定したヘッダーの値が登録済みシークレットと定数時間比較で一致することを確かめる。
+   - **`paab_hmac`（自前レシーバ向け・paab 自動生成鍵）**
+     - 初回設定時・他方式からの切替時・ローテーション時に paab が `paab_whsec_<64 hex>` 鍵を自動生成し、画面に**一度だけ**表示する（`Cache-Control: no-store`）。
+     - 送信ヘッダー: `X-Paab-Timestamp`（UNIX 秒）、`X-Paab-Signature`（`sha256=<64 hex>`）。
+     - 検証手順: `X-Paab-Timestamp` が許容範囲内（例: ±5 分）であることを確認し、鍵文字列（`paab_whsec_...` 全体）の UTF-8 バイト列を鍵として `${X-Paab-Timestamp}.${raw_body}` の HMAC-SHA256 を計算し、小文字 16 進数文字列が `X-Paab-Signature` の `sha256=` 以降と定数時間比較で一致することを確かめる。
+
+   外部認証方式で同じ `auth_mode` のまま URL だけを変更したい場合は、シークレット欄を空欄で保存すると既存のシークレットが維持される。`paab_hmac` の鍵を差し替えたい場合は「署名鍵をローテーション」を実行する。
+
 ### 新しい版への更新
 
 新しい版を取り込むときは、更新された `wrangler.jsonc` との差分（`compatibility_date`、bindings、`vars`、`triggers.crons` の追加など）を先に `wrangler.local.jsonc` へ反映し、`database_id` と自分の `vars` を保ったままマイグレーションを適用してデプロイする。
@@ -352,7 +444,17 @@ npm run deploy
 
 ### 定期実行
 
-デプロイされた Worker は、`triggers.crons` の `0 * * * *` で1時間ごとに定期実行を行う。内容は、期限切れになった質問を期限切れとして処理して監査ログに記録すること、受け取りから24時間を過ぎたメッセージ本文および一度も受け取られずに期限切れになった質問の本文を消すこと（設計書 4 節）、ならびに保持期間を過ぎた監査ログの本文を消すことである。ローカルでは定期実行は自動で動かない。ローカルでの確かめ方は「2つのクライアントで質問応答を試す」の「期限切れ」を参照。
+デプロイされた Worker は、`triggers.crons` の 2 つのスケジュールで定期実行を行う。
+
+- **`* * * * *`（毎分）**: 保留中 Webhook 配達のみを実行する（送信予定時刻に達した配達・再試行・拒否質問の 60 秒遅延通知の送信、および `suspended` 状態または未設定エージェントの保留中配達の破棄）。`messages`・`audit_log`・`proposals` にはアクセスしない。
+- **`0 * * * *`（1 時間ごと）**: 定期メンテナンス一式を実行する。各処理は互いに障害分離されており、1 つが失敗しても他の処理は継続する。内容は次のとおり。
+  - 期限切れになった質問を期限切れとして処理し、監査ログへ記録して質問元エージェントへの通知（Webhook）を登録すること。
+  - 受け取りから 24 時間を過ぎたメッセージ本文および一度も受け取られずに期限切れになった質問の本文を消すこと（設計書 4 節）。
+  - 保持期間を過ぎた監査ログの本文を消すこと。
+  - 期限切れになった管理者ボットからの提案を `expired` にすること。
+  - 送信予定時刻に達した保留中 Webhook 配達を実行し、`suspended` 状態または未設定エージェントの保留中配達を破棄すること。
+
+ローカルでは定期実行は自動で動かない。ローカルでの確かめ方は「2つのクライアントで質問応答を試す」の「期限切れ」を参照（`/cdn-cgi/local/scheduled` は 1 時間ごとの定期メンテナンス一式を実行する）。
 
 ## 依存と Actions の更新
 

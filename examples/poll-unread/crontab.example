@@ -1,0 +1,16 @@
+# Example crontab entry to poll paab GET /unread every 5 minutes.
+#
+# Setup:
+#   1. Issue an unread_count token in /admin/agents and store it in a chmod 600 file:
+#        mkdir -p "$HOME/.config/paab"
+#        install -m 600 /dev/null "$HOME/.config/paab/unread-token"
+#        # write the token into "$HOME/.config/paab/unread-token" (mode 600)
+#   2. Replace <your-subdomain> and /path/to/paab below with your actual values.
+#   3. To use a custom wake handler without editing poll-unread.sh, add:
+#        PAAB_WAKE_SCRIPT="/path/to/your-wake.sh"
+#   4. Never hardcode the token directly in crontab.
+
+SHELL=/bin/sh
+PATH=/usr/local/bin:/usr/bin:/bin
+
+*/5 * * * * PAAB_URL="https://paab.<your-subdomain>.workers.dev" PAAB_UNREAD_TOKEN_FILE="$HOME/.config/paab/unread-token" /path/to/paab/examples/poll-unread/poll-unread.sh

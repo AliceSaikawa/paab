@@ -1,22 +1,33 @@
 import { handleAdminMcpRequest } from "./adminbot";
-import { handleMcpRequest, runScheduledMaintenance } from "./mcp";
+import {
+	handleMcpRequest,
+	runScheduledMaintenance,
+	runWebhookMaintenance,
+	WEBHOOK_POLL_CRON,
+} from "./mcp";
 import { handleAdminRequest } from "./ui";
+import { handleUnreadRequest } from "./unread";
 
 export default {
 	async fetch(
 		request: Request,
 		env: Env,
-		_ctx: ExecutionContext,
+		ctx: ExecutionContext,
 	): Promise<Response> {
 		const url = new URL(request.url);
 		if (request.method === "GET" && url.pathname === "/health") {
 			return new Response("ok", { status: 200 });
 		}
 		if (url.pathname === "/mcp") {
-			return handleMcpRequest(request, env, Date.now());
+			return handleMcpRequest(request, env, Date.now(), {
+				waitUntil: (promise) => ctx.waitUntil(promise),
+			});
 		}
 		if (url.pathname === "/mcp/admin") {
 			return handleAdminMcpRequest(request, env, Date.now());
+		}
+		if (url.pathname === "/unread") {
+			return handleUnreadRequest(request, env, Date.now());
 		}
 		if (url.pathname === "/admin" || url.pathname.startsWith("/admin/")) {
 			return handleAdminRequest(request, env, Date.now());
@@ -25,10 +36,15 @@ export default {
 	},
 
 	async scheduled(
-		_event: ScheduledController,
+		event: ScheduledController,
 		env: Env,
 		ctx: ExecutionContext,
 	): Promise<void> {
-		ctx.waitUntil(runScheduledMaintenance(env, Date.now()));
+		const now = Date.now();
+		if (event.cron === WEBHOOK_POLL_CRON) {
+			ctx.waitUntil(runWebhookMaintenance(env, now));
+			return;
+		}
+		ctx.waitUntil(runScheduledMaintenance(env, now));
 	},
 };

@@ -3,10 +3,12 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
 	type AdminBotConfigRow,
 	type AgentRow,
+	type AgentWebhookRow,
 	type AllowRuleRow,
 	type AuditLogRow,
 	adminBotConfigFromRow,
 	agentFromRow,
+	agentWebhookFromRow,
 	allowRuleFromRow,
 	auditLogEntryFromRow,
 	type CategoryRow,
@@ -20,20 +22,35 @@ import {
 	insertCategory,
 	insertChangeLogEntry,
 	insertMessage,
+	insertProposal,
 	insertToken,
+	insertWebhookDelivery,
 	type MessageRow,
 	messageFromRow,
 	newId,
+	type PendingDescriptionRow,
+	type ProposalRow,
+	parseProposalPayload,
+	pendingDescriptionFromRow,
+	proposalFromRow,
 	type TokenRow,
 	tokenFromRow,
+	upsertAgentWebhook,
+	upsertPendingDescription,
+	type WebhookDeliveryRow,
+	webhookDeliveryFromRow,
 } from "../../src/db";
 import type {
 	Agent,
+	AgentWebhook,
 	AllowRule,
 	Message,
 	NewAuditLogEntry,
 	NewChangeLogEntry,
+	PendingDescription,
+	Proposal,
 	Token,
+	WebhookDelivery,
 } from "../../src/types";
 import { createTestDb, migrationByName } from "../helpers/db";
 import { DAY_MS, seedAgent, seedCategory, T0 } from "../helpers/fixtures";
@@ -103,13 +120,17 @@ describe("test database helper", () => {
 		const tables = results.map((row) => row.name);
 		expect(tables).toEqual([
 			"admin_bot_config",
+			"agent_webhooks",
 			"agents",
 			"allow_rules",
 			"audit_log",
 			"categories",
 			"change_log",
 			"messages",
+			"pending_descriptions",
+			"proposals",
 			"tokens",
+			"webhook_deliveries",
 		]);
 		for (const table of tables) {
 			const count = await db
@@ -673,6 +694,10 @@ describe("migrations", () => {
 
 	it("preserves all existing tables when migrating a populated database from 0002 to 0003 and enforces change_log constraints", async () => {
 		await db.batch([
+			db.prepare("DROP TABLE IF EXISTS webhook_deliveries"),
+			db.prepare("DROP TABLE IF EXISTS agent_webhooks"),
+			db.prepare("DROP TABLE IF EXISTS pending_descriptions"),
+			db.prepare("DROP TABLE IF EXISTS proposals"),
 			db.prepare("DROP TABLE IF EXISTS admin_bot_config"),
 			db.prepare("DROP TABLE IF EXISTS change_log"),
 			db.prepare("DROP TABLE IF EXISTS audit_log"),
@@ -826,6 +851,10 @@ describe("migrations", () => {
 
 	it("preserves all existing tables when migrating a populated database from 0003 to 0004 and enforces admin_bot_config constraints", async () => {
 		await db.batch([
+			db.prepare("DROP TABLE IF EXISTS webhook_deliveries"),
+			db.prepare("DROP TABLE IF EXISTS agent_webhooks"),
+			db.prepare("DROP TABLE IF EXISTS pending_descriptions"),
+			db.prepare("DROP TABLE IF EXISTS proposals"),
 			db.prepare("DROP TABLE IF EXISTS admin_bot_config"),
 			db.prepare("DROP TABLE IF EXISTS change_log"),
 			db.prepare("DROP TABLE IF EXISTS audit_log"),
@@ -993,6 +1022,415 @@ describe("migrations", () => {
 				.run(),
 		).rejects.toThrow(/FOREIGN KEY/);
 	});
+
+	it("preserves all existing tables when migrating a populated database from 0004 to 0005 and enforces proposals constraints", async () => {
+		await db.batch([
+			db.prepare("DROP TABLE IF EXISTS webhook_deliveries"),
+			db.prepare("DROP TABLE IF EXISTS agent_webhooks"),
+			db.prepare("DROP TABLE IF EXISTS pending_descriptions"),
+			db.prepare("DROP TABLE IF EXISTS proposals"),
+			db.prepare("DROP TABLE IF EXISTS admin_bot_config"),
+			db.prepare("DROP TABLE IF EXISTS change_log"),
+			db.prepare("DROP TABLE IF EXISTS audit_log"),
+			db.prepare("DROP TABLE IF EXISTS messages"),
+			db.prepare("DROP TABLE IF EXISTS allow_rules"),
+			db.prepare("DROP TABLE IF EXISTS tokens"),
+			db.prepare("DROP TABLE IF EXISTS categories"),
+			db.prepare("DROP TABLE IF EXISTS agents"),
+			db.prepare("DROP TABLE IF EXISTS d1_migrations"),
+		]);
+
+		const m1 = migration("0001_initial_schema.sql");
+		const m2 = migration("0002_cascade_message_references.sql");
+		const m3 = migration("0003_change_log.sql");
+		const m4 = migration("0004_admin_bot.sql");
+		const m5 = migration("0005_proposals.sql");
+		await applyD1Migrations(db, [m1, m2, m3, m4]);
+
+		const a = await seedAgent(db, { name: "a" });
+		const b = await seedAgent(db, { name: "b" });
+		const category = await seedCategory(db, { name: "schedule" });
+		await db
+			.prepare(
+				`INSERT INTO admin_bot_config (id, agent_id, read_bodies, superadmin_until, updated_at)
+				VALUES (1, ?, 0, NULL, ?)`,
+			)
+			.bind(a.id, T0)
+			.run();
+
+		await applyD1Migrations(db, [m1, m2, m3, m4, m5]);
+
+		const fkViolations = await db.prepare("PRAGMA foreign_key_check").all();
+		expect(fkViolations.results).toEqual([]);
+
+		expect(
+			(
+				await db.prepare("SELECT * FROM agents ORDER BY name").all<AgentRow>()
+			).results.map(agentFromRow),
+		).toEqual([a, b]);
+		const configRow = await db
+			.prepare("SELECT * FROM admin_bot_config WHERE id = 1")
+			.first<AdminBotConfigRow>();
+		expect(configRow?.agent_id).toBe(a.id);
+
+		const proposal: Proposal = {
+			id: newId(),
+			kind: "grant_allow_rule",
+			proposerAgentId: a.id,
+			payload: {
+				kind: "grant_allow_rule",
+				fromAgentId: a.id,
+				toAgentId: b.id,
+				categoryId: category.id,
+			},
+			reason: "Allow schedule lookup",
+			status: "pending",
+			createdAt: T0,
+			expiresAt: T0 + 14 * DAY_MS,
+			resolvedAt: null,
+			resolvedBy: null,
+			changeLogId: null,
+		};
+		await insertProposal(db, proposal).run();
+
+		const loaded = await db
+			.prepare("SELECT * FROM proposals WHERE id = ?")
+			.bind(proposal.id)
+			.first<ProposalRow>();
+		expect(loaded && proposalFromRow(loaded)).toEqual(proposal);
+
+		await expect(
+			db
+				.prepare(
+					`INSERT INTO proposals
+						(id, kind, proposer_agent_id, payload_json, reason, status, created_at, expires_at, resolved_at)
+					VALUES (?, 'unknown_kind', ?, '{}', 'r', 'pending', ?, ?, NULL)`,
+				)
+				.bind(newId(), a.id, T0, T0 + 14 * DAY_MS)
+				.run(),
+		).rejects.toThrow(/CHECK/);
+
+		await expect(
+			db
+				.prepare(
+					`INSERT INTO proposals
+						(id, kind, proposer_agent_id, payload_json, reason, status, created_at, expires_at, resolved_at)
+					VALUES (?, 'create_category', ?, '{"kind":"create_category","name":"x"}', 'r', 'cancelled', ?, ?, ?)`,
+				)
+				.bind(newId(), a.id, T0, T0 + 14 * DAY_MS, T0 + 1)
+				.run(),
+		).rejects.toThrow(/CHECK/);
+
+		// Pending row with non-null resolved_at violates CHECK.
+		await expect(
+			insertProposal(db, {
+				...proposal,
+				id: newId(),
+				status: "pending",
+				resolvedAt: T0 + 1,
+			}).run(),
+		).rejects.toThrow(/CHECK/);
+
+		// Resolved row with null resolved_at violates CHECK.
+		for (const status of ["approved", "rejected", "expired"] as const) {
+			await expect(
+				insertProposal(db, {
+					...proposal,
+					id: newId(),
+					status,
+					resolvedAt: null,
+				}).run(),
+			).rejects.toThrow(/CHECK/);
+		}
+
+		// STRICT type check on created_at.
+		await expect(
+			db
+				.prepare(
+					`INSERT INTO proposals
+						(id, kind, proposer_agent_id, payload_json, reason, status, created_at, expires_at, resolved_at)
+					VALUES (?, 'create_category', ?, '{"kind":"create_category","name":"x"}', 'r', 'pending', 'not-int', ?, NULL)`,
+				)
+				.bind(newId(), a.id, T0 + 14 * DAY_MS)
+				.run(),
+		).rejects.toThrow(/STRICT|datatype/i);
+
+		// Foreign key on proposer_agent_id and ON DELETE CASCADE.
+		await expect(
+			insertProposal(db, {
+				...proposal,
+				id: newId(),
+				proposerAgentId: newId(),
+			}).run(),
+		).rejects.toThrow(/FOREIGN KEY/);
+
+		await db.prepare("DELETE FROM agents WHERE id = ?").bind(a.id).run();
+		const remaining = await db
+			.prepare("SELECT COUNT(*) AS n FROM proposals")
+			.first<{ n: number }>();
+		expect(remaining?.n).toBe(0);
+	});
+
+	it("preserves all existing tables when migrating a populated database from 0005 to 0006 and enforces pending_descriptions constraints", async () => {
+		await db.batch([
+			db.prepare("DROP TABLE IF EXISTS webhook_deliveries"),
+			db.prepare("DROP TABLE IF EXISTS agent_webhooks"),
+			db.prepare("DROP TABLE IF EXISTS pending_descriptions"),
+			db.prepare("DROP TABLE IF EXISTS proposals"),
+			db.prepare("DROP TABLE IF EXISTS admin_bot_config"),
+			db.prepare("DROP TABLE IF EXISTS change_log"),
+			db.prepare("DROP TABLE IF EXISTS audit_log"),
+			db.prepare("DROP TABLE IF EXISTS messages"),
+			db.prepare("DROP TABLE IF EXISTS allow_rules"),
+			db.prepare("DROP TABLE IF EXISTS tokens"),
+			db.prepare("DROP TABLE IF EXISTS categories"),
+			db.prepare("DROP TABLE IF EXISTS agents"),
+			db.prepare("DROP TABLE IF EXISTS d1_migrations"),
+		]);
+
+		const m1 = migration("0001_initial_schema.sql");
+		const m2 = migration("0002_cascade_message_references.sql");
+		const m3 = migration("0003_change_log.sql");
+		const m4 = migration("0004_admin_bot.sql");
+		const m5 = migration("0005_proposals.sql");
+		const m6 = migration("0006_pending_descriptions.sql");
+		await applyD1Migrations(db, [m1, m2, m3, m4, m5]);
+
+		const a = await seedAgent(db, { name: "a", description: "original" });
+		const b = await seedAgent(db, { name: "b" });
+		await insertProposal(db, {
+			id: newId(),
+			kind: "create_category",
+			proposerAgentId: a.id,
+			payload: { kind: "create_category", name: "travel" },
+			reason: "Need travel",
+			status: "pending",
+			createdAt: T0,
+			expiresAt: T0 + 14 * DAY_MS,
+			resolvedAt: null,
+			resolvedBy: null,
+			changeLogId: null,
+		}).run();
+
+		await applyD1Migrations(db, [m1, m2, m3, m4, m5, m6]);
+
+		const fkViolations = await db.prepare("PRAGMA foreign_key_check").all();
+		expect(fkViolations.results).toEqual([]);
+
+		expect(
+			(
+				await db.prepare("SELECT * FROM agents ORDER BY name").all<AgentRow>()
+			).results.map(agentFromRow),
+		).toEqual([a, b]);
+
+		const draft: PendingDescription = {
+			agentId: a.id,
+			submissionId: newId(),
+			description: "Updated agent description",
+			submittedAt: T0 + 10,
+		};
+		await upsertPendingDescription(db, draft).run();
+
+		const loaded = await db
+			.prepare("SELECT * FROM pending_descriptions WHERE agent_id = ?")
+			.bind(a.id)
+			.first<PendingDescriptionRow>();
+		expect(loaded && pendingDescriptionFromRow(loaded)).toEqual(draft);
+
+		// Upsert replaces the previous draft and submission_id for the same agent.
+		const revised: PendingDescription = {
+			agentId: a.id,
+			submissionId: newId(),
+			description: "Revised agent description",
+			submittedAt: T0 + 20,
+		};
+		await upsertPendingDescription(db, revised).run();
+		const reloaded = await db
+			.prepare("SELECT * FROM pending_descriptions WHERE agent_id = ?")
+			.bind(a.id)
+			.first<PendingDescriptionRow>();
+		expect(reloaded && pendingDescriptionFromRow(reloaded)).toEqual(revised);
+
+		// STRICT type check on submitted_at.
+		await expect(
+			db
+				.prepare(
+					`INSERT INTO pending_descriptions (agent_id, submission_id, description, submitted_at)
+					VALUES (?, ?, 'desc', 'not-int')`,
+				)
+				.bind(b.id, newId())
+				.run(),
+		).rejects.toThrow(/STRICT|datatype/i);
+
+		// NOT NULL check on submission_id.
+		await expect(
+			db
+				.prepare(
+					`INSERT INTO pending_descriptions (agent_id, submission_id, description, submitted_at)
+					VALUES (?, NULL, 'desc', ?)`,
+				)
+				.bind(b.id, T0)
+				.run(),
+		).rejects.toThrow(/NOT NULL/);
+
+		// NOT NULL check on description.
+		await expect(
+			db
+				.prepare(
+					`INSERT INTO pending_descriptions (agent_id, submission_id, description, submitted_at)
+					VALUES (?, ?, NULL, ?)`,
+				)
+				.bind(b.id, newId(), T0)
+				.run(),
+		).rejects.toThrow(/NOT NULL/);
+
+		// Foreign key on agent_id and ON DELETE CASCADE.
+		await expect(
+			upsertPendingDescription(db, {
+				agentId: newId(),
+				submissionId: newId(),
+				description: "ghost",
+				submittedAt: T0,
+			}).run(),
+		).rejects.toThrow(/FOREIGN KEY/);
+
+		await db.prepare("DELETE FROM agents WHERE id = ?").bind(a.id).run();
+		const remaining = await db
+			.prepare("SELECT COUNT(*) AS n FROM pending_descriptions")
+			.first<{ n: number }>();
+		expect(remaining?.n).toBe(0);
+	});
+});
+
+describe("pending_descriptions", () => {
+	it("orders by submitted_at ASC using pending_descriptions_submitted_idx", async () => {
+		const a = await seedAgent(db, { name: "a" });
+		const b = await seedAgent(db, { name: "b" });
+		const second: PendingDescription = {
+			agentId: b.id,
+			submissionId: newId(),
+			description: "second",
+			submittedAt: T0 + 20,
+		};
+		const first: PendingDescription = {
+			agentId: a.id,
+			submissionId: newId(),
+			description: "first",
+			submittedAt: T0 + 10,
+		};
+		await db.batch([
+			upsertPendingDescription(db, second),
+			upsertPendingDescription(db, first),
+		]);
+
+		const sql = "SELECT * FROM pending_descriptions ORDER BY submitted_at ASC";
+		const { results } = await db.prepare(sql).all<PendingDescriptionRow>();
+		expect(results.map(pendingDescriptionFromRow)).toEqual([first, second]);
+		expect(await queryPlan(sql)).toContain(
+			"pending_descriptions_submitted_idx",
+		);
+	});
+});
+
+describe("proposals", () => {
+	it("stores all payload variants and uses status and expiry indexes", async () => {
+		const bot = await seedAgent(db, { name: "bot" });
+		const target = await seedAgent(db, { name: "target" });
+		const cat = await seedCategory(db, { name: "work" });
+
+		const entries: Proposal[] = [
+			{
+				id: newId(),
+				kind: "grant_allow_rule",
+				proposerAgentId: bot.id,
+				payload: {
+					kind: "grant_allow_rule",
+					fromAgentId: bot.id,
+					toAgentId: target.id,
+					categoryId: cat.id,
+				},
+				reason: "Allow work",
+				status: "pending",
+				createdAt: T0,
+				expiresAt: T0 + 14 * DAY_MS,
+				resolvedAt: null,
+				resolvedBy: null,
+				changeLogId: null,
+			},
+			{
+				id: newId(),
+				kind: "create_category",
+				proposerAgentId: bot.id,
+				payload: { kind: "create_category", name: "travel" },
+				reason: "Add travel",
+				status: "approved",
+				createdAt: T0 + 1,
+				expiresAt: T0 + 14 * DAY_MS + 1,
+				resolvedAt: T0 + 10,
+				resolvedBy: "owner@example.com",
+				changeLogId: 42,
+			},
+			{
+				id: newId(),
+				kind: "raise_daily_limit",
+				proposerAgentId: bot.id,
+				payload: {
+					kind: "raise_daily_limit",
+					agentId: target.id,
+					newLimit: 50,
+				},
+				reason: "Higher traffic",
+				status: "rejected",
+				createdAt: T0 + 2,
+				expiresAt: T0 + 14 * DAY_MS + 2,
+				resolvedAt: T0 + 20,
+				resolvedBy: "owner@example.com",
+				changeLogId: null,
+			},
+			{
+				id: newId(),
+				kind: "resume_agent",
+				proposerAgentId: bot.id,
+				payload: { kind: "resume_agent", agentId: target.id },
+				reason: "Issue resolved",
+				status: "expired",
+				createdAt: T0 + 3,
+				expiresAt: T0 + 14 * DAY_MS + 3,
+				resolvedAt: T0 + 14 * DAY_MS + 3,
+				resolvedBy: null,
+				changeLogId: null,
+			},
+		];
+
+		await db.batch(entries.map((entry) => insertProposal(db, entry)));
+
+		const { results } = await db
+			.prepare("SELECT * FROM proposals ORDER BY created_at ASC")
+			.all<ProposalRow>();
+		expect(results.map(proposalFromRow)).toEqual(entries);
+
+		const { results: indexes } = await db
+			.prepare(
+				"SELECT name FROM sqlite_schema WHERE type = 'index' AND tbl_name = 'proposals' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+			)
+			.all<{ name: string }>();
+		expect(indexes.map((row) => row.name)).toEqual([
+			"proposals_expiry_idx",
+			"proposals_status_idx",
+		]);
+		expect(
+			await queryPlan(
+				"SELECT * FROM proposals WHERE status = ? ORDER BY created_at DESC",
+				"pending",
+			),
+		).toContain("proposals_status_idx");
+		expect(
+			await queryPlan(
+				"SELECT id FROM proposals INDEXED BY proposals_expiry_idx WHERE status = 'pending' AND expires_at <= ?",
+				T0 + 14 * DAY_MS,
+			),
+		).toContain("proposals_expiry_idx");
+	});
 });
 
 describe("row conversion", () => {
@@ -1039,6 +1477,82 @@ describe("row conversion", () => {
 			}),
 		).toThrow(/admin_bot_config\.read_bodies/);
 	});
+
+	it("validates proposal kind, status, and payload_json strictly", () => {
+		const validRow: ProposalRow = {
+			id: "p1",
+			kind: "create_category",
+			proposer_agent_id: "a1",
+			payload_json: JSON.stringify({ kind: "create_category", name: "travel" }),
+			reason: "Need travel",
+			status: "pending",
+			created_at: T0,
+			expires_at: T0 + 14 * DAY_MS,
+			resolved_at: null,
+			resolved_by: null,
+			change_log_id: null,
+		};
+		expect(proposalFromRow(validRow).payload).toEqual({
+			kind: "create_category",
+			name: "travel",
+		});
+
+		expect(() => proposalFromRow({ ...validRow, kind: "bogus" })).toThrow(
+			/proposals\.kind/,
+		);
+		expect(() => proposalFromRow({ ...validRow, status: "bogus" })).toThrow(
+			/proposals\.status/,
+		);
+		expect(() => parseProposalPayload("create_category", "{bad json")).toThrow(
+			/Invalid JSON/,
+		);
+		expect(() =>
+			parseProposalPayload(
+				"create_category",
+				JSON.stringify({ kind: "resume_agent", agentId: "a1" }),
+			),
+		).toThrow(/Mismatched kind/);
+		expect(() =>
+			parseProposalPayload(
+				"grant_allow_rule",
+				JSON.stringify({
+					kind: "grant_allow_rule",
+					fromAgentId: "a1",
+					toAgentId: "",
+					categoryId: "c1",
+				}),
+			),
+		).toThrow(/toAgentId/);
+		expect(() =>
+			parseProposalPayload(
+				"raise_daily_limit",
+				JSON.stringify({
+					kind: "raise_daily_limit",
+					agentId: "a1",
+					newLimit: -1,
+				}),
+			),
+		).toThrow(/newLimit/);
+	});
+
+	it("rejects empty or blank pending_descriptions.submission_id", () => {
+		expect(() =>
+			pendingDescriptionFromRow({
+				agent_id: "a1",
+				submission_id: "",
+				description: "desc",
+				submitted_at: T0,
+			}),
+		).toThrow(/pending_descriptions\.submission_id/);
+		expect(() =>
+			pendingDescriptionFromRow({
+				agent_id: "a1",
+				submission_id: "   ",
+				description: "desc",
+				submitted_at: T0,
+			}),
+		).toThrow(/pending_descriptions\.submission_id/);
+	});
 });
 
 describe("migration 0002 on populated data", () => {
@@ -1047,6 +1561,10 @@ describe("migration 0002 on populated data", () => {
 		const m0002 = migrationByName("0002_cascade_message_references.sql");
 
 		for (const table of [
+			"webhook_deliveries",
+			"agent_webhooks",
+			"pending_descriptions",
+			"proposals",
 			"admin_bot_config",
 			"change_log",
 			"audit_log",
@@ -1106,5 +1624,434 @@ describe("migration 0002 on populated data", () => {
 			.prepare("SELECT COUNT(*) AS n FROM messages")
 			.first<{ n: number }>();
 		expect(remaining?.n).toBe(0);
+	});
+});
+
+describe("agent_webhooks and webhook_deliveries (migration 0007)", () => {
+	it("stores, upserts, maps, and cascades agent_webhooks across all 4 auth modes", async () => {
+		const a = await seedAgent(db, { name: "muse" });
+		const b = await seedAgent(db, { name: "grok" });
+		const c = await seedAgent(db, { name: "cue" });
+		const d = await seedAgent(db, { name: "custom" });
+
+		const webhooks: AgentWebhook[] = [
+			{
+				agentId: a.id,
+				url: "https://hooks.example.com/a",
+				authMode: "standard_webhooks",
+				secret: "whsec_MDEyMzQ1Njc4OWFiY2RlZg==",
+				createdAt: T0,
+				updatedAt: T0,
+			},
+			{
+				agentId: b.id,
+				url: "https://hooks.example.com/b",
+				authMode: "bearer_header",
+				secret: "bearer-secret",
+				createdAt: T0,
+				updatedAt: T0,
+			},
+			{
+				agentId: c.id,
+				url: "https://hooks.example.com/c",
+				authMode: "custom_header",
+				headerName: "X-Wake-Key",
+				secret: "custom-secret",
+				createdAt: T0,
+				updatedAt: T0,
+			},
+			{
+				agentId: d.id,
+				url: "https://hooks.example.com/d",
+				authMode: "paab_hmac",
+				secret: `paab_whsec_${"ab".repeat(32)}`,
+				createdAt: T0,
+				updatedAt: T0,
+			},
+		];
+
+		await db.batch(webhooks.map((w) => upsertAgentWebhook(db, w)));
+
+		for (const expected of webhooks) {
+			const row = await db
+				.prepare("SELECT * FROM agent_webhooks WHERE agent_id = ?")
+				.bind(expected.agentId)
+				.first<AgentWebhookRow>();
+			expect(row).not.toBeNull();
+			expect(agentWebhookFromRow(row as AgentWebhookRow)).toEqual(expected);
+		}
+
+		// Upsert preserves created_at and updates fields.
+		await upsertAgentWebhook(db, {
+			agentId: c.id,
+			url: "https://hooks.example.com/c2",
+			authMode: "bearer_header",
+			secret: "new-bearer",
+			createdAt: T0 + 999,
+			updatedAt: T0 + 50,
+		}).run();
+		const updatedRow = await db
+			.prepare("SELECT * FROM agent_webhooks WHERE agent_id = ?")
+			.bind(c.id)
+			.first<AgentWebhookRow>();
+		expect(agentWebhookFromRow(updatedRow as AgentWebhookRow)).toEqual({
+			agentId: c.id,
+			url: "https://hooks.example.com/c2",
+			authMode: "bearer_header",
+			secret: "new-bearer",
+			createdAt: T0,
+			updatedAt: T0 + 50,
+		});
+
+		// Deleting the agent cascades to agent_webhooks.
+		await db.prepare("DELETE FROM agents WHERE id = ?").bind(a.id).run();
+		const afterDelete = await db
+			.prepare("SELECT * FROM agent_webhooks WHERE agent_id = ?")
+			.bind(a.id)
+			.first<AgentWebhookRow>();
+		expect(afterDelete).toBeNull();
+	});
+
+	it("enforces CHECK constraints on agent_webhooks", async () => {
+		const a = await seedAgent(db, { name: "agent-check" });
+
+		// Invalid auth_mode rejected.
+		await expect(
+			db
+				.prepare(
+					`INSERT INTO agent_webhooks
+						(agent_id, url, auth_mode, header_name, secret, created_at, updated_at)
+					VALUES (?, ?, ?, ?, ?, ?, ?)`,
+				)
+				.bind(a.id, "https://example.com/h", "invalid", null, "sec", T0, T0)
+				.run(),
+		).rejects.toThrow(/CHECK/);
+
+		// custom_header without header_name rejected.
+		await expect(
+			db
+				.prepare(
+					`INSERT INTO agent_webhooks
+						(agent_id, url, auth_mode, header_name, secret, created_at, updated_at)
+					VALUES (?, ?, ?, ?, ?, ?, ?)`,
+				)
+				.bind(
+					a.id,
+					"https://example.com/h",
+					"custom_header",
+					null,
+					"sec",
+					T0,
+					T0,
+				)
+				.run(),
+		).rejects.toThrow(/CHECK/);
+
+		// non-custom_header with non-null header_name rejected.
+		await expect(
+			db
+				.prepare(
+					`INSERT INTO agent_webhooks
+						(agent_id, url, auth_mode, header_name, secret, created_at, updated_at)
+					VALUES (?, ?, ?, ?, ?, ?, ?)`,
+				)
+				.bind(
+					a.id,
+					"https://example.com/h",
+					"bearer_header",
+					"X-Extra",
+					"sec",
+					T0,
+					T0,
+				)
+				.run(),
+		).rejects.toThrow(/CHECK/);
+	});
+
+	it("enforces agentWebhookFromRow and webhookDeliveryFromRow validation", () => {
+		expect(() =>
+			agentWebhookFromRow({
+				agent_id: "a1",
+				url: "https://example.com",
+				auth_mode: "unknown",
+				header_name: null,
+				secret: "sec",
+				created_at: T0,
+				updated_at: T0,
+			}),
+		).toThrow(/auth_mode/);
+
+		expect(() =>
+			agentWebhookFromRow({
+				agent_id: "a1",
+				url: "https://example.com",
+				auth_mode: "custom_header",
+				header_name: null,
+				secret: "sec",
+				created_at: T0,
+				updated_at: T0,
+			}),
+		).toThrow(/header_name/);
+
+		expect(() =>
+			agentWebhookFromRow({
+				agent_id: "a1",
+				url: "https://example.com",
+				auth_mode: "paab_hmac",
+				header_name: "X-Unexpected",
+				secret: "sec",
+				created_at: T0,
+				updated_at: T0,
+			}),
+		).toThrow(/header_name/);
+
+		expect(() =>
+			webhookDeliveryFromRow({
+				id: "d1",
+				agent_id: "a1",
+				status: "bogus",
+				attempts: 0,
+				next_attempt_at: T0,
+				leased_until: null,
+				last_error: null,
+				created_at: T0,
+				updated_at: T0,
+			}),
+		).toThrow(/status/);
+
+		expect(() =>
+			webhookDeliveryFromRow({
+				id: "d1",
+				agent_id: "a1",
+				status: "pending",
+				attempts: -1,
+				next_attempt_at: T0,
+				leased_until: null,
+				last_error: null,
+				created_at: T0,
+				updated_at: T0,
+			}),
+		).toThrow(/attempts/);
+	});
+
+	it("enforces partial unique pending index, CHECK constraints, due index, and cascade on webhook_deliveries", async () => {
+		const a = await seedAgent(db, { name: "agent-deliv" });
+
+		const d1: WebhookDelivery = {
+			id: newId(),
+			agentId: a.id,
+			status: "pending",
+			attempts: 0,
+			nextAttemptAt: T0,
+			leasedUntil: T0 + 10_000,
+			lastError: null,
+			createdAt: T0,
+			updatedAt: T0,
+		};
+		await insertWebhookDelivery(db, d1).run();
+
+		// Duplicate pending row for same agent fails unique partial index.
+		await expect(
+			insertWebhookDelivery(db, {
+				...d1,
+				id: newId(),
+			}).run(),
+		).rejects.toThrow(/UNIQUE/);
+
+		// Non-pending rows for the same agent are allowed alongside pending.
+		const d2: WebhookDelivery = {
+			id: newId(),
+			agentId: a.id,
+			status: "delivered",
+			attempts: 1,
+			nextAttemptAt: T0 - 10,
+			leasedUntil: null,
+			lastError: null,
+			createdAt: T0 - 10,
+			updatedAt: T0 - 10,
+		};
+		const d3: WebhookDelivery = {
+			id: newId(),
+			agentId: a.id,
+			status: "abandoned",
+			attempts: 3,
+			nextAttemptAt: T0 - 20,
+			leasedUntil: null,
+			lastError: "HTTP 500",
+			createdAt: T0 - 20,
+			updatedAt: T0 - 20,
+		};
+		await db.batch([
+			insertWebhookDelivery(db, d2),
+			insertWebhookDelivery(db, d3),
+		]);
+
+		const row1 = await db
+			.prepare("SELECT * FROM webhook_deliveries WHERE id = ?")
+			.bind(d1.id)
+			.first<WebhookDeliveryRow>();
+		expect(webhookDeliveryFromRow(row1 as WebhookDeliveryRow)).toEqual(d1);
+
+		const row2 = await db
+			.prepare("SELECT * FROM webhook_deliveries WHERE id = ?")
+			.bind(d2.id)
+			.first<WebhookDeliveryRow>();
+		expect(webhookDeliveryFromRow(row2 as WebhookDeliveryRow)).toEqual(d2);
+
+		// Invalid status / negative attempts fail CHECK.
+		await expect(
+			db
+				.prepare(
+					`INSERT INTO webhook_deliveries
+						(id, agent_id, status, attempts, next_attempt_at, leased_until, last_error, created_at, updated_at)
+					VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				)
+				.bind(newId(), a.id, "failed", 0, T0, null, null, T0, T0)
+				.run(),
+		).rejects.toThrow(/CHECK/);
+		await expect(
+			db
+				.prepare(
+					`INSERT INTO webhook_deliveries
+						(id, agent_id, status, attempts, next_attempt_at, leased_until, last_error, created_at, updated_at)
+					VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				)
+				.bind(newId(), a.id, "delivered", -1, T0, null, null, T0, T0)
+				.run(),
+		).rejects.toThrow(/CHECK/);
+
+		// Due query uses partial due index (next_attempt_at, leased_until).
+		const plan = await queryPlan(
+			`SELECT d.*, a.status AS agent_status, w.agent_id AS webhook_agent_id,
+				w.url, w.auth_mode, w.header_name, w.secret,
+				w.created_at AS webhook_created_at, w.updated_at AS webhook_updated_at
+			FROM webhook_deliveries d
+			JOIN agents a ON a.id = d.agent_id
+			JOIN agent_webhooks w ON w.agent_id = d.agent_id
+			WHERE d.status = 'pending'
+				AND d.next_attempt_at <= ?
+				AND (d.leased_until IS NULL OR d.leased_until <= ?)
+			ORDER BY d.next_attempt_at ASC
+			LIMIT 8`,
+			T0,
+			T0,
+		);
+		expect(plan).toContain("webhook_deliveries_due_idx");
+
+		// Deleting agent cascades webhook_deliveries.
+		await db.prepare("DELETE FROM agents WHERE id = ?").bind(a.id).run();
+		const count = await db
+			.prepare("SELECT COUNT(*) AS n FROM webhook_deliveries")
+			.first<{ n: number }>();
+		expect(count?.n).toBe(0);
+	});
+
+	it("preserves populated data when upgrading from migration 0006 through 0008", async () => {
+		await db.batch([
+			db.prepare("DROP TABLE IF EXISTS webhook_deliveries"),
+			db.prepare("DROP TABLE IF EXISTS agent_webhooks"),
+			db.prepare("DROP TABLE IF EXISTS pending_descriptions"),
+			db.prepare("DROP TABLE IF EXISTS proposals"),
+			db.prepare("DROP TABLE IF EXISTS admin_bot_config"),
+			db.prepare("DROP TABLE IF EXISTS change_log"),
+			db.prepare("DROP TABLE IF EXISTS audit_log"),
+			db.prepare("DROP TABLE IF EXISTS messages"),
+			db.prepare("DROP TABLE IF EXISTS allow_rules"),
+			db.prepare("DROP TABLE IF EXISTS tokens"),
+			db.prepare("DROP TABLE IF EXISTS categories"),
+			db.prepare("DROP TABLE IF EXISTS agents"),
+			db.prepare("DROP TABLE IF EXISTS d1_migrations"),
+		]);
+
+		const m1 = migrationByName("0001_initial_schema.sql");
+		const m2 = migrationByName("0002_cascade_message_references.sql");
+		const m3 = migrationByName("0003_change_log.sql");
+		const m4 = migrationByName("0004_admin_bot.sql");
+		const m5 = migrationByName("0005_proposals.sql");
+		const m6 = migrationByName("0006_pending_descriptions.sql");
+		const m7 = migrationByName("0007_webhooks.sql");
+		const m8 = migrationByName("0008_body_retention_indexes.sql");
+
+		await applyD1Migrations(db, [m1, m2, m3, m4, m5, m6]);
+		const a = await seedAgent(db, { name: "existing-agent" });
+		const submissionId = newId();
+		await upsertPendingDescription(db, {
+			agentId: a.id,
+			submissionId,
+			description: "Draft description",
+			submittedAt: T0,
+		}).run();
+
+		await applyD1Migrations(db, [m1, m2, m3, m4, m5, m6, m7, m8]);
+
+		const fkCheck = await db.prepare("PRAGMA foreign_key_check").all();
+		expect(fkCheck.results).toEqual([]);
+		const preserved = await db
+			.prepare("SELECT * FROM pending_descriptions WHERE agent_id = ?")
+			.bind(a.id)
+			.first<PendingDescriptionRow>();
+		expect(preserved?.description).toBe("Draft description");
+		expect(preserved?.submission_id).toBe(submissionId);
+
+		await upsertAgentWebhook(db, {
+			agentId: a.id,
+			url: "https://hooks.example.com/migrated",
+			authMode: "paab_hmac",
+			secret: `paab_whsec_${"11".repeat(32)}`,
+			createdAt: T0,
+			updatedAt: T0,
+		}).run();
+		const loaded = await db
+			.prepare("SELECT * FROM agent_webhooks WHERE agent_id = ?")
+			.bind(a.id)
+			.first<AgentWebhookRow>();
+		expect(loaded?.url).toBe("https://hooks.example.com/migrated");
+
+		const { results: indexRows } = await db
+			.prepare(
+				"SELECT name FROM sqlite_schema WHERE type = 'index' AND name IN ('messages_with_body_idx', 'audit_log_with_body_idx') ORDER BY name",
+			)
+			.all<{ name: string }>();
+		expect(indexRows.map((row) => row.name)).toEqual([
+			"audit_log_with_body_idx",
+			"messages_with_body_idx",
+		]);
+	});
+});
+
+describe("partial body-retention indexes (migration 0008)", () => {
+	it("uses messages_with_body_idx for deleteBodies instead of scanning the full messages table", async () => {
+		const plan = await queryPlan(
+			`UPDATE messages SET body = NULL, body_deleted_at = ?1
+			WHERE body IS NOT NULL AND (
+				(kind = 'question' AND status = 'expired' AND received_at IS NULL)
+				OR (
+					received_at <= ?2
+					AND (
+						kind = 'answer'
+						OR (kind = 'question' AND status IN ('answered', 'declined', 'expired'))
+					)
+				)
+			)`,
+			T0 + DAY_MS,
+			T0,
+		);
+		expect(plan).toContain("messages_with_body_idx");
+		expect(plan).not.toMatch(/\bSCAN messages(?! USING INDEX)/);
+	});
+
+	it("uses audit_log_with_body_idx for purgeExpiredAuditBodies instead of scanning the full audit_log table", async () => {
+		const retentionPlan = await queryPlan(
+			"UPDATE audit_log SET body = NULL WHERE body IS NOT NULL AND occurred_at <= ?",
+			T0,
+		);
+		expect(retentionPlan).toContain("audit_log_with_body_idx");
+		expect(retentionPlan).not.toMatch(/\bSCAN audit_log(?! USING INDEX)/);
+
+		const disabledPlan = await queryPlan(
+			"UPDATE audit_log SET body = NULL WHERE body IS NOT NULL",
+		);
+		expect(disabledPlan).toContain("audit_log_with_body_idx");
+		expect(disabledPlan).not.toMatch(/\bSCAN audit_log(?! USING INDEX)/);
 	});
 });

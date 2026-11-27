@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { submitPendingDescription } from "../adminbot/descriptions";
 import {
 	type AuditBodyConfig,
 	recordAuditEvent,
@@ -13,7 +14,17 @@ import {
 	recordBlockedQuestion,
 	submitQuestion,
 } from "../inbox";
-import { checkQuestion, listAllowedRecipients } from "../policy";
+import {
+	notifyAgentImmediately,
+	scheduleDelayedWake,
+	type WebhookFetcher,
+} from "../notify";
+import {
+	checkQuestion,
+	DESCRIPTION_MAX_LENGTH,
+	descriptionProblem,
+	listAllowedRecipients,
+} from "../policy";
 import type { Agent, UnixMillis } from "../types";
 import { type Frame, renderFramed } from "./frame";
 import {
@@ -30,6 +41,9 @@ export interface McpContext {
 	agent: Agent;
 	audit: AuditBodyConfig;
 	now: UnixMillis;
+	waitUntil?: (promise: Promise<unknown>) => void;
+	webhookFetcher?: WebhookFetcher;
+	allowInsecureLocalhostWebhook?: boolean;
 }
 
 export interface ToolOutput {
@@ -132,6 +146,14 @@ const ask = defineTool({
 				messageId: questionId,
 				body: question,
 			});
+			await notifyAgentImmediately(ctx.db, {
+				agentId: decision.toAgentId,
+				now: ctx.now,
+				audit: ctx.audit,
+				waitUntil: ctx.waitUntil,
+				fetcher: ctx.webhookFetcher,
+				allowInsecureLocalhost: ctx.allowInsecureLocalhostWebhook,
+			});
 		} else {
 			({ questionId } = await recordBlockedQuestion(ctx.db, {
 				fromAgentId: ctx.agent.id,
@@ -147,6 +169,10 @@ const ask = defineTool({
 				categoryId: decision.categoryId,
 				reasonCode: decision.reasonCode,
 				messageId: questionId,
+			});
+			await scheduleDelayedWake(ctx.db, {
+				agentId: ctx.agent.id,
+				now: ctx.now,
 			});
 		}
 		// Identical for accepted and blocked questions, so that the asker
@@ -310,6 +336,14 @@ const answer = defineTool({
 			messageId: question_id,
 			body: reply.kind === "answer" ? reply.body : null,
 		});
+		await notifyAgentImmediately(ctx.db, {
+			agentId: result.askerAgentId,
+			now: ctx.now,
+			audit: ctx.audit,
+			waitUntil: ctx.waitUntil,
+			fetcher: ctx.webhookFetcher,
+			allowInsecureLocalhost: ctx.allowInsecureLocalhostWebhook,
+		});
 		return ok(
 			reply.kind === "answer"
 				? `answered question ${question_id}; the answer arrives in the asker's inbox`
@@ -347,9 +381,51 @@ const listAgents = defineTool({
 	},
 });
 
+const submitDescription = defineTool({
+	name: "submit_description",
+	description:
+		"Submit a proposed description of yourself for review. Your current description remains visible in list_agents until approved by an admin bot or the owner. Resubmitting replaces your previous pending submission.",
+	inputSchema: z.object({
+		description: z
+			.string()
+			.describe(
+				`Your proposed description, at most ${DESCRIPTION_MAX_LENGTH} characters. Control characters other than newline and tab are not allowed.`,
+			),
+	}),
+	async run(ctx, { description }) {
+		const problem = descriptionProblem(description);
+		if (problem !== null) {
+			return fail(problem);
+		}
+		const result = await submitPendingDescription(ctx.db, {
+			agentId: ctx.agent.id,
+			description,
+			now: ctx.now,
+		});
+		if (!result.ok) {
+			return fail(result.message);
+		}
+		await recordAuditEvent(ctx.db, ctx.audit, {
+			eventType: "description_submitted",
+			occurredAt: ctx.now,
+			fromAgentId: ctx.agent.id,
+			body: result.data.pending.description,
+		});
+		return ok(
+			block([
+				"status: submitted",
+				`submission_id: ${result.data.pending.submissionId}`,
+				`submitted_at: ${new Date(result.data.pending.submittedAt).toISOString()}`,
+				"note: your description is pending approval; your existing description remains visible in list_agents until approved",
+			]),
+		);
+	},
+});
+
 export const TOOLS: readonly ToolDefinition[] = [
 	ask,
 	checkInbox,
 	answer,
 	listAgents,
+	submitDescription,
 ];

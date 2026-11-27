@@ -50,6 +50,11 @@ export const CHANGE_ACTION_LABELS: Record<ChangeAction, string> = {
 	admin_bot_designated: "管理者ボット指名",
 	admin_bot_cleared: "管理者ボット解除",
 	admin_bot_switches_updated: "管理者ボット権限変更",
+	description_approved: "説明文承認",
+	description_rejected: "説明文却下",
+	webhook_configured: "Webhook設定",
+	webhook_secret_rotated: "Webhook鍵ローテーション",
+	webhook_deleted: "Webhook削除",
 	change_reverted: "変更取消",
 };
 
@@ -124,6 +129,12 @@ export function collectEntityNames(
 				if (id !== null && name !== null && !agentMap.has(id)) {
 					agentMap.set(id, name);
 				}
+			} else if (entry.targetType === "description") {
+				const id = readString(record, "agentId");
+				const name = readString(record, "name");
+				if (id !== null && name !== null && !agentMap.has(id)) {
+					agentMap.set(id, name);
+				}
 			}
 		}
 	}
@@ -191,7 +202,7 @@ export function describeChangeTarget(
 		case "admin_bot":
 			return names.agents.get(entry.targetId) ?? entry.targetId;
 		case "description":
-			return entry.targetId;
+			return names.agents.get(entry.targetId) ?? entry.targetId;
 	}
 }
 
@@ -220,6 +231,47 @@ function describeAgentSnapshot(
 	if (status !== null) parts.push(`状態=${status}`);
 	if (typeof limit === "number") parts.push(`上限=${limit}/日`);
 	return parts.join(" ");
+}
+
+const DESCRIPTION_SNAPSHOT_PREVIEW_MAX = 80;
+
+function describeDescriptionSnapshot(
+	targetId: string,
+	record: Record<string, unknown>,
+	names: ChangeLogNameMaps,
+): string {
+	const agentId = readString(record, "agentId") ?? targetId;
+	const name =
+		names.agents.get(agentId) ?? readString(record, "name") ?? agentId;
+	const description = record.description;
+	if (typeof description !== "string") {
+		return name;
+	}
+	if (description.length === 0) {
+		return `${name}（説明文なし）`;
+	}
+	const preview =
+		description.length > DESCRIPTION_SNAPSHOT_PREVIEW_MAX
+			? `${description.slice(0, DESCRIPTION_SNAPSHOT_PREVIEW_MAX)}…`
+			: description;
+	return `${name}「${preview}」`;
+}
+
+function describeWebhookSnapshot(record: Record<string, unknown>): string {
+	const url = readString(record, "url");
+	const authMode = readString(record, "authMode");
+	const headerName = readString(record, "headerName");
+	const details: string[] = [];
+	if (authMode !== null) {
+		details.push(authMode);
+	}
+	if (headerName !== null) {
+		details.push(`header=${headerName}`);
+	}
+	if (url !== null) {
+		return details.length > 0 ? `${url}（${details.join("・")}）` : url;
+	}
+	return details.length > 0 ? details.join("・") : "Webhook設定";
 }
 
 function describeSnapshot(
@@ -274,11 +326,27 @@ function describeSnapshot(
 			if (record.readBodies === true) {
 				extras.push("本文閲覧=ON");
 			}
-			if (typeof record.superadminUntil === "number") {
-				extras.push("最高管理者=有効");
+			if (record.superadminUntil === 0) {
+				extras.push("最高管理者=無期限");
+			} else if (
+				typeof record.superadminUntil === "number" &&
+				record.superadminUntil > 0
+			) {
+				extras.push(
+					record.superadminUntil > entry.occurredAt
+						? "最高管理者=有効"
+						: "最高管理者=期限切れ",
+				);
 			}
 			return extras.length > 0 ? `${name}（${extras.join("・")}）` : name;
 		}
+		case "description_approved":
+		case "description_rejected":
+			return describeDescriptionSnapshot(entry.targetId, record, names);
+		case "webhook_configured":
+		case "webhook_secret_rotated":
+		case "webhook_deleted":
+			return describeWebhookSnapshot(record);
 		case "change_reverted": {
 			switch (entry.targetType) {
 				case "allow_rule":
@@ -287,9 +355,10 @@ function describeSnapshot(
 					return readString(record, "name") ?? raw;
 				case "agent":
 					return describeAgentSnapshot(entry.targetId, record);
+				case "description":
+					return describeDescriptionSnapshot(entry.targetId, record, names);
 				case "token":
 				case "admin_bot":
-				case "description":
 					return raw;
 			}
 		}
@@ -303,7 +372,9 @@ export function describeChangeBeforeAfter(
 	const before = describeSnapshot(entry, entry.beforeJson, names);
 	const after =
 		entry.afterJson === null && entry.beforeJson !== null
-			? "削除"
+			? entry.action === "description_rejected"
+				? "却下"
+				: "削除"
 			: describeSnapshot(entry, entry.afterJson, names);
 	return `変更前: ${before} / 変更後: ${after}`;
 }

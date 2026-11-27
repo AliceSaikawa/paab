@@ -11,13 +11,24 @@ import {
 	clearAdminBot,
 	designateAdminBot,
 	getAdminBotConfig,
+	getSuperadminState,
 	issueAdminBotToken,
+	MAX_SUPERADMIN_DAYS,
 	revokeAdminBotToken,
+	setAdminBotReadBodies,
+	setAdminBotSuperadmin,
+	wouldEnableBothOptionalPermissions,
 } from "../../adminbot";
+import { isBodyRecordingEnabled } from "../../audit";
+import { auditBodyConfig } from "../../mcp/config";
 import { adminPageResponse, type FlashMessage } from "../layout";
 import type { AdminGetContext, AdminPostContext, AdminRoute } from "../router";
 import { CHANGE_ACTION_LABELS } from "../rules/render";
-import { renderAdminBotPageBody, renderIssuedAdminTokenBody } from "./render";
+import {
+	renderAdminBotPageBody,
+	renderBothPermissionsConfirmBody,
+	renderIssuedAdminTokenBody,
+} from "./render";
 
 const ADMIN_BOT_PATH = "/admin/adminbot";
 const ADMIN_BOT_TITLE = "管理者ボット";
@@ -80,6 +91,7 @@ async function renderAdminBotScreen(
 		config.agentId !== null
 			? (agents.find((item) => item.agent.id === config.agentId) ?? null)
 			: null;
+	const bodyRecordingEnabled = isBodyRecordingEnabled(auditBodyConfig(ctx.env));
 
 	return adminPageResponse(
 		{
@@ -94,6 +106,8 @@ async function renderAdminBotScreen(
 				agents,
 				categories,
 				changes,
+				bodyRecordingEnabled,
+				now: ctx.now,
 				csrfToken: ctx.csrfToken,
 				adminMcpUrl: `${ctx.url.origin}/mcp/admin`,
 			}),
@@ -290,6 +304,225 @@ async function handleRevokeAdminBotToken(
 	});
 }
 
+async function resolveAgentDisplayName(
+	db: D1Database,
+	agentId: string,
+): Promise<string> {
+	const row = await db
+		.prepare("SELECT name FROM agents WHERE id = ?")
+		.bind(agentId)
+		.first<{ name: string }>();
+	return row?.name ?? agentId;
+}
+
+function parseEnabledField(raw: string | null): boolean | null {
+	if (raw === null) return null;
+	const value = raw.trim();
+	if (value === "1") return true;
+	if (value === "0") return false;
+	return null;
+}
+
+type ParsedSuperadminDuration =
+	| { mode: "off" }
+	| { mode: "permanent"; formValue: "permanent" }
+	| { mode: "days"; days: number; formValue: string };
+
+function parseSuperadminDuration(
+	raw: string | null,
+): ParsedSuperadminDuration | null {
+	if (raw === null) return null;
+	const value = raw.trim();
+	if (value === "off") return { mode: "off" };
+	if (value === "permanent") {
+		return { mode: "permanent", formValue: "permanent" };
+	}
+	if (!/^[1-9]\d*$/.test(value)) return null;
+	const days = Number(value);
+	if (!Number.isSafeInteger(days) || days < 1 || days > MAX_SUPERADMIN_DAYS) {
+		return null;
+	}
+	return { mode: "days", days, formValue: String(days) };
+}
+
+async function handleToggleReadBodies(
+	ctx: AdminPostContext,
+): Promise<Response> {
+	const enabled = parseEnabledField(ctx.form.get("enabled"));
+	if (enabled === null) {
+		return renderAdminBotScreen(ctx, {
+			status: 400,
+			flash: {
+				kind: "error",
+				message: "本文閲覧スイッチの指定が不正です",
+			},
+		});
+	}
+
+	if (enabled) {
+		const current = await getAdminBotConfig(ctx.env.DB);
+		if (
+			current.agentId !== null &&
+			wouldEnableBothOptionalPermissions(current, ctx.now, {
+				readBodies: true,
+			}) &&
+			ctx.form.get("confirm_both") !== "1"
+		) {
+			const agentName = await resolveAgentDisplayName(
+				ctx.env.DB,
+				current.agentId,
+			);
+			const superadminState = getSuperadminState(current, ctx.now);
+			return adminPageResponse({
+				title: "本文閲覧と最高管理者権限の同時有効化の確認",
+				currentPath: ADMIN_BOT_PATH,
+				user: ctx.user,
+				devMode: ctx.devMode,
+				body: renderBothPermissionsConfirmBody({
+					agentName,
+					action: "/admin/adminbot/permissions/read-bodies",
+					hiddenFields: [
+						{ name: "enabled", value: "1" },
+						{ name: "confirm_both", value: "1" },
+					],
+					enablingLabel: "本文閲覧",
+					alreadyEnabledLabel:
+						superadminState.kind === "permanent"
+							? "最高管理者権限（無期限）"
+							: "最高管理者権限",
+					csrfToken: ctx.csrfToken,
+				}),
+			});
+		}
+	}
+
+	const result = await setAdminBotReadBodies(ctx.env.DB, {
+		enabled,
+		actor: ownerActor(ctx),
+		now: ctx.now,
+	});
+	if (!result.ok) {
+		return renderAdminBotScreen(ctx, {
+			status: statusForError(result.code),
+			flash: { kind: "error", message: result.message },
+		});
+	}
+
+	if (!result.data.changed) {
+		return renderAdminBotScreen(ctx, {
+			flash: {
+				kind: "info",
+				message: enabled
+					? "本文閲覧はすでにオンです"
+					: "本文閲覧はすでにオフです",
+			},
+		});
+	}
+
+	const bodyRecordingEnabled = isBodyRecordingEnabled(auditBodyConfig(ctx.env));
+	const message = enabled
+		? bodyRecordingEnabled
+			? "本文閲覧をオンにしました"
+			: "本文閲覧をオンにしました（監査ログへの本文記録が無効のため、現在読める本文はありません）"
+		: "本文閲覧をオフにしました";
+
+	return renderAdminBotScreen(ctx, {
+		flash: { kind: "success", message },
+	});
+}
+
+async function handleSetSuperadmin(ctx: AdminPostContext): Promise<Response> {
+	const parsed = parseSuperadminDuration(ctx.form.get("duration"));
+	if (parsed === null) {
+		return renderAdminBotScreen(ctx, {
+			status: 400,
+			flash: {
+				kind: "error",
+				message: "最高管理者権限の有効期間の指定が不正です",
+			},
+		});
+	}
+
+	if (parsed.mode !== "off") {
+		const current = await getAdminBotConfig(ctx.env.DB);
+		if (
+			current.agentId !== null &&
+			wouldEnableBothOptionalPermissions(current, ctx.now, {
+				superadminActive: true,
+			}) &&
+			ctx.form.get("confirm_both") !== "1"
+		) {
+			const agentName = await resolveAgentDisplayName(
+				ctx.env.DB,
+				current.agentId,
+			);
+			return adminPageResponse({
+				title: "本文閲覧と最高管理者権限の同時有効化の確認",
+				currentPath: ADMIN_BOT_PATH,
+				user: ctx.user,
+				devMode: ctx.devMode,
+				body: renderBothPermissionsConfirmBody({
+					agentName,
+					action: "/admin/adminbot/permissions/superadmin",
+					hiddenFields: [
+						{ name: "duration", value: parsed.formValue },
+						{ name: "confirm_both", value: "1" },
+					],
+					enablingLabel:
+						parsed.mode === "permanent"
+							? "最高管理者権限（無期限）"
+							: `最高管理者権限（${parsed.days}日間）`,
+					alreadyEnabledLabel: "本文閲覧",
+					csrfToken: ctx.csrfToken,
+				}),
+			});
+		}
+	}
+
+	const result = await setAdminBotSuperadmin(
+		ctx.env.DB,
+		parsed.mode === "off"
+			? { mode: "off", actor: ownerActor(ctx), now: ctx.now }
+			: parsed.mode === "permanent"
+				? { mode: "permanent", actor: ownerActor(ctx), now: ctx.now }
+				: {
+						mode: "days",
+						days: parsed.days,
+						actor: ownerActor(ctx),
+						now: ctx.now,
+					},
+	);
+	if (!result.ok) {
+		return renderAdminBotScreen(ctx, {
+			status: statusForError(result.code),
+			flash: { kind: "error", message: result.message },
+		});
+	}
+
+	if (!result.data.changed) {
+		const infoMessage =
+			parsed.mode === "off"
+				? "最高管理者権限はすでにオフです"
+				: parsed.mode === "permanent"
+					? "最高管理者権限はすでに無期限で有効です"
+					: "最高管理者権限の有効期限は変更されませんでした";
+		return renderAdminBotScreen(ctx, {
+			flash: { kind: "info", message: infoMessage },
+		});
+	}
+
+	const successMessage =
+		parsed.mode === "off"
+			? "最高管理者権限をオフにしました"
+			: parsed.mode === "permanent"
+				? "最高管理者権限を無期限でオンにしました"
+				: `最高管理者権限を ${parsed.days} 日間オンにしました`;
+
+	return renderAdminBotScreen(ctx, {
+		flash: { kind: "success", message: successMessage },
+	});
+}
+
 async function handleRevertAdminBotChange(
 	ctx: AdminPostContext,
 ): Promise<Response> {
@@ -338,6 +571,14 @@ export function adminBotRoutes(): AdminRoute[] {
 		{
 			pattern: "/admin/adminbot/token/revoke",
 			post: handleRevokeAdminBotToken,
+		},
+		{
+			pattern: "/admin/adminbot/permissions/read-bodies",
+			post: handleToggleReadBodies,
+		},
+		{
+			pattern: "/admin/adminbot/permissions/superadmin",
+			post: handleSetSuperadmin,
 		},
 		{
 			pattern: "/admin/adminbot/changes/:id/revert",

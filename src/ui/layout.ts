@@ -238,7 +238,7 @@ th {
 	margin-bottom: 0.85rem;
 }
 label { font-size: 0.875rem; font-weight: 600; }
-input[type="text"], input[type="number"], input[type="url"], select, textarea {
+input[type="text"], input[type="number"], input[type="url"], input[type="password"], select, textarea {
 	width: 100%;
 	padding: 0.5rem 0.65rem;
 	border: 1px solid #cbd5e1;

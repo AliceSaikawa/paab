@@ -1,11 +1,15 @@
 import { z } from "zod";
 import {
+	AUDIT_WRITE_CHUNK,
 	type AuditBodyConfig,
+	type AuditEvent,
 	type AuditLogFilter,
 	type AuditLogView,
 	DEFAULT_AUDIT_QUERY_LIMIT,
+	isBodyRecordingEnabled,
 	MAX_AUDIT_QUERY_LIMIT,
 	queryAuditLog,
+	recordAuditEvents,
 } from "../audit";
 import { type Frame, renderFramed } from "../mcp/frame";
 import {
@@ -15,7 +19,16 @@ import {
 	type ReasonCode,
 	type UnixMillis,
 } from "../types";
+import { DESCRIPTION_TOOLS } from "./description-tools";
+import { PROPOSAL_TOOLS } from "./proposal-tools";
 import { TIGHTENING_TOOLS } from "./tightening";
+
+/**
+ * Maximum entries returned per `view_audit_log` page when message bodies are
+ * included, matching `AUDIT_WRITE_CHUNK` so all `admin_body_read` rows are
+ * written in a single D1 batch.
+ */
+export const MAX_ADMIN_BODY_AUDIT_LIMIT = AUDIT_WRITE_CHUNK;
 
 /** Request-scoped context passed to every `/mcp/admin` tool. */
 export interface AdminMcpContext {
@@ -187,7 +200,11 @@ function renderLabeledExternalName(
 	return `${label}:\n${frame(name)}`;
 }
 
-function renderAuditEntry(entry: AuditLogView, frame: Frame): string {
+function renderAuditEntry(
+	entry: AuditLogView,
+	frame: Frame,
+	includeBody: boolean,
+): string {
 	return [
 		`id: ${entry.id}`,
 		`occurred_at: ${new Date(entry.occurredAt).toISOString()}`,
@@ -201,13 +218,16 @@ function renderAuditEntry(entry: AuditLogView, frame: Frame): string {
 		renderLabeledExternalName("to_name", entry.toAgentName, frame),
 		`category_id: ${entry.categoryId ?? "-"}`,
 		renderLabeledExternalName("category_name", entry.categoryName, frame),
+		...(includeBody && entry.body !== null
+			? [`body:\n${frame(entry.body)}`]
+			: []),
 	].join("\n");
 }
 
 const viewAuditLog = defineAdminTool({
 	name: "view_audit_log",
 	description:
-		"Read bridge audit log metadata (without message bodies) with optional filters and cursor pagination.",
+		"Read bridge audit log entries with optional filters and cursor pagination. Message bodies are omitted unless both the owner-enabled read_bodies switch and AUDIT_RECORD_BODIES are on (set include_body=false to omit bodies even when enabled; explicit include_body=true is denied while read_bodies is off). Returned bodies are framed as untrusted external data and logged as admin_body_read.",
 	inputSchema: z.object({
 		since: z
 			.string()
@@ -236,7 +256,7 @@ const viewAuditLog = defineAdminTool({
 			.max(MAX_AUDIT_QUERY_LIMIT)
 			.optional()
 			.describe(
-				`Maximum entries to return (1-${MAX_AUDIT_QUERY_LIMIT}, default ${DEFAULT_AUDIT_QUERY_LIMIT}).`,
+				`Maximum entries to return (1-${MAX_AUDIT_QUERY_LIMIT}, default ${DEFAULT_AUDIT_QUERY_LIMIT}; capped at ${MAX_ADMIN_BODY_AUDIT_LIMIT} when message bodies are included).`,
 			),
 		before_id: z
 			.number()
@@ -254,8 +274,21 @@ const viewAuditLog = defineAdminTool({
 			.boolean()
 			.optional()
 			.describe("Return oldest entries first instead of newest first."),
+		include_body: z
+			.boolean()
+			.optional()
+			.describe(
+				"Include recorded message bodies when read_bodies and AUDIT_RECORD_BODIES are both enabled. Set false to omit bodies even when enabled.",
+			),
 	}),
 	async run(ctx, args) {
+		if (args.include_body === true && !ctx.config.readBodies) {
+			return adminToolFail(
+				"body access is disabled; the owner must enable read_bodies in /admin/adminbot",
+				{ deniedReason: "permission_denied" },
+			);
+		}
+
 		let occurredFrom: UnixMillis | undefined;
 		if (args.since !== undefined) {
 			const parsed = parseAuditTimestamp(args.since);
@@ -289,7 +322,14 @@ const viewAuditLog = defineAdminTool({
 		);
 		if (!messageIdCheck.ok) return adminToolFail(messageIdCheck.error);
 
-		const limit = args.limit ?? DEFAULT_AUDIT_QUERY_LIMIT;
+		const bodyRecordingOn = isBodyRecordingEnabled(ctx.audit);
+		const includeBody =
+			ctx.config.readBodies && bodyRecordingOn && args.include_body !== false;
+
+		const requestedLimit = args.limit ?? DEFAULT_AUDIT_QUERY_LIMIT;
+		const limit = includeBody
+			? Math.min(requestedLimit, MAX_ADMIN_BODY_AUDIT_LIMIT)
+			: requestedLimit;
 		const order = args.oldest === true ? "asc" : "desc";
 		const baseFilter: AuditLogFilter = {
 			occurredFrom,
@@ -302,8 +342,7 @@ const viewAuditLog = defineAdminTool({
 			beforeId: args.before_id,
 			afterId: args.after_id,
 			order,
-			// Body inspection is out of scope for #34 and requires the read_bodies switch.
-			includeBody: false,
+			includeBody,
 		};
 
 		let entries: AuditLogView[];
@@ -323,6 +362,7 @@ const viewAuditLog = defineAdminTool({
 					...baseFilter,
 					beforeId: order === "desc" ? last.id : args.before_id,
 					afterId: order === "asc" ? last.id : args.after_id,
+					includeBody: false,
 					limit: 1,
 				});
 				hasMore = probe.length > 0;
@@ -331,6 +371,31 @@ const viewAuditLog = defineAdminTool({
 
 		if (entries.length === 0) {
 			return adminToolOk("no matching audit log entries");
+		}
+
+		if (includeBody) {
+			const bodyReadEvents: AuditEvent[] = entries
+				.filter((entry) => entry.body !== null)
+				.map((entry) => ({
+					eventType: "admin_body_read",
+					occurredAt: ctx.now,
+					fromAgentId: ctx.agent.id,
+					toAgentId: entry.toAgentId,
+					categoryId: entry.categoryId,
+					messageId: entry.messageId ?? `audit:${entry.id}`,
+				}));
+			if (bodyReadEvents.length > 0) {
+				const recorded = await recordAuditEvents(
+					ctx.db,
+					ctx.audit,
+					bodyReadEvents,
+				);
+				if (!recorded) {
+					return adminToolFail(
+						"failed to record admin_body_read audit log; message bodies were withheld",
+					);
+				}
+			}
 		}
 
 		const lastEntry = entries.at(-1);
@@ -351,7 +416,9 @@ const viewAuditLog = defineAdminTool({
 				].join("\n");
 				return [
 					header,
-					...entries.map((entry) => renderAuditEntry(entry, frame)),
+					...entries.map((entry) =>
+						renderAuditEntry(entry, frame, includeBody),
+					),
 				].join("\n\n");
 			}),
 		);
@@ -361,4 +428,6 @@ const viewAuditLog = defineAdminTool({
 export const ADMIN_TOOLS: readonly AdminToolDefinition[] = [
 	viewAuditLog,
 	...TIGHTENING_TOOLS,
+	...PROPOSAL_TOOLS,
+	...DESCRIPTION_TOOLS,
 ];

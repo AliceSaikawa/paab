@@ -2,6 +2,7 @@ import {
 	type AdminBotConfig,
 	AGENT_STATUSES,
 	type Agent,
+	type AgentWebhook,
 	type AllowRule,
 	AUDIT_EVENT_TYPES,
 	AUDIT_OUTCOMES,
@@ -14,9 +15,18 @@ import {
 	MESSAGE_KINDS,
 	MESSAGE_STATUSES,
 	type Message,
+	type PendingDescription,
+	PROPOSAL_KINDS,
+	PROPOSAL_STATUSES,
+	type Proposal,
+	type ProposalKind,
+	type ProposalPayload,
 	REASON_CODES,
 	TOKEN_PURPOSES,
 	type Token,
+	WEBHOOK_AUTH_MODES,
+	WEBHOOK_DELIVERY_STATUSES,
+	type WebhookDelivery,
 } from "../types";
 
 /*
@@ -107,6 +117,49 @@ export interface AdminBotConfigRow {
 	agent_id: string | null;
 	read_bodies: number;
 	superadmin_until: number | null;
+	updated_at: number;
+}
+
+export interface ProposalRow {
+	id: string;
+	kind: string;
+	proposer_agent_id: string;
+	payload_json: string;
+	reason: string;
+	status: string;
+	created_at: number;
+	expires_at: number;
+	resolved_at: number | null;
+	resolved_by: string | null;
+	change_log_id: number | null;
+}
+
+export interface PendingDescriptionRow {
+	agent_id: string;
+	submission_id: string;
+	description: string;
+	submitted_at: number;
+}
+
+export interface AgentWebhookRow {
+	agent_id: string;
+	url: string;
+	auth_mode: string;
+	header_name: string | null;
+	secret: string;
+	created_at: number;
+	updated_at: number;
+}
+
+export interface WebhookDeliveryRow {
+	id: string;
+	agent_id: string;
+	status: string;
+	attempts: number;
+	next_attempt_at: number;
+	leased_until: number | null;
+	last_error: string | null;
+	created_at: number;
 	updated_at: number;
 }
 
@@ -235,6 +288,172 @@ export function adminBotConfigFromRow(row: AdminBotConfigRow): AdminBotConfig {
 		agentId: row.agent_id,
 		readBodies: row.read_bodies === 1,
 		superadminUntil: row.superadmin_until,
+		updatedAt: row.updated_at,
+	};
+}
+
+function readRequiredString(
+	record: Record<string, unknown>,
+	key: string,
+	context: string,
+): string {
+	const value = record[key];
+	if (typeof value !== "string" || value.trim().length === 0) {
+		throw new Error(`Invalid ${key} in ${context}`);
+	}
+	return value;
+}
+
+/** Parses and validates a stored `proposals.payload_json` against its `kind`. */
+export function parseProposalPayload(
+	kind: ProposalKind,
+	json: string,
+): ProposalPayload {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(json);
+	} catch {
+		throw new Error("Invalid JSON in proposals.payload_json");
+	}
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+		throw new Error("proposals.payload_json must be a JSON object");
+	}
+	const record = parsed as Record<string, unknown>;
+	if (record.kind !== kind) {
+		throw new Error(
+			`Mismatched kind in proposals.payload_json: expected ${kind}, got ${String(record.kind)}`,
+		);
+	}
+	const context = `proposals.payload_json (${kind})`;
+	switch (kind) {
+		case "grant_allow_rule":
+			return {
+				kind,
+				fromAgentId: readRequiredString(record, "fromAgentId", context),
+				toAgentId: readRequiredString(record, "toAgentId", context),
+				categoryId: readRequiredString(record, "categoryId", context),
+			};
+		case "create_category":
+			return {
+				kind,
+				name: readRequiredString(record, "name", context),
+			};
+		case "raise_daily_limit": {
+			const agentId = readRequiredString(record, "agentId", context);
+			const newLimit = record.newLimit;
+			if (
+				typeof newLimit !== "number" ||
+				!Number.isSafeInteger(newLimit) ||
+				newLimit < 0
+			) {
+				throw new Error(`Invalid newLimit in ${context}`);
+			}
+			return { kind, agentId, newLimit };
+		}
+		case "resume_agent":
+			return {
+				kind,
+				agentId: readRequiredString(record, "agentId", context),
+			};
+	}
+}
+
+export function proposalFromRow(row: ProposalRow): Proposal {
+	const kind = oneOf(PROPOSAL_KINDS, row.kind, "proposals.kind");
+	const status = oneOf(PROPOSAL_STATUSES, row.status, "proposals.status");
+	return {
+		id: row.id,
+		kind,
+		proposerAgentId: row.proposer_agent_id,
+		payload: parseProposalPayload(kind, row.payload_json),
+		reason: row.reason,
+		status,
+		createdAt: row.created_at,
+		expiresAt: row.expires_at,
+		resolvedAt: row.resolved_at,
+		resolvedBy: row.resolved_by,
+		changeLogId: row.change_log_id,
+	};
+}
+
+export function pendingDescriptionFromRow(
+	row: PendingDescriptionRow,
+): PendingDescription {
+	if (
+		typeof row.submission_id !== "string" ||
+		row.submission_id.trim().length === 0
+	) {
+		throw new Error(
+			"Invalid value in pending_descriptions.submission_id: must be non-empty",
+		);
+	}
+	return {
+		agentId: row.agent_id,
+		submissionId: row.submission_id,
+		description: row.description,
+		submittedAt: row.submitted_at,
+	};
+}
+
+export function agentWebhookFromRow(row: AgentWebhookRow): AgentWebhook {
+	const authMode = oneOf(
+		WEBHOOK_AUTH_MODES,
+		row.auth_mode,
+		"agent_webhooks.auth_mode",
+	);
+	if (authMode === "custom_header") {
+		if (row.header_name === null || row.header_name.trim().length === 0) {
+			throw new Error(
+				"agent_webhooks.header_name is required for custom_header",
+			);
+		}
+		return {
+			agentId: row.agent_id,
+			url: row.url,
+			authMode,
+			headerName: row.header_name,
+			secret: row.secret,
+			createdAt: row.created_at,
+			updatedAt: row.updated_at,
+		};
+	}
+	if (row.header_name !== null) {
+		throw new Error(
+			`agent_webhooks.header_name must be null for auth_mode ${authMode}`,
+		);
+	}
+	return {
+		agentId: row.agent_id,
+		url: row.url,
+		authMode,
+		secret: row.secret,
+		createdAt: row.created_at,
+		updatedAt: row.updated_at,
+	};
+}
+
+export function webhookDeliveryFromRow(
+	row: WebhookDeliveryRow,
+): WebhookDelivery {
+	const status = oneOf(
+		WEBHOOK_DELIVERY_STATUSES,
+		row.status,
+		"webhook_deliveries.status",
+	);
+	if (!Number.isSafeInteger(row.attempts) || row.attempts < 0) {
+		throw new Error(
+			`Invalid value in webhook_deliveries.attempts: ${row.attempts}`,
+		);
+	}
+	return {
+		id: row.id,
+		agentId: row.agent_id,
+		status,
+		attempts: row.attempts,
+		nextAttemptAt: row.next_attempt_at,
+		leasedUntil: row.leased_until,
+		lastError: row.last_error,
+		createdAt: row.created_at,
 		updatedAt: row.updated_at,
 	};
 }

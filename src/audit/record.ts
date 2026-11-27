@@ -14,7 +14,8 @@ import { type AuditBodyConfig, isBodyRecordingEnabled } from "./config";
 export type DeniedByBridgeEventType =
 	| "question_blocked"
 	| "auth_failed"
-	| "admin_tool_denied";
+	| "admin_tool_denied"
+	| "webhook_abandoned";
 
 interface AuditEventBase {
 	/** When the event happened. The caller passes the time in. */
@@ -62,6 +63,10 @@ const OUTCOMES: Record<AuditEventType, AuditOutcome> = {
 	auth_failed: "denied",
 	admin_tool_called: "ok",
 	admin_tool_denied: "denied",
+	admin_body_read: "ok",
+	description_submitted: "ok",
+	webhook_delivered: "ok",
+	webhook_abandoned: "denied",
 };
 
 /** The outcome an event type is recorded with. */

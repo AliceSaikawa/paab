@@ -60,3 +60,19 @@ export {
 	type UndoFailure,
 	type UndoResult,
 } from "./undo";
+export {
+	type AgentWebhookSummary,
+	type ConfigureAgentWebhookInput,
+	type ConfiguredAgentWebhook,
+	configureAgentWebhook,
+	type DeleteAgentWebhookInput,
+	type DeletedAgentWebhook,
+	deleteAgentWebhook,
+	getAgentWebhookSummary,
+	listAgentWebhooks,
+	type RotateAgentWebhookSecretInput,
+	type RotatedAgentWebhookSecret,
+	rotateAgentWebhookSecret,
+	type WebhookAuditSnapshot,
+	type WebhookDeliverySummary,
+} from "./webhooks";

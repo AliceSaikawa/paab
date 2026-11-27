@@ -125,6 +125,46 @@ describe("recordAuditEvent", () => {
 				outcome: "denied",
 				reason: "permission_denied",
 			},
+			{
+				event: {
+					occurredAt: T0 + 9,
+					eventType: "description_submitted",
+					fromAgentId: "agent-a",
+				},
+				outcome: "ok",
+				reason: null,
+			},
+			{
+				event: {
+					occurredAt: T0 + 10,
+					eventType: "admin_body_read",
+					fromAgentId: "admin-bot",
+					toAgentId: "agent-b",
+					categoryId: "category-schedule",
+					messageId: "question-1",
+				},
+				outcome: "ok",
+				reason: null,
+			},
+			{
+				event: {
+					occurredAt: T0 + 11,
+					eventType: "webhook_delivered",
+					toAgentId: "agent-b",
+				},
+				outcome: "ok",
+				reason: null,
+			},
+			{
+				event: {
+					occurredAt: T0 + 12,
+					eventType: "webhook_abandoned",
+					toAgentId: "agent-b",
+					reasonCode: "webhook_delivery_failed",
+				},
+				outcome: "denied",
+				reason: "webhook_delivery_failed",
+			},
 		];
 
 	it("has a case for every event type", () => {

@@ -9,8 +9,10 @@ import { adminBotRoutes } from "./adminbot";
 import { agentRoutes } from "./agents";
 import { auditRoutes } from "./audit";
 import { prepareCsrfGet, verifyCsrfPost } from "./csrf";
+import { descriptionRoutes } from "./descriptions";
 import { html } from "./html";
 import { ADMIN_NAV_TABS, adminPageResponse } from "./layout";
+import { proposalRoutes } from "./proposals";
 import { ruleRoutes } from "./rules";
 
 export interface AdminGetContext {
@@ -77,45 +79,14 @@ function renderOverviewPage(ctx: AdminGetContext): Response {
 	});
 }
 
-function placeholderRoute(pattern: string, title: string): AdminRoute {
-	return {
-		pattern,
-		get: (ctx) =>
-			adminPageResponse(
-				{
-					title,
-					currentPath: ctx.url.pathname,
-					user: ctx.user,
-					devMode: ctx.devMode,
-					body: html`
-						<section class="card">
-							<h1>${title}</h1>
-							<p>この画面はまだ実装されていません。</p>
-							<p><a href="/admin">概要へ戻る</a></p>
-						</section>
-					`,
-				},
-				501,
-			),
-	};
-}
-
-const IMPLEMENTED_ROUTES: readonly AdminRoute[] = [
+export const DEFAULT_ADMIN_ROUTES: readonly AdminRoute[] = [
 	{ pattern: "/admin", get: renderOverviewPage },
 	...agentRoutes(),
 	...ruleRoutes(),
 	...auditRoutes(),
+	...proposalRoutes(),
+	...descriptionRoutes(),
 	...adminBotRoutes(),
-];
-const IMPLEMENTED_PATTERNS = new Set(
-	IMPLEMENTED_ROUTES.map((route) => route.pattern),
-);
-
-export const DEFAULT_ADMIN_ROUTES: readonly AdminRoute[] = [
-	...IMPLEMENTED_ROUTES,
-	...ADMIN_NAV_TABS.filter((tab) => !IMPLEMENTED_PATTERNS.has(tab.href)).map(
-		(tab) => placeholderRoute(tab.href, tab.label),
-	),
 ];
 
 function normalizeAdminPath(pathname: string): string {

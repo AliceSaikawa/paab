@@ -76,6 +76,10 @@ export const AUDIT_EVENT_TYPES = [
 	"auth_failed",
 	"admin_tool_called",
 	"admin_tool_denied",
+	"admin_body_read",
+	"description_submitted",
+	"webhook_delivered",
+	"webhook_abandoned",
 ] as const;
 export type AuditEventType = (typeof AUDIT_EVENT_TYPES)[number];
 
@@ -99,6 +103,7 @@ export const REASON_CODES = [
 	"token_revoked",
 	"not_admin_bot",
 	"permission_denied",
+	"webhook_delivery_failed",
 ] as const;
 export type ReasonCode = (typeof REASON_CODES)[number];
 
@@ -202,6 +207,11 @@ export const CHANGE_ACTIONS = [
 	"admin_bot_designated",
 	"admin_bot_cleared",
 	"admin_bot_switches_updated",
+	"description_approved",
+	"description_rejected",
+	"webhook_configured",
+	"webhook_secret_rotated",
+	"webhook_deleted",
 	"change_reverted",
 ] as const;
 export type ChangeAction = (typeof CHANGE_ACTIONS)[number];
@@ -229,3 +239,101 @@ export interface ChangeLogEntry {
 
 /** A change log entry before the database assigns its ID. */
 export type NewChangeLogEntry = Omit<ChangeLogEntry, "id">;
+
+export const PROPOSAL_KINDS = [
+	"grant_allow_rule",
+	"create_category",
+	"raise_daily_limit",
+	"resume_agent",
+] as const;
+export type ProposalKind = (typeof PROPOSAL_KINDS)[number];
+
+export const PROPOSAL_STATUSES = [
+	"pending",
+	"approved",
+	"rejected",
+	"expired",
+] as const;
+export type ProposalStatus = (typeof PROPOSAL_STATUSES)[number];
+
+export type ProposalPayload =
+	| {
+			kind: "grant_allow_rule";
+			fromAgentId: string;
+			toAgentId: string;
+			categoryId: string;
+	  }
+	| {
+			kind: "create_category";
+			name: string;
+	  }
+	| {
+			kind: "raise_daily_limit";
+			agentId: string;
+			newLimit: number;
+	  }
+	| {
+			kind: "resume_agent";
+			agentId: string;
+	  };
+
+export interface Proposal {
+	id: string;
+	kind: ProposalKind;
+	proposerAgentId: string;
+	payload: ProposalPayload;
+	reason: string;
+	status: ProposalStatus;
+	createdAt: UnixMillis;
+	expiresAt: UnixMillis;
+	resolvedAt: UnixMillis | null;
+	resolvedBy: string | null;
+	changeLogId: number | null;
+}
+
+export interface PendingDescription {
+	agentId: string;
+	submissionId: string;
+	description: string;
+	submittedAt: UnixMillis;
+}
+
+export const WEBHOOK_AUTH_MODES = [
+	"standard_webhooks",
+	"bearer_header",
+	"custom_header",
+	"paab_hmac",
+] as const;
+export type WebhookAuthMode = (typeof WEBHOOK_AUTH_MODES)[number];
+
+export const WEBHOOK_DELIVERY_STATUSES = [
+	"pending",
+	"delivered",
+	"abandoned",
+] as const;
+export type WebhookDeliveryStatus = (typeof WEBHOOK_DELIVERY_STATUSES)[number];
+
+export type WebhookAuthConfig =
+	| { authMode: "standard_webhooks"; secret: string }
+	| { authMode: "bearer_header"; secret: string }
+	| { authMode: "custom_header"; headerName: string; secret: string }
+	| { authMode: "paab_hmac"; secret: string };
+
+export type AgentWebhook = WebhookAuthConfig & {
+	agentId: string;
+	url: string;
+	createdAt: UnixMillis;
+	updatedAt: UnixMillis;
+};
+
+export interface WebhookDelivery {
+	id: string;
+	agentId: string;
+	status: WebhookDeliveryStatus;
+	attempts: number;
+	nextAttemptAt: UnixMillis;
+	leasedUntil: UnixMillis | null;
+	lastError: string | null;
+	createdAt: UnixMillis;
+	updatedAt: UnixMillis;
+}
