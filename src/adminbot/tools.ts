@@ -15,6 +15,7 @@ import {
 	type ReasonCode,
 	type UnixMillis,
 } from "../types";
+import { TIGHTENING_TOOLS } from "./tightening";
 
 /** Request-scoped context passed to every `/mcp/admin` tool. */
 export interface AdminMcpContext {
@@ -357,4 +358,7 @@ const viewAuditLog = defineAdminTool({
 	},
 });
 
-export const ADMIN_TOOLS: readonly AdminToolDefinition[] = [viewAuditLog];
+export const ADMIN_TOOLS: readonly AdminToolDefinition[] = [
+	viewAuditLog,
+	...TIGHTENING_TOOLS,
+];

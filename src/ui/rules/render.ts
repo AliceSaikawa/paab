@@ -30,12 +30,12 @@ export interface DeleteCategoryConfirmData {
 	allowRuleCount: number;
 }
 
-interface NameMaps {
+export interface ChangeLogNameMaps {
 	agents: Map<string, string>;
 	categories: Map<string, string>;
 }
 
-const CHANGE_ACTION_LABELS: Record<ChangeAction, string> = {
+export const CHANGE_ACTION_LABELS: Record<ChangeAction, string> = {
 	agent_registered: "エージェント登録",
 	agent_updated: "エージェント更新",
 	agent_deleted: "エージェント削除",
@@ -50,6 +50,7 @@ const CHANGE_ACTION_LABELS: Record<ChangeAction, string> = {
 	admin_bot_designated: "管理者ボット指名",
 	admin_bot_cleared: "管理者ボット解除",
 	admin_bot_switches_updated: "管理者ボット権限変更",
+	change_reverted: "変更取消",
 };
 
 function parseJsonRecord(raw: string | null): Record<string, unknown> | null {
@@ -96,11 +97,11 @@ function readArrayLength(
 	return Array.isArray(value) ? value.length : null;
 }
 
-function collectEntityNames(
+export function collectEntityNames(
 	agents: readonly AgentWithStatus[],
 	categories: readonly CategoryWithUsage[],
 	changeLog: readonly ChangeLogEntry[],
-): NameMaps {
+): ChangeLogNameMaps {
 	const agentMap = new Map<string, string>();
 	const categoryMap = new Map<string, string>();
 
@@ -141,7 +142,7 @@ function formatRuleTarget(
 	fromId: string,
 	toId: string,
 	categoryId: string,
-	names: NameMaps,
+	names: ChangeLogNameMaps,
 ): string {
 	const fromName = names.agents.get(fromId) ?? fromId;
 	const toName = names.agents.get(toId) ?? toId;
@@ -149,7 +150,7 @@ function formatRuleTarget(
 	return `${fromName} → ${toName} (${categoryName})`;
 }
 
-function formatActor(entry: ChangeLogEntry, names: NameMaps): string {
+function formatActor(entry: ChangeLogEntry, names: ChangeLogNameMaps): string {
 	const kind = entry.actorType === "owner" ? "所有者" : "管理者ボット";
 	const actor =
 		entry.actorType === "admin_bot"
@@ -160,7 +161,10 @@ function formatActor(entry: ChangeLogEntry, names: NameMaps): string {
 	return `${kind}: ${actor}${approver}`;
 }
 
-function describeTarget(entry: ChangeLogEntry, names: NameMaps): string {
+export function describeChangeTarget(
+	entry: ChangeLogEntry,
+	names: ChangeLogNameMaps,
+): string {
 	switch (entry.targetType) {
 		case "allow_rule": {
 			const parts = entry.targetId.split(":");
@@ -191,10 +195,37 @@ function describeTarget(entry: ChangeLogEntry, names: NameMaps): string {
 	}
 }
 
+function describeAllowRuleSnapshot(
+	record: Record<string, unknown>,
+	raw: string,
+	names: ChangeLogNameMaps,
+): string {
+	const fromId = readString(record, "fromAgentId");
+	const toId = readString(record, "toAgentId");
+	const categoryId = readString(record, "categoryId");
+	if (fromId !== null && toId !== null && categoryId !== null) {
+		return formatRuleTarget(fromId, toId, categoryId, names);
+	}
+	return raw;
+}
+
+function describeAgentSnapshot(
+	targetId: string,
+	record: Record<string, unknown>,
+): string {
+	const name = readString(record, "name") ?? targetId;
+	const status = readString(record, "status");
+	const limit = record.dailyQuestionLimit;
+	const parts = [name];
+	if (status !== null) parts.push(`状態=${status}`);
+	if (typeof limit === "number") parts.push(`上限=${limit}/日`);
+	return parts.join(" ");
+}
+
 function describeSnapshot(
 	entry: ChangeLogEntry,
 	raw: string | null,
-	names: NameMaps,
+	names: ChangeLogNameMaps,
 ): string {
 	if (raw === null) return "なし";
 	const record = parseJsonRecord(raw);
@@ -202,15 +233,8 @@ function describeSnapshot(
 
 	switch (entry.action) {
 		case "allow_rule_granted":
-		case "allow_rule_revoked": {
-			const fromId = readString(record, "fromAgentId");
-			const toId = readString(record, "toAgentId");
-			const categoryId = readString(record, "categoryId");
-			if (fromId !== null && toId !== null && categoryId !== null) {
-				return formatRuleTarget(fromId, toId, categoryId, names);
-			}
-			return raw;
-		}
+		case "allow_rule_revoked":
+			return describeAllowRuleSnapshot(record, raw, names);
 		case "category_created":
 			return readString(record, "name") ?? raw;
 		case "category_deleted": {
@@ -222,15 +246,8 @@ function describeSnapshot(
 		case "agent_registered":
 		case "agent_updated":
 		case "agent_suspended":
-		case "agent_resumed": {
-			const name = readString(record, "name") ?? entry.targetId;
-			const status = readString(record, "status");
-			const limit = record.dailyQuestionLimit;
-			const parts = [name];
-			if (status !== null) parts.push(`状態=${status}`);
-			if (typeof limit === "number") parts.push(`上限=${limit}/日`);
-			return parts.join(" ");
-		}
+		case "agent_resumed":
+			return describeAgentSnapshot(entry.targetId, record);
 		case "agent_deleted": {
 			const agent = readRecord(record, "agent");
 			const name = readString(agent, "name") ?? entry.targetId;
@@ -262,10 +279,27 @@ function describeSnapshot(
 			}
 			return extras.length > 0 ? `${name}（${extras.join("・")}）` : name;
 		}
+		case "change_reverted": {
+			switch (entry.targetType) {
+				case "allow_rule":
+					return describeAllowRuleSnapshot(record, raw, names);
+				case "category":
+					return readString(record, "name") ?? raw;
+				case "agent":
+					return describeAgentSnapshot(entry.targetId, record);
+				case "token":
+				case "admin_bot":
+				case "description":
+					return raw;
+			}
+		}
 	}
 }
 
-function describeBeforeAfter(entry: ChangeLogEntry, names: NameMaps): string {
+export function describeChangeBeforeAfter(
+	entry: ChangeLogEntry,
+	names: ChangeLogNameMaps,
+): string {
 	const before = describeSnapshot(entry, entry.beforeJson, names);
 	const after =
 		entry.afterJson === null && entry.beforeJson !== null
@@ -483,7 +517,7 @@ function renderCategoriesSection(data: RulesPageData): SafeHtml {
 
 function renderChangeLogSection(
 	changeLog: readonly ChangeLogEntry[],
-	names: NameMaps,
+	names: ChangeLogNameMaps,
 ): SafeHtml {
 	return html`
 		<section class="card">
@@ -514,8 +548,8 @@ function renderChangeLogSection(
 													${CHANGE_ACTION_LABELS[entry.action]}
 													${entry.revertedAt !== null ? html` <span class="badge">取消済</span>` : false}
 												</td>
-												<td>${describeTarget(entry, names)}</td>
-												<td>${describeBeforeAfter(entry, names)}</td>
+												<td>${describeChangeTarget(entry, names)}</td>
+												<td>${describeChangeBeforeAfter(entry, names)}</td>
 											</tr>
 										`,
 									)}
