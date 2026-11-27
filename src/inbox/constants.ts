@@ -8,3 +8,9 @@ export const QUESTION_TTL_MS = 7 * 24 * HOUR_MS;
  * message (design 4).
  */
 export const BODY_RETENTION_MS = 24 * HOUR_MS;
+
+/**
+ * Delay before a bridge-rejected question's rejection becomes visible in the
+ * asker's inbox, unread count, and delayed webhook wake (design 3.4).
+ */
+export const BRIDGE_REJECTION_DELAY_MS = 60_000;

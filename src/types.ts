@@ -160,6 +160,12 @@ export interface Message {
 	/** Set on questions; null on answers and rejections. */
 	expiresAt: UnixMillis | null;
 	bodyDeletedAt: UnixMillis | null;
+	/**
+	 * Earliest time the message becomes visible in inbox fetches and unread
+	 * counts; null means immediately visible. Set on bridge-generated rejections
+	 * to match the delayed webhook wake (design 3.4).
+	 */
+	availableAt: UnixMillis | null;
 }
 
 export interface AuditLogEntry {

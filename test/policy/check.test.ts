@@ -44,6 +44,7 @@ async function recordQuestion(
 		receivedAt: null,
 		expiresAt: createdAt + 7 * DAY_MS,
 		bodyDeletedAt: null,
+		availableAt: null,
 		...overrides,
 	};
 	await insertMessage(db, message).run();

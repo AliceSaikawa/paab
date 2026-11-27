@@ -384,6 +384,7 @@ describe("deleteAgent", () => {
 				receivedAt: T0 + 4,
 				expiresAt: T0 + 7 * DAY_MS,
 				bodyDeletedAt: null,
+				availableAt: null,
 			}),
 			insertMessage(db, {
 				id: newId(),
@@ -398,6 +399,7 @@ describe("deleteAgent", () => {
 				receivedAt: null,
 				expiresAt: null,
 				bodyDeletedAt: null,
+				availableAt: null,
 			}),
 			insertAuditLogEntry(db, {
 				occurredAt: T0 + 3,

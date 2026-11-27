@@ -17,6 +17,7 @@ import {
 	type WebhookDeliveryRow,
 	webhookDeliveryFromRow,
 } from "../../src/db";
+import { BRIDGE_REJECTION_DELAY_MS } from "../../src/inbox";
 import worker from "../../src/index";
 import {
 	HOURLY_MAINTENANCE_CRON,
@@ -46,6 +47,9 @@ import {
 	createMcpWorld,
 	MCP_URL,
 	type McpWorld,
+	questionIdOf,
+	unreadCount,
+	withoutFooter,
 } from "../mcp/support";
 
 const OWNER = { actorType: "owner" as const, actorId: "owner@example.com" };
@@ -314,12 +318,15 @@ describe("4 webhook triggers and non-blocking execution", () => {
 		});
 
 		// Ask Bob about disallowed category "health" -> bridge blocks it.
+		expect(WEBHOOK_BLOCKED_DELAY_MS).toBe(BRIDGE_REJECTION_DELAY_MS);
 		const res = await call(alice, "ask", {
 			to: "bob",
 			category: "health",
 			question: "What is my blood pressure?",
 		});
 		expect(res.isError).toBe(false);
+		expect(unreadCount(res.text)).toBe(0);
+		const blockedQuestionId = questionIdOf(res.text);
 
 		// Neither waitUntil nor immediate HTTP fetch was called!
 		expect(pendingTasks).toHaveLength(0);
@@ -335,13 +342,19 @@ describe("4 webhook triggers and non-blocking execution", () => {
 			nextAttemptAt: T0 + WEBHOOK_BLOCKED_DELAY_MS,
 		});
 
-		// Cron before 60s does NOT deliver.
+		// Cron before 60s does NOT deliver, and rejection is not yet visible.
 		await runScheduledMaintenance(mcpEnv(), T0 + WEBHOOK_BLOCKED_DELAY_MS - 1, {
 			webhookFetcher: fetcher,
 		});
 		expect(fetcher).not.toHaveBeenCalled();
+		const aliceBefore = await connectWithOptions(world.alice.token, {
+			now: T0 + WEBHOOK_BLOCKED_DELAY_MS - 1,
+		});
+		expect(withoutFooter((await call(aliceBefore, "check_inbox")).text)).toBe(
+			"no new messages",
+		);
 
-		// Cron at +60s DOES deliver to Alice.
+		// Cron at +60s DOES deliver to Alice, and rejection is now visible in check_inbox.
 		await runScheduledMaintenance(mcpEnv(), T0 + WEBHOOK_BLOCKED_DELAY_MS, {
 			webhookFetcher: fetcher,
 		});
@@ -349,6 +362,12 @@ describe("4 webhook triggers and non-blocking execution", () => {
 		expect((await listDeliveries(world.alice.agent.id))[0]?.status).toBe(
 			"delivered",
 		);
+		const aliceAtDelay = await connectWithOptions(world.alice.token, {
+			now: T0 + WEBHOOK_BLOCKED_DELAY_MS,
+		});
+		const inboxAtDelay = await call(aliceAtDelay, "check_inbox");
+		expect(inboxAtDelay.text).toContain(`question_id: ${blockedQuestionId}`);
+		expect(inboxAtDelay.text).toContain("kind: rejection");
 	});
 
 	it("Trigger 3 (answer and decline): notifies asker immediately via waitUntil", async () => {

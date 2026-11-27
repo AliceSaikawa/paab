@@ -97,6 +97,7 @@ describe("createCategory and deleteCategory", () => {
 				receivedAt: T0 + 2,
 				expiresAt: T0 + 7 * DAY_MS,
 				bodyDeletedAt: null,
+				availableAt: null,
 			}),
 			insertMessage(db, {
 				id: newId(),
@@ -111,6 +112,7 @@ describe("createCategory and deleteCategory", () => {
 				receivedAt: null,
 				expiresAt: null,
 				bodyDeletedAt: null,
+				availableAt: null,
 			}),
 			insertAuditLogEntry(db, {
 				occurredAt: T0 + 1,

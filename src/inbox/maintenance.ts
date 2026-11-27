@@ -49,9 +49,9 @@ async function expireQuestions(
 	const insertRejection = db.prepare(
 		`INSERT OR IGNORE INTO messages
 			(id, kind, from_agent_id, to_agent_id, category_id, body, in_reply_to,
-			status, created_at, received_at, expires_at, body_deleted_at)
+			status, created_at, received_at, expires_at, body_deleted_at, available_at)
 		SELECT ?1, 'rejection', NULL, from_agent_id, NULL, NULL, id,
-			'sent', ?2, NULL, NULL, NULL
+			'sent', ?2, NULL, NULL, NULL, NULL
 		FROM messages
 		WHERE id = ?3 AND status = 'pending' AND expires_at <= ?2`,
 	);

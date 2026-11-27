@@ -40,16 +40,18 @@ export type InboxItem = InboxQuestion | InboxAnswer | InboxRejection;
 
 /*
  * What an agent can still receive: undelivered questions that are waiting
- * for an answer and have not passed their deadline, and undelivered replies.
- * A question past its deadline is left out even before the maintenance run
- * marks it expired, because it can no longer be answered.
+ * for an answer and have not passed their deadline, and undelivered replies
+ * whose visibility delay (if any) has elapsed. A question past its deadline
+ * is left out even before the maintenance run marks it expired, because it
+ * can no longer be answered.
  *
  * Binds: ?1 = agent ID, ?2 = now.
  */
 const DELIVERABLE = `to_agent_id = ?1
 	AND status IN ('pending', 'sent')
 	AND received_at IS NULL
-	AND (expires_at IS NULL OR expires_at > ?2)`;
+	AND (expires_at IS NULL OR expires_at > ?2)
+	AND (available_at IS NULL OR available_at <= ?2)`;
 
 function required<T>(value: T | null, column: string, id: string): T {
 	if (value === null) {
@@ -111,7 +113,8 @@ export async function fetchInbox(
 	return results
 		.sort(
 			(a, b) =>
-				a.created_at - b.created_at || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
+				(a.available_at ?? a.created_at) - (b.available_at ?? b.created_at) ||
+				(a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
 		)
 		.map(itemFromRow);
 }

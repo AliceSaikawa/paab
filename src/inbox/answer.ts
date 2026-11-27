@@ -63,12 +63,12 @@ export async function answerQuestion(
 		.prepare(
 			`INSERT INTO messages
 				(id, kind, from_agent_id, to_agent_id, category_id, body, in_reply_to,
-				status, created_at, received_at, expires_at, body_deleted_at)
+				status, created_at, received_at, expires_at, body_deleted_at, available_at)
 			SELECT ?1, ?2,
 				CASE WHEN ?2 = 'answer' THEN to_agent_id END,
 				from_agent_id,
 				CASE WHEN ?2 = 'answer' THEN category_id END,
-				?3, id, 'sent', ?4, NULL, NULL, NULL
+				?3, id, 'sent', ?4, NULL, NULL, NULL, NULL
 			FROM messages
 			WHERE id = ?5 AND kind = 'question' AND to_agent_id = ?6
 				AND status = 'pending' AND expires_at > ?4`,

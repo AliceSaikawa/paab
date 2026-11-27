@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { queryAuditLog, recordAuditEvent } from "../../src/audit";
-import { submitQuestion } from "../../src/inbox";
+import { BRIDGE_REJECTION_DELAY_MS, submitQuestion } from "../../src/inbox";
 import { runScheduledMaintenance } from "../../src/mcp";
 import { DAY_MS, T0 } from "../helpers/fixtures";
 import {
@@ -345,7 +345,7 @@ describe("list_agents", () => {
 });
 
 describe("unread footer", () => {
-	it("ends every tool result with the caller's unread count", async () => {
+	it("ends every tool result with the caller's unread count and hides bridge rejections until the delay elapses", async () => {
 		const alice = await connect(world.alice.token);
 		const bob = await connect(world.bob.token);
 
@@ -362,9 +362,26 @@ describe("unread footer", () => {
 			category: "schedule",
 			question: "Lunch?",
 		});
-		expect(unreadCount(blocked.text)).toBe(1);
+		expect(unreadCount(blocked.text)).toBe(0);
 
-		const tooLong = await call(alice, "ask", {
+		const immediateInbox = await call(alice, "check_inbox");
+		expect(withoutFooter(immediateInbox.text)).toBe("no new messages");
+		expect(unreadCount(immediateInbox.text)).toBe(0);
+
+		const aliceBeforeDelay = await connect(world.alice.token, {
+			now: T0 + BRIDGE_REJECTION_DELAY_MS - 1,
+		});
+		expect(
+			unreadCount((await call(aliceBeforeDelay, "list_agents")).text),
+		).toBe(0);
+		expect(
+			withoutFooter((await call(aliceBeforeDelay, "check_inbox")).text),
+		).toBe("no new messages");
+
+		const aliceAfterDelay = await connect(world.alice.token, {
+			now: T0 + BRIDGE_REJECTION_DELAY_MS,
+		});
+		const tooLong = await call(aliceAfterDelay, "ask", {
 			to: "bob",
 			category: "schedule",
 			question: "x".repeat(2001),
@@ -386,6 +403,12 @@ describe("unread footer", () => {
 
 		const empty = await call(bob, "check_inbox");
 		expect(unreadCount(empty.text)).toBe(0);
-		expect(unreadCount((await call(alice, "list_agents")).text)).toBe(1);
+		expect(unreadCount((await call(aliceAfterDelay, "list_agents")).text)).toBe(
+			1,
+		);
+
+		const aliceInbox = await call(aliceAfterDelay, "check_inbox");
+		expect(inboxBlocks(aliceInbox.text)).toHaveLength(1);
+		expect(unreadCount(aliceInbox.text)).toBe(0);
 	});
 });

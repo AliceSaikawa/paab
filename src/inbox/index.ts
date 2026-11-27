@@ -11,7 +11,11 @@ export {
 	type SubmittedQuestion,
 	submitQuestion,
 } from "./ask";
-export { BODY_RETENTION_MS, QUESTION_TTL_MS } from "./constants";
+export {
+	BODY_RETENTION_MS,
+	BRIDGE_REJECTION_DELAY_MS,
+	QUESTION_TTL_MS,
+} from "./constants";
 export {
 	countUnread,
 	fetchInbox,

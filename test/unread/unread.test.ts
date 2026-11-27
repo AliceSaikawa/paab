@@ -13,6 +13,7 @@ import { queryAuditLog } from "../../src/audit";
 import { issueToken } from "../../src/auth";
 import {
 	answerQuestion,
+	BRIDGE_REJECTION_DELAY_MS,
 	fetchInbox,
 	QUESTION_TTL_MS,
 	recordBlockedQuestion,
@@ -29,7 +30,14 @@ import {
 	seedCategory,
 	T0,
 } from "../helpers/fixtures";
-import { call, connect, MCP_URL } from "../mcp/support";
+import {
+	call,
+	connect,
+	MCP_URL,
+	questionIdOf,
+	unreadCount,
+	withoutFooter,
+} from "../mcp/support";
 
 const UNREAD_URL = "https://paab.test/unread";
 const ADMIN_MCP_URL = "https://paab.test/mcp/admin";
@@ -168,7 +176,7 @@ describe("GET /unread", () => {
 		});
 		expect(answerRes.ok).toBe(true);
 
-		// 4. Rejection addressed to alice (from a blocked question).
+		// 4. Rejection addressed to alice (from a blocked question at T0 + 2000).
 		const blocked = await recordBlockedQuestion(db, {
 			fromAgentId: alice.id,
 			toAgentId: bob.id,
@@ -185,10 +193,20 @@ describe("GET /unread", () => {
 			now: T0 + 3000,
 		});
 
-		const res = await unreadGet(
+		// Before the 60s visibility delay elapses, only the active question and answer count.
+		const beforeDelayRes = await unreadGet(
 			`Bearer ${aliceUnreadToken}`,
 			UNREAD_URL,
 			T0 + 4000,
+		);
+		expect(beforeDelayRes.status).toBe(200);
+		expect(await beforeDelayRes.json()).toEqual({ unread: 2 });
+
+		// Once the 60s visibility delay elapses, the blocked-question rejection is counted too.
+		const res = await unreadGet(
+			`Bearer ${aliceUnreadToken}`,
+			UNREAD_URL,
+			T0 + 2000 + BRIDGE_REJECTION_DELAY_MS,
 		);
 		expect(res.status).toBe(200);
 		expect(res.headers.get("Content-Type")).toBe(
@@ -208,6 +226,88 @@ describe("GET /unread", () => {
 		expect(rawBody).not.toContain(blocked.questionId);
 		expect(rawBody).not.toContain(alice.id);
 		expect(rawBody).not.toContain(bob.id);
+	});
+
+	it("hides a bridge rejection across ask footer, GET /unread, and check_inbox until +60s while showing recipient decline immediately", async () => {
+		const aliceAtT0 = await connect(aliceParticipantToken, { env, now: T0 });
+		const blockedAsk = await call(aliceAtT0, "ask", {
+			to: "bob",
+			category: "schedule",
+			question: "No allow rule exists",
+		});
+		expect(blockedAsk.isError).toBe(false);
+		const blockedQuestionId = questionIdOf(blockedAsk.text);
+
+		// Immediately at T0: hidden from ask footer, GET /unread, and check_inbox.
+		expect(unreadCount(blockedAsk.text)).toBe(0);
+		const unreadAtT0 = await unreadGet(
+			`Bearer ${aliceUnreadToken}`,
+			UNREAD_URL,
+			T0,
+		);
+		expect(unreadAtT0.status).toBe(200);
+		expect(await unreadAtT0.json()).toEqual({ unread: 0 });
+		const inboxAtT0 = await call(aliceAtT0, "check_inbox");
+		expect(withoutFooter(inboxAtT0.text)).toBe("no new messages");
+
+		// At T0 + 59_999ms: still hidden everywhere.
+		const beforeBoundary = T0 + BRIDGE_REJECTION_DELAY_MS - 1;
+		const unreadBefore = await unreadGet(
+			`Bearer ${aliceUnreadToken}`,
+			UNREAD_URL,
+			beforeBoundary,
+		);
+		expect(await unreadBefore.json()).toEqual({ unread: 0 });
+		const aliceBefore = await connect(aliceParticipantToken, {
+			env,
+			now: beforeBoundary,
+		});
+		const inboxBefore = await call(aliceBefore, "check_inbox");
+		expect(withoutFooter(inboxBefore.text)).toBe("no new messages");
+		expect(unreadCount(inboxBefore.text)).toBe(0);
+
+		// At T0 + 60_000ms: visible in GET /unread and delivered by check_inbox.
+		const atBoundary = T0 + BRIDGE_REJECTION_DELAY_MS;
+		const unreadAt = await unreadGet(
+			`Bearer ${aliceUnreadToken}`,
+			UNREAD_URL,
+			atBoundary,
+		);
+		expect(await unreadAt.json()).toEqual({ unread: 1 });
+		const aliceAt = await connect(aliceParticipantToken, {
+			env,
+			now: atBoundary,
+		});
+		const inboxAt = await call(aliceAt, "check_inbox");
+		expect(withoutFooter(inboxAt.text)).toMatch(
+			new RegExp(
+				`^messages: 1\\n\\nkind: rejection\\nmessage_id: \\S+\\nquestion_id: ${blockedQuestionId}$`,
+			),
+		);
+		expect(unreadCount(inboxAt.text)).toBe(0);
+
+		// Recipient decline remains immediately visible in GET /unread without delay.
+		const accepted = await submitQuestion(db, {
+			fromAgentId: alice.id,
+			toAgentId: bob.id,
+			categoryId: schedule.id,
+			body: "Will you decline?",
+			now: atBoundary,
+		});
+		const declined = await answerQuestion(db, {
+			questionId: accepted.questionId,
+			responderAgentId: bob.id,
+			reply: { kind: "decline" },
+			now: atBoundary + 1000,
+		});
+		expect(declined.ok).toBe(true);
+
+		const unreadAfterDecline = await unreadGet(
+			`Bearer ${aliceUnreadToken}`,
+			UNREAD_URL,
+			atBoundary + 1000,
+		);
+		expect(await unreadAfterDecline.json()).toEqual({ unread: 1 });
 	});
 
 	it("is read-only: repeated calls do not mark messages received and check_inbox still delivers them", async () => {

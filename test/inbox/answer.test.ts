@@ -106,6 +106,7 @@ describe("answering", () => {
 			receivedAt: null,
 			expiresAt: null,
 			bodyDeletedAt: null,
+			availableAt: null,
 		}).run();
 
 		expect(await answer(questionId, world.responder.id, T0 + 1)).toEqual({

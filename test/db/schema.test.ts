@@ -80,6 +80,7 @@ function question(
 		receivedAt: null,
 		expiresAt: T0 + 7 * DAY_MS,
 		bodyDeletedAt: null,
+		availableAt: null,
 		...overrides,
 	};
 }
@@ -98,8 +99,36 @@ function reply(to: Message, overrides: Partial<Message> = {}): Message {
 		receivedAt: null,
 		expiresAt: null,
 		bodyDeletedAt: null,
+		availableAt: null,
 		...overrides,
 	};
+}
+
+function insertPre0009Message(
+	targetDb: D1Database,
+	message: Message,
+): D1PreparedStatement {
+	return targetDb
+		.prepare(
+			`INSERT INTO messages
+				(id, kind, from_agent_id, to_agent_id, category_id, body, in_reply_to,
+				status, created_at, received_at, expires_at, body_deleted_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		)
+		.bind(
+			message.id,
+			message.kind,
+			message.fromAgentId,
+			message.toAgentId,
+			message.categoryId,
+			message.body,
+			message.inReplyTo,
+			message.status,
+			message.createdAt,
+			message.receivedAt,
+			message.expiresAt,
+			message.bodyDeletedAt,
+		);
 }
 
 async function queryPlan(sql: string, ...params: unknown[]): Promise<string> {
@@ -383,16 +412,44 @@ describe("messages", () => {
 		const delivered = question(a, b, categoryId, { receivedAt: T0 + 1 });
 		const waiting = question(a, b, categoryId, { createdAt: T0 + 2 });
 		const blocked = question(a, b, categoryId, { status: "blocked" });
+		const delayedRejection = reply(blocked, {
+			kind: "rejection",
+			fromAgentId: null,
+			toAgentId: b.id,
+			categoryId: null,
+			body: null,
+			availableAt: T0 + 60_000,
+		});
 		const elsewhere = question(b, a, categoryId);
 		await db.batch(
-			[delivered, waiting, blocked, elsewhere].map((m) => insertMessage(db, m)),
+			[delivered, waiting, blocked, delayedRejection, elsewhere].map((m) =>
+				insertMessage(db, m),
+			),
 		);
 
-		const sql =
-			"SELECT * FROM messages WHERE to_agent_id = ? AND status IN ('pending', 'sent') AND received_at IS NULL ORDER BY created_at";
-		const { results } = await db.prepare(sql).bind(b.id).all<MessageRow>();
+		const sql = `SELECT * FROM messages
+			WHERE to_agent_id = ?1
+				AND status IN ('pending', 'sent')
+				AND received_at IS NULL
+				AND (expires_at IS NULL OR expires_at > ?2)
+				AND (available_at IS NULL OR available_at <= ?2)
+			ORDER BY created_at`;
+		const { results } = await db
+			.prepare(sql)
+			.bind(b.id, T0 + 59_999)
+			.all<MessageRow>();
 		expect(results.map((row) => row.id)).toEqual([waiting.id]);
-		expect(await queryPlan(sql, b.id)).toContain("messages_inbox_idx");
+		expect(await queryPlan(sql, b.id, T0 + 59_999)).toContain(
+			"messages_inbox_idx",
+		);
+
+		const { results: atBoundary } = await db
+			.prepare(sql)
+			.bind(b.id, T0 + 60_000)
+			.all<MessageRow>();
+		expect(atBoundary.map((row) => row.id).sort()).toEqual(
+			[waiting.id, delayedRejection.id].sort(),
+		);
 	});
 
 	it("counts a sender's questions per UTC day, blocked ones included", async () => {
@@ -746,7 +803,7 @@ describe("migrations", () => {
 		await db.batch([
 			insertAllowRule(db, rule),
 			insertToken(db, tok),
-			insertMessage(db, msg),
+			insertPre0009Message(db, msg),
 			insertAuditLogEntry(db, audit),
 		]);
 
@@ -916,7 +973,7 @@ describe("migrations", () => {
 		await db.batch([
 			insertAllowRule(db, rule),
 			insertToken(db, tok),
-			insertMessage(db, msg),
+			insertPre0009Message(db, msg),
 			insertAuditLogEntry(db, audit),
 			insertChangeLogEntry(db, change),
 		]);
@@ -1591,7 +1648,7 @@ describe("migration 0002 on populated data", () => {
 			fromAgentId: null,
 			body: null,
 		});
-		await db.batch([q1, r1, q2, r2].map((m) => insertMessage(db, m)));
+		await db.batch([q1, r1, q2, r2].map((m) => insertPre0009Message(db, m)));
 
 		await applyD1Migrations(db, [m0001, m0002]);
 
@@ -2053,5 +2110,86 @@ describe("partial body-retention indexes (migration 0008)", () => {
 		);
 		expect(disabledPlan).toContain("audit_log_with_body_idx");
 		expect(disabledPlan).not.toMatch(/\bSCAN audit_log(?! USING INDEX)/);
+	});
+});
+
+describe("message available_at column (migration 0009)", () => {
+	it("preserves existing messages with NULL available_at and enforces STRICT integer type when upgrading from 0008 to 0009", async () => {
+		await db.batch([
+			db.prepare("DROP TABLE IF EXISTS webhook_deliveries"),
+			db.prepare("DROP TABLE IF EXISTS agent_webhooks"),
+			db.prepare("DROP TABLE IF EXISTS pending_descriptions"),
+			db.prepare("DROP TABLE IF EXISTS proposals"),
+			db.prepare("DROP TABLE IF EXISTS admin_bot_config"),
+			db.prepare("DROP TABLE IF EXISTS change_log"),
+			db.prepare("DROP TABLE IF EXISTS audit_log"),
+			db.prepare("DROP TABLE IF EXISTS messages"),
+			db.prepare("DROP TABLE IF EXISTS allow_rules"),
+			db.prepare("DROP TABLE IF EXISTS tokens"),
+			db.prepare("DROP TABLE IF EXISTS categories"),
+			db.prepare("DROP TABLE IF EXISTS agents"),
+			db.prepare("DROP TABLE IF EXISTS d1_migrations"),
+		]);
+
+		const upTo0008 = [
+			migrationByName("0001_initial_schema.sql"),
+			migrationByName("0002_cascade_message_references.sql"),
+			migrationByName("0003_change_log.sql"),
+			migrationByName("0004_admin_bot.sql"),
+			migrationByName("0005_proposals.sql"),
+			migrationByName("0006_pending_descriptions.sql"),
+			migrationByName("0007_webhooks.sql"),
+			migrationByName("0008_body_retention_indexes.sql"),
+		];
+		const m9 = migrationByName("0009_message_available_at.sql");
+
+		await applyD1Migrations(db, upTo0008);
+
+		const a = await seedAgent(db, { name: "a" });
+		const b = await seedAgent(db, { name: "b" });
+		const cat = await seedCategory(db, { name: "schedule" });
+		const existing = question(a, b, cat.id);
+		await insertPre0009Message(db, existing).run();
+
+		await applyD1Migrations(db, [...upTo0008, m9]);
+
+		const fkCheck = await db.prepare("PRAGMA foreign_key_check").all();
+		expect(fkCheck.results).toEqual([]);
+
+		const preserved = await db
+			.prepare("SELECT * FROM messages WHERE id = ?")
+			.bind(existing.id)
+			.first<MessageRow>();
+		expect(preserved?.available_at).toBeNull();
+		expect(preserved && messageFromRow(preserved)).toEqual(existing);
+
+		const delayedQuestion = question(a, b, cat.id, {
+			status: "blocked",
+			body: null,
+			expiresAt: null,
+		});
+		const delayedRejection = reply(delayedQuestion, {
+			kind: "rejection",
+			fromAgentId: null,
+			categoryId: null,
+			body: null,
+			availableAt: T0 + 60_000,
+		});
+		await db.batch([
+			insertMessage(db, delayedQuestion),
+			insertMessage(db, delayedRejection),
+		]);
+		const loaded = await db
+			.prepare("SELECT * FROM messages WHERE id = ?")
+			.bind(delayedRejection.id)
+			.first<MessageRow>();
+		expect(loaded && messageFromRow(loaded)).toEqual(delayedRejection);
+
+		await expect(
+			db
+				.prepare("UPDATE messages SET available_at = 'not-int' WHERE id = ?")
+				.bind(delayedRejection.id)
+				.run(),
+		).rejects.toThrow(/STRICT|datatype/i);
 	});
 });

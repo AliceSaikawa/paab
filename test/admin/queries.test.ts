@@ -174,6 +174,7 @@ describe("Stage 2 read helpers", () => {
 				receivedAt: T0 + HOUR_MS,
 				expiresAt: T0 + 7 * DAY_MS,
 				bodyDeletedAt: null,
+				availableAt: null,
 			}),
 			insertMessage(db, {
 				id: newId(),
@@ -188,6 +189,7 @@ describe("Stage 2 read helpers", () => {
 				receivedAt: null,
 				expiresAt: null,
 				bodyDeletedAt: null,
+				availableAt: null,
 			}),
 			// Yesterday's question and an answer by alpha must not count.
 			insertMessage(db, {
@@ -203,6 +205,7 @@ describe("Stage 2 read helpers", () => {
 				receivedAt: null,
 				expiresAt: T0 + 7 * DAY_MS,
 				bodyDeletedAt: null,
+				availableAt: null,
 			}),
 			insertMessage(db, {
 				id: newId(),
@@ -217,6 +220,7 @@ describe("Stage 2 read helpers", () => {
 				receivedAt: null,
 				expiresAt: null,
 				bodyDeletedAt: null,
+				availableAt: null,
 			}),
 		]);
 
