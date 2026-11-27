@@ -6,6 +6,7 @@ import {
 	verifyAccessRequest,
 } from "./access";
 import { agentRoutes } from "./agents";
+import { auditRoutes } from "./audit";
 import { prepareCsrfGet, verifyCsrfPost } from "./csrf";
 import { html } from "./html";
 import { ADMIN_NAV_TABS, adminPageResponse } from "./layout";
@@ -102,6 +103,7 @@ const IMPLEMENTED_ROUTES: readonly AdminRoute[] = [
 	{ pattern: "/admin", get: renderOverviewPage },
 	...agentRoutes(),
 	...ruleRoutes(),
+	...auditRoutes(),
 ];
 const IMPLEMENTED_PATTERNS = new Set(
 	IMPLEMENTED_ROUTES.map((route) => route.pattern),
