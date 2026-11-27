@@ -350,7 +350,7 @@ describe("GET /unread", () => {
 		expect(await authFailedAudits()).toHaveLength(0);
 	});
 
-	it("returns 403 and logs sender_suspended for a suspended agent, then restores access on resume", async () => {
+	it("returns 403 and logs agent_suspended_rejected for a suspended agent, then restores access on resume", async () => {
 		await submitQuestion(db, {
 			fromAgentId: bob.id,
 			toAgentId: alice.id,
@@ -375,10 +375,14 @@ describe("GET /unread", () => {
 		expect(res.headers.get("Cache-Control")).toBe("no-store");
 		expect(await res.text()).toBe("agent suspended");
 
-		const audits = await authFailedAudits();
-		expect(audits).toHaveLength(1);
-		expect(audits[0]?.fromAgentId).toBe(alice.id);
-		expect(audits[0]?.reasonCode).toBe("sender_suspended");
+		expect(await authFailedAudits()).toHaveLength(0);
+		const rejected = (await queryAuditLog(db)).filter(
+			(entry) => entry.eventType === "agent_suspended_rejected",
+		);
+		expect(rejected).toHaveLength(1);
+		expect(rejected[0]?.fromAgentId).toBe(alice.id);
+		expect(rejected[0]?.outcome).toBe("denied");
+		expect(rejected[0]?.reasonCode).toBe("sender_suspended");
 
 		const resumed = await resumeAgent(db, {
 			agentId: alice.id,

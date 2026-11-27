@@ -105,7 +105,7 @@ Webhook を直接受けられない製品、および Webhook 失敗時のフォ
 - 認証は `Authorization: Bearer <unread_count_token>` ヘッダーのみを受け付ける（[設計書 3.5 節](design.md#35-本人確認確定)）。`tokens.purpose = 'unread_count'` のトークンだけを許可する（`migrations/0001_initial_schema.sql` と `src/types.ts` に予約済み）。
 - Cloudflare Access の対象外とし、エージェント側ランタイムから直接叩けるようにする。
 - レスポンスは HTTP 200、`Content-Type: application/json; charset=utf-8`、`Cache-Control: no-store`、ボディは `{"unread": <件数>}`。`countUnread`（`src/inbox/fetch.ts`）を再利用し、`received_at` は更新しない。
-- `suspended` 状態のエージェントはトークン検証後に HTTP 403 を返す。認証失敗時は他の窓口と同じく監査ログに `auth_failed` を残し、空の HTTP 401 を返す。
+- `suspended` 状態のエージェントはトークン検証後に監査ログへ `agent_suspended_rejected`（理由 `sender_suspended`）を残して HTTP 403 を返す。認証失敗時は他の窓口と同じく監査ログに `auth_failed` を残し、空の HTTP 401 を返す。
 - URL クエリ（`?token=...`）でのトークン送信はアクセスログやプロキシログに平文が残るため採用しない。
 
 Meta Muse での運用は、フックの「シークレット・コネクタ資格情報不可」制約を踏まえて次の 2 段階に分岐させる。

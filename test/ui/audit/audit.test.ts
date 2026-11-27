@@ -276,6 +276,47 @@ describe("Admin Audit Log UI (/admin/audit)", () => {
 		expect(withAuthRows).toHaveLength(6);
 	});
 
+	it("shows reply_delivered, answer_failed, and agent_suspended_rejected by default", async () => {
+		const events: AuditEvent[] = [
+			{
+				occurredAt: T0,
+				eventType: "reply_delivered",
+				fromAgentId: muse.id,
+				toAgentId: grok.id,
+				categoryId: schedule.id,
+				messageId: "msg-reply",
+			},
+			{
+				occurredAt: T0 + 1000,
+				eventType: "answer_failed",
+				fromAgentId: carol.id,
+				reasonCode: "not_recipient",
+				messageId: "msg-reply",
+			},
+			{
+				occurredAt: T0 + 2000,
+				eventType: "agent_suspended_rejected",
+				fromAgentId: grok.id,
+				reasonCode: "sender_suspended",
+			},
+			{
+				occurredAt: T0 + 3000,
+				eventType: "auth_failed",
+				reasonCode: "token_unknown",
+			},
+		];
+		expect(await recordAuditEvents(db, RECORDING_ON, events)).toBe(true);
+
+		const defaultRes = await fetchAuditHtml("/admin/audit");
+		expect(defaultRes.status).toBe(200);
+		const rows = parseTableRows(defaultRes.text);
+		expect(rows.map((r) => [r.eventType, r.outcome, r.reasonCode])).toEqual([
+			["agent_suspended_rejected", "denied", "sender_suspended"],
+			["answer_failed", "denied", "not_recipient"],
+			["reply_delivered", "ok", "-"],
+		]);
+	});
+
 	it("hides bodies by default even when AUDIT_RECORD_BODIES=true, and shows them only when show_body=1 and recording is enabled", async () => {
 		await seedStandardFixture();
 

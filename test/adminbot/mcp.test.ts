@@ -223,7 +223,7 @@ describe("/mcp/admin authentication and authorization", () => {
 		]);
 	});
 
-	it("rejects a suspended designated admin bot with 403 and sender_suspended", async () => {
+	it("rejects a suspended designated admin bot with 403 and agent_suspended_rejected", async () => {
 		await suspendAgent(db, { agentId: muse.id, actor: OWNER, now: T0 + 1 });
 
 		const res = await handleAdminMcpRequest(
@@ -233,7 +233,12 @@ describe("/mcp/admin authentication and authorization", () => {
 		);
 		expect(res.status).toBe(403);
 		await expect(connectAdmin(adminToken, { now: T0 + 2 })).rejects.toThrow();
-		expect((await authFailures())[0]).toEqual({
+		expect(await authFailures()).toEqual([]);
+		const rejected = (await queryAuditLog(db)).filter(
+			(row) => row.eventType === "agent_suspended_rejected",
+		);
+		expect(rejected[0]).toMatchObject({
+			eventType: "agent_suspended_rejected",
 			fromAgentId: muse.id,
 			reasonCode: "sender_suspended",
 			outcome: "denied",

@@ -106,8 +106,9 @@ describe("a question and its answer", () => {
 			["question_accepted", "alice", "bob", "予定", "ok", questionId],
 			["question_delivered", "alice", "bob", "予定", "ok", questionId],
 			["question_answered", "alice", "bob", "予定", "ok", questionId],
+			["reply_delivered", "alice", "bob", "予定", "ok", questionId],
 		]);
-		expect(log.map((entry) => entry.body)).toEqual([null, null, null]);
+		expect(log.map((entry) => entry.body)).toEqual([null, null, null, null]);
 		expect(JSON.stringify(log)).not.toContain(QUESTION);
 		expect(JSON.stringify(log)).not.toContain(ANSWER);
 	});
@@ -127,6 +128,15 @@ describe("a question the bridge does not allow", () => {
 				categoryName: "健康",
 				outcome: "denied",
 				reasonCode: "no_allow_rule",
+			},
+			{
+				eventType: "reply_delivered",
+				fromAgentName: "alice",
+				toAgentName: "bob",
+				categoryName: "健康",
+				outcome: "ok",
+				reasonCode: null,
+				messageId: questionId,
 			},
 		]);
 	});
@@ -232,6 +242,24 @@ describe("answering", () => {
 		});
 		expect(stolen.isError).toBe(true);
 		expect(withoutFooter(stolen.text)).toBe(withoutFooter(unknown.text));
+		expect(await auditLog()).toContainEqual(
+			expect.objectContaining({
+				eventType: "answer_failed",
+				fromAgentName: "alice",
+				outcome: "denied",
+				reasonCode: "not_recipient",
+				messageId: questionId,
+			}),
+		);
+		expect(await auditLog()).toContainEqual(
+			expect.objectContaining({
+				eventType: "answer_failed",
+				fromAgentName: "alice",
+				outcome: "denied",
+				reasonCode: "question_not_found",
+				messageId: "no-such-question",
+			}),
+		);
 
 		const answered = await call(bob, "answer", {
 			question_id: questionId,

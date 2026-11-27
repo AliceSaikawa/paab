@@ -131,6 +131,40 @@ paab（Personal SI Agent Bridge）は、同一人物が使う複数のパーソ�
 | ルール変更の記録 | 誰が、いつ、何を、誰の承認で変えたかを残す | 確定 |
 | 追加の暗号化 | しない（D1の保存時暗号化のみ） | 確定 |
 
+### 4.1 監査ログの記録対象（確定）
+
+`audit_log` に記録する出来事と、意図して記録しない出来事は次のとおりとする。
+
+**記録する出来事**
+
+| 種別（`event_type`） | 結果（`outcome`） | 主な理由（`reason_code`） | 本文記録（`AUDIT_RECORD_BODIES=true` 時） |
+| --- | --- | --- | --- |
+| `question_accepted` | `ok` | — | 質問文 |
+| `question_blocked` | `denied` | `recipient_not_found`、`sender_suspended`、`recipient_suspended`、`self_addressed`、`category_not_found`、`no_allow_rule`、`daily_limit_exceeded` | 質問文（`messages.body` は `NULL` のまま保持し、監査ログの本文も他の本文と同じ保持期間で削除する） |
+| `question_delivered` | `ok` | — | なし |
+| `question_answered` | `ok` | — | 回答文 |
+| `question_declined` | `denied` | — | なし |
+| `question_expired` | `expired` | — | なし |
+| `reply_delivered` | `ok` | — | なし（質問側が `check_inbox` で回答または拒否を受け取った記録） |
+| `answer_failed` | `denied` | `question_not_found`、`not_recipient`、`question_already_replied`、`question_expired` | なし（D1 書き込み増幅を抑えるため、1 isolate・1 エージェントあたり 1 分間 20 件まで記録する） |
+| `auth_failed` | `denied` | `token_missing`、`token_unknown`、`token_revoked`、`not_admin_bot` | なし |
+| `agent_suspended_rejected` | `denied` | `sender_suspended` | なし（`/mcp`、`/mcp/admin`、`GET /unread` でトークン認証に成功したが `suspended` で HTTP 403 とした記録） |
+| `admin_tool_called` | `ok` | — | なし |
+| `admin_tool_denied` | `denied` | `permission_denied` | なし |
+| `admin_body_read` | `ok` | — | なし |
+| `description_submitted` | `ok` | — | 提出された説明文 |
+| `webhook_delivered` | `ok` | — | なし |
+| `webhook_abandoned` | `denied` | `webhook_delivery_failed` | なし |
+
+- 質問のライフサイクルに関する記録（`question_*` と `reply_delivered`）は、すべて `from_agent_id` に質問元、`to_agent_id` に質問先（宛先不明時は `NULL`）、`category_id` に申告カテゴリ（カテゴリ不明時は `NULL`）、`message_id` に元の質問 ID を入れる。単一の送信元・宛先・質問 ID フィルタで受付から回答・拒否の受け取りまでを追跡できるようにするためである。
+- 呼び出し元の行為に関する記録（`answer_failed`、`auth_failed`、`agent_suspended_rejected`、`admin_*`、`description_submitted`）は、`from_agent_id` に呼び出し元エージェントを入れる。`answer_failed` の `message_id` には指定された `question_id`（空文字や NUL 文字を含む場合は `NULL`、128 文字超は先頭 128 文字）を入れる。
+
+**記録しない出来事**
+
+- **入力検証でその場エラーになる呼び出し**: `ask` の空文字・長さ上限超過、`answer` の本文欠落・長さ上限超過・`decline` 時の本文指定、`submit_description` の形式違反。ルール照合や D1 書き込みに進む前の引数エラーであり、不正入力ループによる D1 書き込みの増加を防ぐため記録しない。
+- **`list_agents` および正常な `GET /unread`**: すでに許可された相手の一覧や未読件数だけを読む参照操作であり、情報開示や違反の兆候にならないため記録しない。
+- **管理操作の変更履歴**: エージェントの停止・再開、トークンの発行・失効、ルールやカテゴリの変更などは `audit_log` ではなく `change_log` に記録する。
+
 ## 5. 管理
 
 ### 5.1 画面（確定）
