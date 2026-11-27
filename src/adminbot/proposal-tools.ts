@@ -1,4 +1,10 @@
 import { z } from "zod";
+import {
+	createCategory,
+	grantAllowRule,
+	resumeAgent,
+	updateAgent,
+} from "../admin";
 import { type AgentRow, agentFromRow } from "../db";
 import { type Frame, renderFramed } from "../mcp/frame";
 import {
@@ -13,6 +19,7 @@ import {
 	type Proposal,
 	type ProposalPayload,
 } from "../types";
+import { isSuperadminActive } from "./config";
 import {
 	createProposal,
 	DEFAULT_PROPOSAL_LIST_LIMIT,
@@ -238,6 +245,32 @@ export async function resolveResumeAgentTarget(
 	return { ok: true, agent };
 }
 
+function botActor(ctx: AdminMcpContext) {
+	return { actorType: "admin_bot" as const, actorId: ctx.agent.id };
+}
+
+function renderImmediateExecution(
+	kind: ProposalPayload["kind"],
+	changeId: number,
+	reason: string,
+	renderTargetLines: (frame: Frame) => string[],
+	audit?: Omit<AdminToolAudit, "deniedReason">,
+): AdminToolOutput {
+	return ok(
+		renderFramed((frame) =>
+			[
+				"mode: executed_immediately",
+				`kind: ${kind}`,
+				"status: applied",
+				`change_id: ${changeId}`,
+				...renderTargetLines(frame),
+				framedField("reason", reason, frame),
+			].join("\n"),
+		),
+		audit,
+	);
+}
+
 async function submitProposal(
 	ctx: AdminMcpContext,
 	payload: ProposalPayload,
@@ -280,7 +313,7 @@ export const proposeAllowRuleTool: AdminToolDefinition<
 > = {
 	name: "propose_allow_rule",
 	description:
-		"Submit a proposal to grant a directional allow rule (from -> to for a category). Does not take effect until the owner approves it in the Admin UI.",
+		"Grant a directional allow rule (from -> to for a category). By default submits a proposal that takes effect after owner approval in the Admin UI; when owner-enabled superadmin permission is active, applies immediately.",
 	inputSchema: z.object({
 		from: z.string().describe("Exact name of the asking agent."),
 		to: z.string().describe("Exact name of the recipient agent."),
@@ -298,6 +331,35 @@ export const proposeAllowRuleTool: AdminToolDefinition<
 		const resolved = await resolveAllowRuleTargets(ctx.db, args);
 		if (!resolved.ok) return fail(resolved.error);
 		const { from, to, category } = resolved.targets;
+		const audit = { toAgentId: to.id, categoryId: category.id };
+		const renderTargets = (frame: Frame) => [
+			`from_id: ${from.id}`,
+			framedField("from", from.name, frame),
+			`to_id: ${to.id}`,
+			framedField("to", to.name, frame),
+			`category_id: ${category.id}`,
+			framedField("category", category.name, frame),
+		];
+
+		if (isSuperadminActive(ctx.config, ctx.now)) {
+			const result = await grantAllowRule(ctx.db, {
+				fromAgentId: from.id,
+				toAgentId: to.id,
+				categoryId: category.id,
+				actor: botActor(ctx),
+				now: ctx.now,
+			});
+			if (!result.ok) {
+				return fail(result.message, audit);
+			}
+			return renderImmediateExecution(
+				"grant_allow_rule",
+				result.changeId,
+				reasonCheck.reason,
+				renderTargets,
+				audit,
+			);
+		}
 
 		return submitProposal(
 			ctx,
@@ -308,15 +370,8 @@ export const proposeAllowRuleTool: AdminToolDefinition<
 				categoryId: category.id,
 			},
 			reasonCheck.reason,
-			(frame) => [
-				`from_id: ${from.id}`,
-				framedField("from", from.name, frame),
-				`to_id: ${to.id}`,
-				framedField("to", to.name, frame),
-				`category_id: ${category.id}`,
-				framedField("category", category.name, frame),
-			],
-			{ toAgentId: to.id, categoryId: category.id },
+			renderTargets,
+			audit,
 		);
 	},
 };
@@ -329,7 +384,7 @@ export const proposeCategoryTool: AdminToolDefinition<
 > = {
 	name: "propose_category",
 	description:
-		"Submit a proposal to create a new question category. Does not take effect until the owner approves it in the Admin UI.",
+		"Create a new question category. By default submits a proposal that takes effect after owner approval in the Admin UI; when owner-enabled superadmin permission is active, applies immediately.",
 	inputSchema: z.object({
 		name: z.string().describe("Name of the new category (1-64 characters)."),
 		reason: z
@@ -344,6 +399,27 @@ export const proposeCategoryTool: AdminToolDefinition<
 
 		const nameCheck = validateCategoryNameArg(args.name);
 		if (!nameCheck.ok) return fail(nameCheck.error);
+
+		if (isSuperadminActive(ctx.config, ctx.now)) {
+			const result = await createCategory(ctx.db, {
+				name: nameCheck.name,
+				actor: botActor(ctx),
+				now: ctx.now,
+			});
+			if (!result.ok) {
+				return fail(result.message);
+			}
+			return renderImmediateExecution(
+				"create_category",
+				result.changeId,
+				reasonCheck.reason,
+				(frame) => [
+					`category_id: ${result.data.category.id}`,
+					framedField("category", result.data.category.name, frame),
+				],
+				{ categoryId: result.data.category.id },
+			);
+		}
 
 		return submitProposal(
 			ctx,
@@ -363,7 +439,7 @@ export const proposeRaiseDailyLimitTool: AdminToolDefinition<
 > = {
 	name: "propose_raise_daily_limit",
 	description:
-		"Submit a proposal to raise an agent's daily question limit (new_limit must be strictly greater than its current limit). Does not take effect until the owner approves it in the Admin UI.",
+		"Raise an agent's daily question limit (new_limit must be strictly greater than its current limit). By default submits a proposal that takes effect after owner approval in the Admin UI; when owner-enabled superadmin permission is active, applies immediately.",
 	inputSchema: z.object({
 		agent: z.string().describe("Exact name of the agent."),
 		new_limit: z
@@ -386,6 +462,34 @@ export const proposeRaiseDailyLimitTool: AdminToolDefinition<
 		const resolved = await resolveRaiseLimitTarget(ctx.db, args);
 		if (!resolved.ok) return fail(resolved.error, resolved.audit);
 		const { agent, newLimit } = resolved;
+		const audit = { toAgentId: agent.id };
+
+		if (isSuperadminActive(ctx.config, ctx.now)) {
+			const result = await updateAgent(ctx.db, {
+				agentId: agent.id,
+				dailyQuestionLimit: newLimit,
+				actor: botActor(ctx),
+				now: ctx.now,
+			});
+			if (!result.ok) {
+				return fail(result.message, audit);
+			}
+			if (!result.data.changed || result.changeId === null) {
+				return fail("daily_question_limit was not changed", audit);
+			}
+			return renderImmediateExecution(
+				"raise_daily_limit",
+				result.changeId,
+				reasonCheck.reason,
+				(frame) => [
+					`agent_id: ${result.data.agent.id}`,
+					framedField("agent", result.data.agent.name, frame),
+					`previous_limit: ${agent.dailyQuestionLimit}`,
+					`daily_question_limit: ${result.data.agent.dailyQuestionLimit}`,
+				],
+				audit,
+			);
+		}
 
 		return submitProposal(
 			ctx,
@@ -397,7 +501,7 @@ export const proposeRaiseDailyLimitTool: AdminToolDefinition<
 				`current_limit: ${agent.dailyQuestionLimit}`,
 				`proposed_limit: ${newLimit}`,
 			],
-			{ toAgentId: agent.id },
+			audit,
 		);
 	},
 };
@@ -410,7 +514,7 @@ export const proposeResumeAgentTool: AdminToolDefinition<
 > = {
 	name: "propose_resume_agent",
 	description:
-		"Submit a proposal to resume a suspended agent. Does not take effect until the owner approves it in the Admin UI.",
+		"Resume a suspended agent. By default submits a proposal that takes effect after owner approval in the Admin UI; when owner-enabled superadmin permission is active, applies immediately.",
 	inputSchema: z.object({
 		agent: z.string().describe("Exact name of the suspended agent."),
 		reason: z
@@ -426,6 +530,29 @@ export const proposeResumeAgentTool: AdminToolDefinition<
 		const resolved = await resolveResumeAgentTarget(ctx.db, args);
 		if (!resolved.ok) return fail(resolved.error, resolved.audit);
 		const { agent } = resolved;
+		const audit = { toAgentId: agent.id };
+
+		if (isSuperadminActive(ctx.config, ctx.now)) {
+			const result = await resumeAgent(ctx.db, {
+				agentId: agent.id,
+				actor: botActor(ctx),
+				now: ctx.now,
+			});
+			if (!result.ok) {
+				return fail(result.message, audit);
+			}
+			return renderImmediateExecution(
+				"resume_agent",
+				result.changeId,
+				reasonCheck.reason,
+				(frame) => [
+					`agent_id: ${result.data.agent.id}`,
+					framedField("agent", result.data.agent.name, frame),
+					`agent_status: ${result.data.agent.status}`,
+				],
+				audit,
+			);
+		}
 
 		return submitProposal(
 			ctx,
@@ -435,7 +562,7 @@ export const proposeResumeAgentTool: AdminToolDefinition<
 				`agent_id: ${agent.id}`,
 				framedField("agent", agent.name, frame),
 			],
-			{ toAgentId: agent.id },
+			audit,
 		);
 	},
 };

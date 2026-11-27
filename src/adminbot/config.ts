@@ -22,6 +22,26 @@ import type { AdminBotConfig, Agent, UnixMillis } from "../types";
 
 export type { AdminBotConfig };
 
+/** Sentinel value in `admin_bot_config.superadmin_until` meaning permanent superadmin (`null` = off, positive UNIX ms = expires at). */
+export const SUPERADMIN_PERMANENT = 0;
+
+/** Default duration in days when enabling superadmin permission (design section 5.3). */
+export const DEFAULT_SUPERADMIN_DAYS = 7;
+
+/** Preset durations in days offered in the Admin UI for superadmin permission. */
+export const SUPERADMIN_DURATION_PRESETS = [1, 3, 7, 14, 30] as const;
+
+/** Maximum allowed finite duration in days for timed superadmin permission. */
+export const MAX_SUPERADMIN_DAYS = 365;
+
+const SUPERADMIN_DAY_MS = 24 * 60 * 60 * 1000;
+
+export type SuperadminState =
+	| { kind: "off" }
+	| { kind: "permanent" }
+	| { kind: "active"; until: UnixMillis; remainingMs: number }
+	| { kind: "expired"; expiredAt: UnixMillis };
+
 export type AdminBotErrorCode = AdminErrorCode | "not_admin_bot";
 
 export interface AdminBotFailure {
@@ -100,6 +120,11 @@ export interface SetAdminBotReadBodiesInput {
 	actor: ChangeActor;
 	now: UnixMillis;
 }
+
+export type SetAdminBotSuperadminInput =
+	| { mode: "off"; actor: ChangeActor; now: UnixMillis }
+	| { mode: "days"; days?: number; actor: ChangeActor; now: UnixMillis }
+	| { mode: "permanent"; actor: ChangeActor; now: UnixMillis };
 
 export type SetAdminBotSwitchesResult =
 	| {
@@ -441,6 +466,157 @@ export async function setAdminBotReadBodies(
 					WHERE id = 1`,
 				)
 				.bind(input.enabled ? 1 : 0, ctx.value.now),
+		],
+		{
+			occurredAt: ctx.value.now,
+			actorType: ctx.value.actorType,
+			actorId: ctx.value.actorId,
+			approverId: ctx.value.approverId,
+			action: "admin_bot_switches_updated",
+			targetType: "admin_bot",
+			targetId: current.agentId,
+			beforeJson: JSON.stringify(current),
+			afterJson: JSON.stringify(next),
+			revertedAt: null,
+		},
+	);
+
+	return {
+		ok: true,
+		data: { config: next, changed: true },
+		changeId,
+	};
+}
+
+/**
+ * Resolves the current superadmin permission state from `config.superadminUntil`
+ * and `now` without waiting for any scheduled sweep (design section 5.3).
+ *
+ * `null` = off, `0` (`SUPERADMIN_PERMANENT`) = permanent, positive UNIX ms = expires at timestamp.
+ */
+export function getSuperadminState(
+	config: AdminBotConfig,
+	now: UnixMillis,
+): SuperadminState {
+	const until = config.superadminUntil;
+	if (until === null) {
+		return { kind: "off" };
+	}
+	if (until === SUPERADMIN_PERMANENT) {
+		return { kind: "permanent" };
+	}
+	if (until > now) {
+		return { kind: "active", until, remainingMs: until - now };
+	}
+	return { kind: "expired", expiredAt: until };
+}
+
+/** Returns whether superadmin permission is currently active (timed and not expired, or permanent). */
+export function isSuperadminActive(
+	config: AdminBotConfig,
+	now: UnixMillis,
+): boolean {
+	const state = getSuperadminState(config, now);
+	return state.kind === "permanent" || state.kind === "active";
+}
+
+/**
+ * Returns `true` only when applying `next` transitions optional permissions
+ * from "not both active" to "both `readBodies` and superadmin active at once"
+ * (design section 5.3 simultaneous-enable confirmation trigger).
+ */
+export function wouldEnableBothOptionalPermissions(
+	config: AdminBotConfig,
+	now: UnixMillis,
+	next: { readBodies?: boolean; superadminActive?: boolean },
+): boolean {
+	const currentSuperadmin = isSuperadminActive(config, now);
+	const currentlyBoth = config.readBodies && currentSuperadmin;
+	const nextReadBodies = next.readBodies ?? config.readBodies;
+	const nextSuperadmin = next.superadminActive ?? currentSuperadmin;
+	return !currentlyBoth && nextReadBodies && nextSuperadmin;
+}
+
+/**
+ * Configures the optional superadmin permission switch for the currently
+ * designated administrator bot (design section 5.2, 5.3). Owner-only.
+ */
+export async function setAdminBotSuperadmin(
+	db: D1Database,
+	input: SetAdminBotSuperadminInput,
+): Promise<SetAdminBotSwitchesResult> {
+	const ctx = validateContext(input.actor, input.now);
+	if (!ctx.ok) return ctx;
+
+	if (ctx.value.actorType !== "owner") {
+		return adminFail(
+			"invalid_input",
+			"最高管理者権限の変更は所有者のみが実行できます",
+		);
+	}
+
+	let nextSuperadminUntil: UnixMillis | null;
+	if (input.mode === "off") {
+		nextSuperadminUntil = null;
+	} else if (input.mode === "permanent") {
+		nextSuperadminUntil = SUPERADMIN_PERMANENT;
+	} else if (input.mode === "days") {
+		const days = input.days ?? DEFAULT_SUPERADMIN_DAYS;
+		if (
+			typeof days !== "number" ||
+			!Number.isSafeInteger(days) ||
+			days < 1 ||
+			days > MAX_SUPERADMIN_DAYS
+		) {
+			return adminFail(
+				"invalid_input",
+				`最高管理者権限の有効期間は1〜${MAX_SUPERADMIN_DAYS}日の整数で指定してください`,
+			);
+		}
+		const computed = ctx.value.now + days * SUPERADMIN_DAY_MS;
+		if (!Number.isSafeInteger(computed) || computed <= 0) {
+			return adminFail(
+				"invalid_input",
+				"最高管理者権限の有効期限の計算値が不正です",
+			);
+		}
+		nextSuperadminUntil = computed;
+	} else {
+		return adminFail("invalid_input", "最高管理者権限の指定が不正です");
+	}
+
+	const current = await getAdminBotConfig(db);
+	if (current.agentId === null) {
+		return fail(
+			"not_admin_bot",
+			"管理者ボットが指名されていないため権限スイッチを変更できません",
+		);
+	}
+
+	if (current.superadminUntil === nextSuperadminUntil) {
+		return {
+			ok: true,
+			data: { config: current, changed: false },
+			changeId: null,
+		};
+	}
+
+	const next: AdminBotConfig = {
+		...current,
+		superadminUntil: nextSuperadminUntil,
+		updatedAt: ctx.value.now,
+	};
+
+	const changeId = await runWithChangeLog(
+		db,
+		[
+			db
+				.prepare(
+					`UPDATE admin_bot_config
+					SET superadmin_until = ?, updated_at = ?
+					WHERE id = 1`,
+				)
+				.bind(nextSuperadminUntil, ctx.value.now),
 		],
 		{
 			occurredAt: ctx.value.now,

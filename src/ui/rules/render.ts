@@ -306,7 +306,12 @@ function describeSnapshot(
 			if (record.readBodies === true) {
 				extras.push("本文閲覧=ON");
 			}
-			if (typeof record.superadminUntil === "number") {
+			if (record.superadminUntil === 0) {
+				extras.push("最高管理者=無期限");
+			} else if (
+				typeof record.superadminUntil === "number" &&
+				record.superadminUntil > 0
+			) {
 				extras.push("最高管理者=有効");
 			}
 			return extras.length > 0 ? `${name}（${extras.join("・")}）` : name;

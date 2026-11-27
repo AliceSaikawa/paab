@@ -3,8 +3,14 @@ import {
 	type CategoryWithUsage,
 	isUndoableChangeAction,
 } from "../../admin";
-import type { AdminBotConfig } from "../../adminbot";
-import type { ChangeLogEntry } from "../../types";
+import {
+	type AdminBotConfig,
+	DEFAULT_SUPERADMIN_DAYS,
+	getSuperadminState,
+	SUPERADMIN_DURATION_PRESETS,
+	type SuperadminState,
+} from "../../adminbot";
+import type { ChangeLogEntry, UnixMillis } from "../../types";
 import { csrfInput } from "../csrf";
 import { html, rawHtml, type SafeHtml } from "../html";
 import { formatTimestamp } from "../layout";
@@ -22,8 +28,18 @@ export interface AdminBotPageView {
 	categories: readonly CategoryWithUsage[];
 	changes: readonly ChangeLogEntry[];
 	bodyRecordingEnabled: boolean;
+	now: UnixMillis;
 	csrfToken: string;
 	adminMcpUrl: string;
+}
+
+export interface BothPermissionsConfirmView {
+	agentName: string;
+	action: string;
+	hiddenFields: readonly { name: string; value: string }[];
+	enablingLabel: string;
+	alreadyEnabledLabel: string;
+	csrfToken: string;
 }
 
 export interface IssuedAdminTokenView {
@@ -31,6 +47,54 @@ export interface IssuedAdminTokenView {
 	token: string;
 	revokedPrevious: boolean;
 	adminMcpUrl: string;
+}
+
+const MINUTE_MS = 60 * 1000;
+const HOUR_MS = 60 * MINUTE_MS;
+const DAY_MS = 24 * HOUR_MS;
+
+function formatRemainingDuration(remainingMs: number): string {
+	if (remainingMs >= DAY_MS) {
+		const days = Math.floor(remainingMs / DAY_MS);
+		const hours = Math.floor((remainingMs % DAY_MS) / HOUR_MS);
+		return `残り ${days}日 ${hours}時間`;
+	}
+	if (remainingMs >= HOUR_MS) {
+		const hours = Math.floor(remainingMs / HOUR_MS);
+		const minutes = Math.floor((remainingMs % HOUR_MS) / MINUTE_MS);
+		return `残り ${hours}時間 ${minutes}分`;
+	}
+	if (remainingMs >= MINUTE_MS) {
+		const minutes = Math.floor(remainingMs / MINUTE_MS);
+		return `残り ${minutes}分`;
+	}
+	return "残り 1分未満";
+}
+
+function superadminSummaryLabel(state: SuperadminState): string {
+	switch (state.kind) {
+		case "off":
+			return "オフ";
+		case "expired":
+			return "期限切れ（オフ）";
+		case "active":
+			return "有効";
+		case "permanent":
+			return "有効（無期限）";
+	}
+}
+
+function renderSuperadminBadge(state: SuperadminState): SafeHtml {
+	switch (state.kind) {
+		case "off":
+			return html`<span class="badge">オフ</span>`;
+		case "expired":
+			return html`<span class="badge">期限切れ（オフ）</span>`;
+		case "active":
+			return html`<span class="badge badge-dev">有効</span>`;
+		case "permanent":
+			return html`<span class="badge badge-danger">有効（無期限）</span>`;
+	}
 }
 
 function renderStatusBadge(
@@ -108,6 +172,7 @@ function renderCurrentSection(view: AdminBotPageView): SafeHtml {
 	}
 
 	const { agent } = designated;
+	const superadminState = getSuperadminState(config, view.now);
 	const suspendedBanner =
 		agent.status === "suspended"
 			? html`
@@ -135,7 +200,7 @@ function renderCurrentSection(view: AdminBotPageView): SafeHtml {
 				管理者用 MCP 接続先: <code>${adminMcpUrl}</code>
 			</div>
 			<div class="muted">
-				任意の権限（既定はオフ）: 本文閲覧 <strong>${config.readBodies ? "オン" : "オフ"}</strong> / 最高管理者権限 <strong>${config.superadminUntil !== null ? "有効" : "オフ"}</strong>
+				任意の権限（既定はオフ）: 本文閲覧 <strong>${config.readBodies ? "オン" : "オフ"}</strong> / 最高管理者権限 <strong>${superadminSummaryLabel(superadminState)}</strong>
 			</div>
 
 			${renderAdminTokenSection(designated, csrfToken)}
@@ -195,6 +260,74 @@ function renderReadBodiesPermission(view: AdminBotPageView): SafeHtml {
 	`;
 }
 
+function renderSuperadminPermission(view: AdminBotPageView): SafeHtml {
+	const { config, now, csrfToken } = view;
+	const state = getSuperadminState(config, now);
+	const isActive = state.kind === "active" || state.kind === "permanent";
+	const submitLabel = isActive
+		? "最高管理者権限の有効期間を更新する"
+		: "最高管理者権限をオンにする";
+
+	let stateDetail: SafeHtml | false = false;
+	if (state.kind === "active") {
+		stateDetail = html`
+			<span class="muted">（${formatRemainingDuration(state.remainingMs)} / 有効期限: ${formatTimestamp(state.until)}）</span>
+		`;
+	} else if (state.kind === "expired") {
+		stateDetail = html`
+			<span class="muted">（期限切れ: ${formatTimestamp(state.expiredAt)}）</span>
+		`;
+	} else if (state.kind === "permanent") {
+		stateDetail = html`
+			<span class="muted">（有効期限なし・手動でオフにするまで有効）</span>
+		`;
+	}
+
+	return html`
+		<div class="card stack">
+			<div class="actions">
+				<h3 style="margin: 0;">最高管理者権限</h3>
+				${renderSuperadminBadge(state)}
+				${stateDetail}
+			</div>
+			<p class="muted">
+				通常は提案までとなる緩める操作（許可ルール追加・カテゴリ追加・1日の質問数上限引き上げ・停止中エージェントの再開）を、承認なしで単独実行できるようにします。有効期限が過ぎた時点で自動的に無効になり、トークンの発行・再発行、管理者の指名替え、自分の権限設定の変更、監査ログの停止・削除は有効中でも実行できません。
+			</p>
+			<div class="banner banner-warning" role="note">
+				<strong>把握しているリスク（設計書 5.3 節）:</strong>
+				管理者ボットは参加者を兼ねるため、参加者として受け取った質問文に仕込まれたプロンプトインジェクション経由で管理者としての操作を実行させられる可能性があります。最高管理者権限が有効なときは、全カテゴリの開示許可につながり得ます。有効期限、固定の禁止操作、変更履歴の記録と 1 操作での取消はこの被害を限定するためのものです。
+			</div>
+			<div class="actions">
+				<form class="inline-form" method="POST" action="/admin/adminbot/permissions/superadmin">
+					${csrfInput(csrfToken)}
+					<div class="actions">
+						<label for="adminbot-superadmin-duration">有効期間</label>
+						<select id="adminbot-superadmin-duration" name="duration" style="width: auto;">
+							${SUPERADMIN_DURATION_PRESETS.map(
+								(days) =>
+									html`<option value="${String(days)}"${days === DEFAULT_SUPERADMIN_DAYS ? rawHtml(" selected") : false}>${days}日${days === DEFAULT_SUPERADMIN_DAYS ? "（既定）" : ""}</option>`,
+							)}
+							<option value="permanent">無期限</option>
+						</select>
+						<button type="submit" class="btn btn-primary">${submitLabel}</button>
+					</div>
+				</form>
+				${
+					isActive
+						? html`
+							<form class="inline-form" method="POST" action="/admin/adminbot/permissions/superadmin">
+								${csrfInput(csrfToken)}
+								<input type="hidden" name="duration" value="off">
+								<button type="submit" class="btn">最高管理者権限をオフにする</button>
+							</form>
+						`
+						: false
+				}
+			</div>
+		</div>
+	`;
+}
+
 function renderOptionalPermissionsSection(
 	view: AdminBotPageView,
 ): SafeHtml | false {
@@ -212,6 +345,7 @@ function renderOptionalPermissionsSection(
 			</div>
 			<div class="stack">
 				${renderReadBodiesPermission(view)}
+				${renderSuperadminPermission(view)}
 			</div>
 		</section>
 	`;
@@ -362,6 +496,41 @@ export function renderAdminBotPageBody(view: AdminBotPageView): SafeHtml {
 			${renderOptionalPermissionsSection(view)}
 			${renderDesignateSection(view)}
 			${renderAdminBotChangesSection(view)}
+		</div>
+	`;
+}
+
+/** Renders the 1-step confirmation screen when enabling both optional permissions at once (design section 5.3). */
+export function renderBothPermissionsConfirmBody(
+	view: BothPermissionsConfirmView,
+): SafeHtml {
+	return html`
+		<div class="stack">
+			<div>
+				<h1>本文閲覧と最高管理者権限の同時有効化の確認</h1>
+				<p class="muted"><a href="/admin/adminbot">管理者ボット設定へ戻る</a></p>
+			</div>
+			<section class="card stack">
+				<p>
+					対象エージェント: <strong>${view.agentName}</strong>
+				</p>
+				<p>
+					現在 <strong>${view.alreadyEnabledLabel}</strong> が有効です。ここで <strong>${view.enablingLabel}</strong> をオンにすると、本文閲覧と最高管理者権限の両方が同時に有効になります。
+				</p>
+				<div class="banner banner-warning" role="alert">
+					<strong>把握しているリスク（設計書 5.3 節）:</strong>
+					本文閲覧と最高管理者権限を同時に有効にすると、管理者ボットが監査ログの質問文・回答文（外部データ）を読んだ結果としてプロンプトインジェクションを受け、全カテゴリの許可ルール追加など緩める操作を単独で実行してしまうおそれがあります。必要に応じて有効期限を短く設定し、不要になったらオフにしてください。
+				</div>
+				<form method="POST" action="${view.action}" class="actions">
+					${csrfInput(view.csrfToken)}
+					${view.hiddenFields.map(
+						(field) =>
+							html`<input type="hidden" name="${field.name}" value="${field.value}">`,
+					)}
+					<button type="submit" class="btn btn-danger">リスクを理解して両方オンにする</button>
+					<a class="btn" href="/admin/adminbot">キャンセル</a>
+				</form>
+			</section>
 		</div>
 	`;
 }
