@@ -62,7 +62,7 @@ async function openProposalsSession(now = T0): Promise<{
 }> {
 	// Ensure at least one CSRF cookie exists via GET /admin/proposals.
 	const response = await handleAdminRequest(
-		new Request("https://paab.test/admin/proposals", { method: "GET" }),
+		new Request("https://localhost/admin/proposals", { method: "GET" }),
 		devEnv(),
 		now,
 	);
@@ -95,7 +95,7 @@ async function adminGet(
 	now = T0,
 ): Promise<Response> {
 	return handleAdminRequest(
-		new Request(`https://paab.test${path}`, {
+		new Request(`https://localhost${path}`, {
 			method: "GET",
 			headers: session ? { Cookie: session.cookie } : {},
 		}),
@@ -111,11 +111,11 @@ async function adminPost(
 	now = T0,
 ): Promise<Response> {
 	return handleAdminRequest(
-		new Request(`https://paab.test${path}`, {
+		new Request(`https://localhost${path}`, {
 			method: "POST",
 			headers: {
 				Cookie: session.cookie,
-				Origin: "https://paab.test",
+				Origin: "https://localhost",
 			},
 			body: new URLSearchParams({
 				csrf_token: session.token,
@@ -463,12 +463,12 @@ describe("POST /admin/proposals/:id/approve and /reject", () => {
 		for (const action of ["approve", "reject"]) {
 			const noCsrf = await handleAdminRequest(
 				new Request(
-					`https://paab.test/admin/proposals/${encodeURIComponent(created.data.proposal.id)}/${action}`,
+					`https://localhost/admin/proposals/${encodeURIComponent(created.data.proposal.id)}/${action}`,
 					{
 						method: "POST",
 						headers: {
 							Cookie: session.cookie,
-							Origin: "https://paab.test",
+							Origin: "https://localhost",
 						},
 						body: new URLSearchParams(),
 					},

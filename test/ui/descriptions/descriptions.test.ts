@@ -76,7 +76,7 @@ async function openDescriptionsSession(now = T0): Promise<{
 	html: string;
 }> {
 	const response = await handleAdminRequest(
-		new Request("https://paab.test/admin/descriptions", { method: "GET" }),
+		new Request("https://localhost/admin/descriptions", { method: "GET" }),
 		devEnv(),
 		now,
 	);
@@ -108,7 +108,7 @@ async function adminGet(
 	now = T0,
 ): Promise<{ response: Response; html: string }> {
 	const response = await handleAdminRequest(
-		new Request(`https://paab.test${path}`, {
+		new Request(`https://localhost${path}`, {
 			method: "GET",
 			headers: session ? { Cookie: session.cookie } : {},
 		}),
@@ -125,11 +125,11 @@ async function adminPost(
 	now = T0,
 ): Promise<{ response: Response; html: string }> {
 	const response = await handleAdminRequest(
-		new Request(`https://paab.test${path}`, {
+		new Request(`https://localhost${path}`, {
 			method: "POST",
 			headers: {
 				Cookie: session.cookie,
-				Origin: "https://paab.test",
+				Origin: "https://localhost",
 			},
 			body: new URLSearchParams({
 				csrf_token: session.token,
@@ -380,12 +380,12 @@ describe("POST /admin/descriptions/:agentId/approve and /reject", () => {
 		// Missing CSRF returns 403.
 		const noCsrf = await handleAdminRequest(
 			new Request(
-				`https://paab.test/admin/descriptions/${encodeURIComponent(grok.id)}/reject`,
+				`https://localhost/admin/descriptions/${encodeURIComponent(grok.id)}/reject`,
 				{
 					method: "POST",
 					headers: {
 						Cookie: session.cookie,
-						Origin: "https://paab.test",
+						Origin: "https://localhost",
 					},
 					body: new URLSearchParams(),
 				},

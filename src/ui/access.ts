@@ -47,6 +47,7 @@ const TEAM_DOMAIN_PATTERN = new RegExp(
 	`^${HOSTNAME_LABEL}(?:\\.${HOSTNAME_LABEL})*\\.(?:[a-z]{2,63}|xn--[a-z0-9-]{2,59})$`,
 	"i",
 );
+const LOOPBACK_DEV_HOSTS = new Set(["localhost", "127.0.0.1", "[::1]"]);
 
 interface CachedJwks {
 	fetchedAt: UnixMillis;
@@ -330,11 +331,21 @@ async function resolvePublicKey(
 	return { ok: true, key: keysByKid.get(kid) ?? null };
 }
 
+function isLoopbackDevHost(requestUrl: string): boolean {
+	try {
+		const hostname = new URL(requestUrl).hostname.toLowerCase();
+		return LOOPBACK_DEV_HOSTS.has(hostname);
+	} catch {
+		return false;
+	}
+}
+
 /**
  * Verifies Cloudflare Access authentication for an incoming `/admin` request.
  *
  * Fails closed when Access configuration is missing (`503`) or partial (`503`),
- * and only permits `ADMIN_DEV_USER` when both Access variables are unset.
+ * and only permits `ADMIN_DEV_USER` when both Access variables are unset and
+ * the request targets a loopback host (`localhost`, `127.0.0.1`, or `[::1]`).
  */
 export async function verifyAccessRequest(
 	request: Request,
@@ -359,7 +370,7 @@ export async function verifyAccessRequest(
 	}
 
 	if (!hasDomain && !hasAud) {
-		if (devUser.length > 0) {
+		if (devUser.length > 0 && isLoopbackDevHost(request.url)) {
 			return {
 				ok: true,
 				user: { email: devUser, sub: "dev" },

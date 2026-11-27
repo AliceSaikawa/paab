@@ -134,7 +134,7 @@ async function fetchAuditHtml(
 	envOverrides: Partial<UiEnv> = {},
 ): Promise<{ status: number; headers: Headers; text: string }> {
 	const response = await handleAdminRequest(
-		new Request(`https://paab.test${pathAndQuery}`, { method: "GET" }),
+		new Request(`https://localhost${pathAndQuery}`, { method: "GET" }),
 		uiEnv(envOverrides),
 		T0,
 	);

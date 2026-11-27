@@ -298,7 +298,7 @@ curl -s https://paab.<サブドメイン>.workers.dev/health
    echo 'ADMIN_DEV_USER=local@example.com' >> .dev.vars
    ```
 
-   `CF_ACCESS_TEAM_DOMAIN` と `CF_ACCESS_AUD` のどちらか一方でも設定されている場合は `ADMIN_DEV_USER` は無視され、Access 設定が優先される。本番の `wrangler.local.jsonc` には `ADMIN_DEV_USER` を書かないこと。
+   開発モードは、`CF_ACCESS_TEAM_DOMAIN` と `CF_ACCESS_AUD` が両方とも空で、かつリクエストのホスト名がループバック（`localhost`、`127.0.0.1`、`[::1]`）のときだけ有効になる。どちらか一方でも Access 設定がある場合は `ADMIN_DEV_USER` は無視されて Access 検証が優先され、`workers.dev` などループバック以外のホストへのリクエストでは `ADMIN_DEV_USER` が設定されていても HTTP `503` で遮断される。本番の `wrangler.local.jsonc` には `ADMIN_DEV_USER` を書かないこと。
 
 ### 管理画面からのエージェント管理とトークン発行（`/admin/agents`）
 

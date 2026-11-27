@@ -43,7 +43,7 @@ async function openRulesSession(now = T0): Promise<{
 	html: string;
 }> {
 	const response = await handleAdminRequest(
-		new Request("https://paab.test/admin/rules", { method: "GET" }),
+		new Request("https://localhost/admin/rules", { method: "GET" }),
 		devEnv(),
 		now,
 	);
@@ -67,7 +67,7 @@ async function adminGet(
 	now = T0,
 ): Promise<Response> {
 	return handleAdminRequest(
-		new Request(`https://paab.test${path}`, {
+		new Request(`https://localhost${path}`, {
 			method: "GET",
 			headers: session ? { Cookie: session.cookie } : {},
 		}),
@@ -83,11 +83,11 @@ async function adminPost(
 	now = T0,
 ): Promise<Response> {
 	return handleAdminRequest(
-		new Request(`https://paab.test${path}`, {
+		new Request(`https://localhost${path}`, {
 			method: "POST",
 			headers: {
 				Cookie: session.cookie,
-				Origin: "https://paab.test",
+				Origin: "https://localhost",
 			},
 			body: new URLSearchParams({
 				csrf_token: session.token,
@@ -565,11 +565,11 @@ describe("change_log ordering, validation errors, CSRF, and XSS escaping", () =>
 			`/admin/categories/${work.id}/delete`,
 		]) {
 			const noCsrf = await handleAdminRequest(
-				new Request(`https://paab.test${path}`, {
+				new Request(`https://localhost${path}`, {
 					method: "POST",
 					headers: {
 						Cookie: session.cookie,
-						Origin: "https://paab.test",
+						Origin: "https://localhost",
 					},
 					body: new URLSearchParams({ name: "x" }),
 				}),
