@@ -19,6 +19,7 @@ import {
 } from "../../src/admin";
 import {
 	approveProposal,
+	clearAdminBot,
 	createProposal,
 	describeProposalEffect,
 	designateAdminBot,
@@ -1421,5 +1422,207 @@ describe("proposal concurrency, atomicity, and 1-click undo", () => {
 		).not.toContain("undo-cat");
 		expect((await loadAgent(grok.id)).dailyQuestionLimit).toBe(10);
 		expect((await loadAgent(carol.id)).status).toBe("suspended");
+	});
+
+	it("refuses approveProposal with not_admin_bot across all 4 kinds when admin_bot_config no longer matches proposer (pre-check and SQL batch race)", async () => {
+		const proposals = await Promise.all([
+			createProposal(db, {
+				proposerAgentId: muse.id,
+				payload: {
+					kind: "grant_allow_rule",
+					fromAgentId: muse.id,
+					toAgentId: grok.id,
+					categoryId: schedule.id,
+				},
+				reason: "Rule by removed bot",
+				now: T0,
+			}),
+			createProposal(db, {
+				proposerAgentId: muse.id,
+				payload: { kind: "create_category", name: "removed-bot-cat" },
+				reason: "Category by removed bot",
+				now: T0 + 1,
+			}),
+			createProposal(db, {
+				proposerAgentId: muse.id,
+				payload: {
+					kind: "raise_daily_limit",
+					agentId: grok.id,
+					newLimit: 45,
+				},
+				reason: "Limit by removed bot",
+				now: T0 + 2,
+			}),
+			createProposal(db, {
+				proposerAgentId: muse.id,
+				payload: { kind: "resume_agent", agentId: carol.id },
+				reason: "Resume by removed bot",
+				now: T0 + 3,
+			}),
+		]);
+		const ids = proposals.map((res) => {
+			if (!res.ok) throw new Error("Expected proposal to be created");
+			return res.data.proposal.id;
+		});
+
+		// 1. Interleaved SQL batch race: admin_bot_config changes between pre-check and db.batch
+		// while the proposal row itself is still pending.
+		for (const [idx, id] of ids.entries()) {
+			await db
+				.prepare("UPDATE admin_bot_config SET agent_id = ? WHERE id = 1")
+				.bind(muse.id)
+				.run();
+			const nextDesignated = idx % 2 === 0 ? null : grok.id;
+			const racedDb = withBeforeBatch(db, async () => {
+				await db
+					.prepare("UPDATE admin_bot_config SET agent_id = ? WHERE id = 1")
+					.bind(nextDesignated)
+					.run();
+			});
+
+			const res = await approveProposal(racedDb, {
+				proposalId: id,
+				approverId: OWNER.actorId,
+				now: T0 + 20 + idx,
+			});
+			expect(res).toMatchObject({ ok: false, code: "not_admin_bot" });
+			expect((await loadProposal(id)).status).toBe("pending");
+			expect((await loadProposal(id)).changeLogId).toBeNull();
+		}
+
+		// 2. Direct pre-check rejection when admin_bot_config is cleared (NULL) or switched to grok.
+		for (const nextDesignated of [null, grok.id]) {
+			await db
+				.prepare("UPDATE admin_bot_config SET agent_id = ? WHERE id = 1")
+				.bind(nextDesignated)
+				.run();
+			for (const [idx, id] of ids.entries()) {
+				const res = await approveProposal(db, {
+					proposalId: id,
+					approverId: OWNER.actorId,
+					now: T0 + 50 + idx,
+				});
+				expect(res).toMatchObject({ ok: false, code: "not_admin_bot" });
+			}
+		}
+
+		// Live state and admin_bot change_log must remain completely untouched.
+		expect(await listAllowRulesGrouped(db)).toEqual([]);
+		expect(
+			(await listCategoriesWithUsage(db)).map((c) => c.category.name),
+		).not.toContain("removed-bot-cat");
+		expect((await loadAgent(grok.id)).dailyQuestionLimit).toBe(10);
+		expect((await loadAgent(carol.id)).status).toBe("suspended");
+		expect(await queryChangeLog(db, { actorType: "admin_bot" })).toEqual([]);
+	});
+
+	it("prevents split state when approveProposal races with clearAdminBot or designateAdminBot", async () => {
+		const pClear = await createProposal(db, {
+			proposerAgentId: muse.id,
+			payload: { kind: "resume_agent", agentId: carol.id },
+			reason: "Race with clearAdminBot",
+			now: T0,
+		});
+		if (!pClear.ok) throw new Error("Expected pClear");
+
+		// Deterministic interleaving: clearAdminBot runs right between pre-check and approveProposal batch.
+		const racedClearDb = withBeforeBatch(db, async () => {
+			const cleared = await clearAdminBot(db, { actor: OWNER, now: T0 + 5 });
+			expect(cleared.ok && cleared.data.changed).toBe(true);
+		});
+		const approveAfterClear = await approveProposal(racedClearDb, {
+			proposalId: pClear.data.proposal.id,
+			approverId: OWNER.actorId,
+			now: T0 + 6,
+		});
+		expect(approveAfterClear).toMatchObject({
+			ok: false,
+			code: "already_resolved",
+		});
+		expect(await loadProposal(pClear.data.proposal.id)).toMatchObject({
+			status: "rejected",
+			resolvedAt: T0 + 5,
+			resolvedBy: OWNER.actorId,
+			changeLogId: null,
+		});
+		expect((await loadAgent(carol.id)).status).toBe("suspended");
+		expect(await queryChangeLog(db, { actorType: "admin_bot" })).toEqual([]);
+
+		// Deterministic interleaving: designateAdminBot switches to grok right before approveProposal batch.
+		await designateAdminBot(db, {
+			agentId: muse.id,
+			actor: OWNER,
+			now: T0 + 10,
+		});
+		const pSwitch = await createProposal(db, {
+			proposerAgentId: muse.id,
+			payload: { kind: "create_category", name: "never-on-switch" },
+			reason: "Race with designateAdminBot",
+			now: T0 + 11,
+		});
+		if (!pSwitch.ok) throw new Error("Expected pSwitch");
+
+		const racedSwitchDb = withBeforeBatch(db, async () => {
+			const switched = await designateAdminBot(db, {
+				agentId: grok.id,
+				actor: OWNER,
+				now: T0 + 15,
+			});
+			expect(switched.ok && switched.data.changed).toBe(true);
+		});
+		const approveAfterSwitch = await approveProposal(racedSwitchDb, {
+			proposalId: pSwitch.data.proposal.id,
+			approverId: OWNER.actorId,
+			now: T0 + 16,
+		});
+		expect(approveAfterSwitch).toMatchObject({
+			ok: false,
+			code: "already_resolved",
+		});
+		expect(await loadProposal(pSwitch.data.proposal.id)).toMatchObject({
+			status: "rejected",
+			resolvedAt: T0 + 15,
+			resolvedBy: OWNER.actorId,
+			changeLogId: null,
+		});
+		expect(
+			(await listCategoriesWithUsage(db)).map((c) => c.category.name),
+		).not.toContain("never-on-switch");
+		expect(await queryChangeLog(db, { actorType: "admin_bot" })).toEqual([]);
+
+		// Concurrent Promise.all race between approveProposal and clearAdminBot.
+		const pConcurrent = await createProposal(db, {
+			proposerAgentId: grok.id,
+			payload: { kind: "raise_daily_limit", agentId: grok.id, newLimit: 25 },
+			reason: "Concurrent approve vs clear",
+			now: T0 + 20,
+		});
+		if (!pConcurrent.ok) throw new Error("Expected pConcurrent");
+
+		const [approveRes, clearRes] = await Promise.all([
+			approveProposal(db, {
+				proposalId: pConcurrent.data.proposal.id,
+				approverId: OWNER.actorId,
+				now: T0 + 25,
+			}),
+			clearAdminBot(db, { actor: OWNER, now: T0 + 25 }),
+		]);
+		expect(clearRes.ok && clearRes.data.changed).toBe(true);
+
+		const persisted = await loadProposal(pConcurrent.data.proposal.id);
+		const grokAfter = await loadAgent(grok.id);
+		const botLogs = await queryChangeLog(db, { actorType: "admin_bot" });
+		if (approveRes.ok) {
+			expect(persisted.status).toBe("approved");
+			expect(persisted.changeLogId).toBe(approveRes.data.changeId);
+			expect(grokAfter.dailyQuestionLimit).toBe(25);
+			expect(botLogs).toHaveLength(1);
+		} else {
+			expect(["already_resolved", "not_admin_bot"]).toContain(approveRes.code);
+			expect(persisted.status).toBe("rejected");
+			expect(persisted.changeLogId).toBeNull();
+			expect(grokAfter.dailyQuestionLimit).toBe(10);
+			expect(botLogs).toHaveLength(0);
+		}
 	});
 });

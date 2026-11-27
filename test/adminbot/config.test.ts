@@ -6,17 +6,23 @@ import {
 	queryChangeLog,
 } from "../../src/admin";
 import {
+	approveProposal,
 	clearAdminBot,
+	createProposal,
 	designateAdminBot,
+	expireProposals,
 	getAdminBotConfig,
 	issueAdminBotToken,
+	listProposals,
+	PROPOSAL_TTL_MS,
+	rejectProposal,
 	revokeAdminBotToken,
 	setAdminBotReadBodies,
 	setAdminBotSuperadmin,
 } from "../../src/adminbot";
 import { authenticate, hashToken } from "../../src/auth";
-import { newId } from "../../src/db";
-import type { Agent } from "../../src/types";
+import { newId, type ProposalRow, proposalFromRow } from "../../src/db";
+import type { Agent, Proposal } from "../../src/types";
 import { createTestDb } from "../helpers/db";
 import { DAY_MS, seedAgent, T0 } from "../helpers/fixtures";
 
@@ -489,5 +495,202 @@ describe("concurrent re-designation during switch updates", () => {
 		expect(
 			logs.filter((entry) => entry.action === "admin_bot_switches_updated"),
 		).toHaveLength(0);
+	});
+});
+
+async function loadProposal(id: string): Promise<Proposal> {
+	const row = await db
+		.prepare("SELECT * FROM proposals WHERE id = ?")
+		.bind(id)
+		.first<ProposalRow>();
+	if (row === null) throw new Error(`Proposal not found: ${id}`);
+	return proposalFromRow(row);
+}
+
+describe("admin bot designation changes and pending proposals", () => {
+	it("rejects active pending proposals on clearAdminBot while leaving approved, rejected, expired, and overdue ones unchanged", async () => {
+		await designateAdminBot(db, { agentId: muse.id, actor: OWNER, now: T0 });
+
+		const pPending = await createProposal(db, {
+			proposerAgentId: muse.id,
+			payload: { kind: "create_category", name: "pending-cat" },
+			reason: "Active pending",
+			now: T0 + 10 * DAY_MS,
+		});
+		const pApproved = await createProposal(db, {
+			proposerAgentId: muse.id,
+			payload: { kind: "create_category", name: "approved-cat" },
+			reason: "Already approved",
+			now: T0 + 1,
+		});
+		const pRejected = await createProposal(db, {
+			proposerAgentId: muse.id,
+			payload: { kind: "create_category", name: "rejected-cat" },
+			reason: "Already rejected",
+			now: T0 + 2,
+		});
+		const pExpired = await createProposal(db, {
+			proposerAgentId: muse.id,
+			payload: { kind: "create_category", name: "expired-cat" },
+			reason: "Swept expired",
+			now: T0,
+		});
+		const pOverdue = await createProposal(db, {
+			proposerAgentId: muse.id,
+			payload: { kind: "create_category", name: "overdue-cat" },
+			reason: "Overdue but unswept",
+			now: T0 + 100,
+		});
+		if (
+			!pPending.ok ||
+			!pApproved.ok ||
+			!pRejected.ok ||
+			!pExpired.ok ||
+			!pOverdue.ok
+		) {
+			throw new Error("Expected proposals to be created");
+		}
+
+		const approved = await approveProposal(db, {
+			proposalId: pApproved.data.proposal.id,
+			approverId: OWNER.actorId,
+			now: T0 + 10,
+		});
+		const rejected = await rejectProposal(db, {
+			proposalId: pRejected.data.proposal.id,
+			approverId: "earlier-owner@example.com",
+			now: T0 + 11,
+		});
+		expect(approved.ok && rejected.ok).toBe(true);
+		if (!approved.ok) return;
+
+		// Sweep pExpired at its exact deadline while pOverdue is still 100ms before expiry.
+		expect(await expireProposals(db, T0 + PROPOSAL_TTL_MS)).toBe(1);
+
+		// At clearNow, pOverdue is overdue (expiresAt <= clearNow) while pPending is still active.
+		const clearNow = T0 + PROPOSAL_TTL_MS + 100;
+		const cleared = await clearAdminBot(db, { actor: OWNER, now: clearNow });
+		expect(cleared.ok && cleared.data.changed).toBe(true);
+
+		expect(await loadProposal(pPending.data.proposal.id)).toMatchObject({
+			status: "rejected",
+			resolvedAt: clearNow,
+			resolvedBy: OWNER.actorId,
+			changeLogId: null,
+		});
+		expect(await loadProposal(pApproved.data.proposal.id)).toMatchObject({
+			status: "approved",
+			resolvedAt: T0 + 10,
+			resolvedBy: OWNER.actorId,
+			changeLogId: approved.data.changeId,
+		});
+		expect(await loadProposal(pRejected.data.proposal.id)).toMatchObject({
+			status: "rejected",
+			resolvedAt: T0 + 11,
+			resolvedBy: "earlier-owner@example.com",
+			changeLogId: null,
+		});
+		expect(await loadProposal(pExpired.data.proposal.id)).toMatchObject({
+			status: "expired",
+			resolvedAt: T0 + PROPOSAL_TTL_MS,
+			resolvedBy: null,
+			changeLogId: null,
+		});
+		expect(
+			await listProposals(db, { status: "expired", now: clearNow }),
+		).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					id: pOverdue.data.proposal.id,
+					status: "expired",
+				}),
+			]),
+		);
+		expect(
+			await listProposals(db, { status: "pending", now: clearNow }),
+		).toEqual([]);
+	});
+
+	it("rejects previous bot's pending proposals when switching to another bot while preserving re-designated same bot's proposals", async () => {
+		await designateAdminBot(db, { agentId: muse.id, actor: OWNER, now: T0 });
+
+		const pMuse1 = await createProposal(db, {
+			proposerAgentId: muse.id,
+			payload: { kind: "create_category", name: "muse-pending-1" },
+			reason: "Muse proposal 1",
+			now: T0 + 1,
+		});
+		const pMuseApproved = await createProposal(db, {
+			proposerAgentId: muse.id,
+			payload: { kind: "create_category", name: "muse-approved" },
+			reason: "Muse approved",
+			now: T0 + 2,
+		});
+		if (!pMuse1.ok || !pMuseApproved.ok) {
+			throw new Error("Expected muse proposals");
+		}
+		const approved = await approveProposal(db, {
+			proposalId: pMuseApproved.data.proposal.id,
+			approverId: OWNER.actorId,
+			now: T0 + 3,
+		});
+		expect(approved.ok).toBe(true);
+		if (!approved.ok) return;
+
+		// Re-designating the same bot (muse) must NOT reject its pending proposals.
+		const same = await designateAdminBot(db, {
+			agentId: muse.id,
+			actor: OWNER,
+			now: T0 + 5,
+		});
+		expect(same.ok && !same.data.changed).toBe(true);
+		expect(await loadProposal(pMuse1.data.proposal.id)).toMatchObject({
+			status: "pending",
+			resolvedAt: null,
+			resolvedBy: null,
+		});
+
+		// Switching designation from muse to grok rejects muse's pending proposals
+		// without disturbing muse's already-approved proposal.
+		const switched = await designateAdminBot(db, {
+			agentId: grok.id,
+			actor: OWNER,
+			now: T0 + 10,
+		});
+		expect(switched.ok && switched.data.changed).toBe(true);
+
+		expect(await loadProposal(pMuse1.data.proposal.id)).toMatchObject({
+			status: "rejected",
+			resolvedAt: T0 + 10,
+			resolvedBy: OWNER.actorId,
+			changeLogId: null,
+		});
+		expect(await loadProposal(pMuseApproved.data.proposal.id)).toMatchObject({
+			status: "approved",
+			resolvedAt: T0 + 3,
+			resolvedBy: OWNER.actorId,
+			changeLogId: approved.data.changeId,
+		});
+
+		// Proposals created by the newly designated bot (grok) stay pending when re-designating grok.
+		const pGrok = await createProposal(db, {
+			proposerAgentId: grok.id,
+			payload: { kind: "create_category", name: "grok-pending" },
+			reason: "Grok proposal",
+			now: T0 + 11,
+		});
+		expect(pGrok.ok).toBe(true);
+		if (!pGrok.ok) return;
+
+		await designateAdminBot(db, {
+			agentId: grok.id,
+			actor: OWNER,
+			now: T0 + 12,
+		});
+		expect(await loadProposal(pGrok.data.proposal.id)).toMatchObject({
+			status: "pending",
+			resolvedAt: null,
+			resolvedBy: null,
+		});
 	});
 });
