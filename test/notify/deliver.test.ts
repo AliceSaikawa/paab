@@ -4,7 +4,7 @@ import {
 	StreamableHTTPClientTransport,
 } from "@modelcontextprotocol/client";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { configureAgentWebhook } from "../../src/admin";
+import { configureAgentWebhook, suspendAgent } from "../../src/admin";
 import { AUDIT_BODY_RECORDING_DISABLED, queryAuditLog } from "../../src/audit";
 import {
 	upsertAgentWebhook,
@@ -798,5 +798,110 @@ describe("coalescing, suspended agents, retries, redirect rejection, and secret 
 		expect(expiredAudit.some((e) => e.eventType === "question_expired")).toBe(
 			true,
 		);
+	});
+
+	it("preserves active retry backoff when new wakes arrive and prevents duplicate concurrent POSTs", async () => {
+		await configureAgentWebhook(world.db, {
+			agentId: world.bob.agent.id,
+			url: "https://hooks.example.com/bob",
+			authMode: "paab_hmac",
+			actor: OWNER,
+			now: T0,
+		});
+
+		const deliveryId = await enqueueWake(world.db, {
+			agentId: world.bob.agent.id,
+			now: T0,
+		});
+		const failOnce: WebhookFetcher = vi.fn(
+			async () => new Response("err", { status: 503 }),
+		);
+		const first = await attemptWebhookDelivery(world.db, deliveryId as string, {
+			now: T0,
+			audit: AUDIT_BODY_RECORDING_DISABLED,
+			fetcher: failOnce,
+		});
+		expect(first).toMatchObject({
+			status: "retry_scheduled",
+			attempts: 1,
+			nextAttemptAt: T0 + WEBHOOK_RETRY_DELAYS_MS[1],
+		});
+
+		// A new immediate wake during backoff must coalesce without resetting next_attempt_at.
+		await enqueueWake(world.db, {
+			agentId: world.bob.agent.id,
+			now: T0 + 10_000,
+			delayMs: 0,
+		});
+		const pendingRows = await listDeliveries(world.bob.agent.id);
+		expect(pendingRows).toHaveLength(1);
+		expect(pendingRows[0]?.attempts).toBe(1);
+		expect(pendingRows[0]?.nextAttemptAt).toBe(T0 + WEBHOOK_RETRY_DELAYS_MS[1]);
+
+		// Calling attemptWebhookDelivery before backoff elapses skips without POSTing.
+		const earlyFetcher: WebhookFetcher = vi.fn(async () => new Response("ok"));
+		const early = await attemptWebhookDelivery(world.db, deliveryId as string, {
+			now: T0 + 10_000,
+			audit: AUDIT_BODY_RECORDING_DISABLED,
+			fetcher: earlyFetcher,
+		});
+		expect(early).toEqual({ status: "skipped", reason: "not_due" });
+		expect(earlyFetcher).not.toHaveBeenCalled();
+
+		// Concurrent attempts once due must lease atomically so only one HTTP POST fires.
+		let releaseFetch: (() => void) | undefined;
+		const slowFetcher: WebhookFetcher = vi.fn(
+			() =>
+				new Promise<Response>((resolve) => {
+					releaseFetch = () => resolve(new Response("ok", { status: 200 }));
+				}),
+		);
+		const dueNow = T0 + WEBHOOK_RETRY_DELAYS_MS[1];
+		const firstInFlight = attemptWebhookDelivery(
+			world.db,
+			deliveryId as string,
+			{
+				now: dueNow,
+				audit: AUDIT_BODY_RECORDING_DISABLED,
+				fetcher: slowFetcher,
+			},
+		);
+		const secondInFlight = attemptWebhookDelivery(
+			world.db,
+			deliveryId as string,
+			{
+				now: dueNow,
+				audit: AUDIT_BODY_RECORDING_DISABLED,
+				fetcher: slowFetcher,
+			},
+		);
+		await vi.waitFor(() => expect(slowFetcher).toHaveBeenCalledTimes(1));
+		releaseFetch?.();
+		const [r1, r2] = await Promise.all([firstInFlight, secondInFlight]);
+		expect([r1.status, r2.status].sort()).toEqual(["delivered", "skipped"]);
+		expect(slowFetcher).toHaveBeenCalledTimes(1);
+	});
+
+	it("immediately drops pending webhook deliveries when suspendAgent runs", async () => {
+		await configureAgentWebhook(world.db, {
+			agentId: world.bob.agent.id,
+			url: "https://hooks.example.com/bob",
+			authMode: "paab_hmac",
+			actor: OWNER,
+			now: T0,
+		});
+		await enqueueWake(world.db, {
+			agentId: world.bob.agent.id,
+			now: T0,
+		});
+		expect(await listDeliveries(world.bob.agent.id)).toHaveLength(1);
+
+		const suspended = await suspendAgent(world.db, {
+			agentId: world.bob.agent.id,
+			actor: OWNER,
+			now: T0 + 1000,
+		});
+		expect(suspended.ok).toBe(true);
+		expect(await listDeliveries(world.bob.agent.id)).toHaveLength(0);
 	});
 });

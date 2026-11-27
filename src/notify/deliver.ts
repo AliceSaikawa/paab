@@ -16,8 +16,25 @@ export const WEBHOOK_BLOCKED_DELAY_MS = 60_000;
 export const WEBHOOK_TIMEOUT_MS = 5_000;
 
 const MAX_ERROR_LENGTH = 200;
-// biome-ignore lint/suspicious/noControlCharactersInRegex: strip control characters from stored error messages.
-const ERROR_CONTROL_CHARS = /[\x00-\x1f\x7f]+/g;
+const WEBHOOK_IN_FLIGHT_LEASE_MS = 10_000;
+
+function stripControlChars(text: string): string {
+	let out = "";
+	let inControl = false;
+	for (let i = 0; i < text.length; i += 1) {
+		const code = text.charCodeAt(i);
+		if (code <= 0x1f || code === 0x7f) {
+			if (!inControl) {
+				out += " ";
+				inControl = true;
+			}
+		} else {
+			out += text[i];
+			inControl = false;
+		}
+	}
+	return out;
+}
 
 export type WebhookFetcher = (
 	input: string,
@@ -40,7 +57,7 @@ export interface AttemptWebhookOptions {
 export type WebhookAttemptOutcome =
 	| {
 			status: "skipped";
-			reason: "not_pending" | "agent_suspended" | "no_webhook";
+			reason: "not_pending" | "not_due" | "agent_suspended" | "no_webhook";
 	  }
 	| { status: "delivered"; attempts: number }
 	| {
@@ -126,7 +143,7 @@ export function sanitizeWebhookError(
 		text = text.split(secretPart).join("[redacted]");
 	}
 
-	text = text.replace(ERROR_CONTROL_CHARS, " ").trim();
+	text = stripControlChars(text).trim();
 	if (text.length === 0) {
 		return "unknown webhook delivery error";
 	}
@@ -136,15 +153,16 @@ export function sanitizeWebhookError(
 	return text;
 }
 
-/**
- * Enqueues a wake delivery for `agentId`, coalescing with any existing pending
- * delivery by taking the earlier `next_attempt_at`. Skips missing, suspended,
- * or unconfigured agents.
- */
-export async function enqueueWake(
+interface EnqueuedWakeRecord {
+	id: string;
+	attempts: number;
+	nextAttemptAt: UnixMillis;
+}
+
+async function enqueueWakeRecord(
 	db: D1Database,
 	input: EnqueueWakeInput,
-): Promise<string | null> {
+): Promise<EnqueuedWakeRecord | null> {
 	const delayMs = input.delayMs ?? 0;
 	if (!Number.isSafeInteger(input.now)) {
 		throw new Error("now must be an integer of UNIX milliseconds");
@@ -175,14 +193,38 @@ export async function enqueueWake(
 				(id, agent_id, status, attempts, next_attempt_at, last_error, created_at, updated_at)
 			VALUES (?, ?, 'pending', 0, ?, NULL, ?, ?)
 			ON CONFLICT (agent_id) WHERE status = 'pending' DO UPDATE SET
-				next_attempt_at = MIN(webhook_deliveries.next_attempt_at, excluded.next_attempt_at),
+				next_attempt_at = CASE
+					WHEN webhook_deliveries.attempts = 0
+					THEN MIN(webhook_deliveries.next_attempt_at, excluded.next_attempt_at)
+					ELSE webhook_deliveries.next_attempt_at
+				END,
 				updated_at = excluded.updated_at
-			RETURNING id`,
+			RETURNING id, attempts, next_attempt_at`,
 		)
 		.bind(id, input.agentId, nextAttemptAt, input.now, input.now)
-		.first<{ id: string }>();
+		.first<{ id: string; attempts: number; next_attempt_at: number }>();
 
-	return row?.id ?? id;
+	return row === null
+		? { id, attempts: 0, nextAttemptAt }
+		: {
+				id: row.id,
+				attempts: row.attempts,
+				nextAttemptAt: row.next_attempt_at,
+			};
+}
+
+/**
+ * Enqueues a wake delivery for `agentId`, coalescing with any existing pending
+ * delivery. Pulls `next_attempt_at` earlier only before the first attempt so
+ * active retry backoff (60s / 300s) is never bypassed. Skips missing,
+ * suspended, or unconfigured agents.
+ */
+export async function enqueueWake(
+	db: D1Database,
+	input: EnqueueWakeInput,
+): Promise<string | null> {
+	const record = await enqueueWakeRecord(db, input);
+	return record?.id ?? null;
 }
 
 async function recordDeliveryFailure(
@@ -260,7 +302,7 @@ export async function attemptWebhookDelivery(
 	const {
 		now,
 		audit,
-		fetcher = fetch as WebhookFetcher,
+		fetcher = (input: string, init?: RequestInit) => fetch(input, init),
 		allowInsecureLocalhost = false,
 	} = options;
 
@@ -274,6 +316,27 @@ export async function attemptWebhookDelivery(
 		return { status: "skipped", reason: "not_pending" };
 	}
 	const delivery = webhookDeliveryFromRow(rawDelivery);
+	if (delivery.nextAttemptAt > now) {
+		return { status: "skipped", reason: "not_due" };
+	}
+
+	const lease = await db
+		.prepare(
+			`UPDATE webhook_deliveries
+			SET next_attempt_at = ?, updated_at = ?
+			WHERE id = ? AND status = 'pending' AND attempts = ? AND next_attempt_at <= ?`,
+		)
+		.bind(
+			now + WEBHOOK_IN_FLIGHT_LEASE_MS,
+			now,
+			delivery.id,
+			delivery.attempts,
+			now,
+		)
+		.run();
+	if ((lease.meta.changes ?? 0) === 0) {
+		return { status: "skipped", reason: "not_due" };
+	}
 
 	const joined = await db
 		.prepare(
@@ -504,16 +567,21 @@ export async function notifyAgentImmediately(
 	options: NotifyAgentImmediatelyOptions,
 ): Promise<void> {
 	try {
-		const deliveryId = await enqueueWake(db, {
+		const record = await enqueueWakeRecord(db, {
 			agentId: options.agentId,
 			now: options.now,
 			delayMs: 0,
 		});
-		if (deliveryId === null || options.waitUntil === undefined) {
+		if (
+			record === null ||
+			options.waitUntil === undefined ||
+			record.attempts > 0 ||
+			record.nextAttemptAt > options.now
+		) {
 			return;
 		}
 		options.waitUntil(
-			attemptWebhookDelivery(db, deliveryId, {
+			attemptWebhookDelivery(db, record.id, {
 				now: options.now,
 				audit: options.audit,
 				fetcher: options.fetcher,

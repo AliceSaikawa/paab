@@ -251,7 +251,11 @@ function newerTargetChangeQuery(
 }
 
 type PreparedRestore =
-	| { ok: true; statement: D1PreparedStatement }
+	| {
+			ok: true;
+			statement: D1PreparedStatement;
+			extraStatements?: D1PreparedStatement[];
+	  }
 	| UndoFailure;
 
 async function prepareAgentRestore(
@@ -305,6 +309,16 @@ async function prepareAgentRestore(
 			statement: db
 				.prepare("UPDATE agents SET status = ? WHERE id = ?")
 				.bind(prevStatus, current.id),
+			extraStatements:
+				prevStatus === "suspended"
+					? [
+							db
+								.prepare(
+									"DELETE FROM webhook_deliveries WHERE agent_id = ? AND status = 'pending'",
+								)
+								.bind(current.id),
+						]
+					: undefined,
 		};
 	}
 
@@ -588,6 +602,7 @@ export async function revertAdminBotChange(
 			db,
 			[
 				prepared.statement,
+				...(prepared.extraStatements ?? []),
 				db
 					.prepare(
 						"UPDATE change_log SET reverted_at = ? WHERE id = ? AND reverted_at IS NULL",

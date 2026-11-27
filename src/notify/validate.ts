@@ -3,8 +3,15 @@ const MAX_SECRET_LENGTH = 2048;
 const MAX_HEADER_NAME_LENGTH = 64;
 const MIN_STANDARD_WEBHOOKS_KEY_BYTES = 16;
 
-// biome-ignore lint/suspicious/noControlCharactersInRegex: intentional check rejecting ASCII control characters in URLs and secrets.
-const CONTROL_CHAR_PATTERN = /[\x00-\x1f\x7f]/;
+function hasControlChar(value: string): boolean {
+	for (let i = 0; i < value.length; i += 1) {
+		const code = value.charCodeAt(i);
+		if (code <= 0x1f || code === 0x7f) {
+			return true;
+		}
+	}
+	return false;
+}
 const HEADER_NAME_PATTERN = /^[A-Za-z0-9-]+$/;
 const BASE64_PATTERN = /^[A-Za-z0-9+/]+={0,2}$/;
 
@@ -248,7 +255,7 @@ export function validateWebhookUrl(
 	if (typeof raw !== "string") {
 		return { ok: false, message: "呼び出し先 URL は文字列で指定してください" };
 	}
-	if (CONTROL_CHAR_PATTERN.test(raw)) {
+	if (hasControlChar(raw)) {
 		return {
 			ok: false,
 			message: "呼び出し先 URL に改行や制御文字は含められません",
@@ -382,7 +389,7 @@ export function validateCustomHeaderName(
 	if (typeof raw !== "string") {
 		return { ok: false, message: "ヘッダー名は文字列で指定してください" };
 	}
-	if (CONTROL_CHAR_PATTERN.test(raw)) {
+	if (hasControlChar(raw)) {
 		return { ok: false, message: "ヘッダー名に改行や制御文字は使えません" };
 	}
 	const headerName = raw.trim();
@@ -461,7 +468,7 @@ export function validateStandardWebhooksSecret(raw: string): SecretValidation {
 				"Standard Webhooks のシークレット（whsec_...）を入力してください",
 		};
 	}
-	if (CONTROL_CHAR_PATTERN.test(raw)) {
+	if (hasControlChar(raw)) {
 		return {
 			ok: false,
 			message: "シークレットに改行や制御文字は含められません",
@@ -504,7 +511,7 @@ export function validateExternalSecret(raw: string): SecretValidation {
 			message: `認証シークレットは ${MAX_SECRET_LENGTH} 文字以内にしてください`,
 		};
 	}
-	if (CONTROL_CHAR_PATTERN.test(raw)) {
+	if (hasControlChar(raw)) {
 		return {
 			ok: false,
 			message: "認証シークレットに改行や制御文字は含められません",

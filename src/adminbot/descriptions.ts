@@ -1,7 +1,6 @@
 import type { AdminErrorCode, ChangeActor } from "../admin";
 import {
 	fail as adminFail,
-	runWithChangeLog,
 	validateContext,
 	validateDescription,
 	validateId,
@@ -216,37 +215,74 @@ export async function approvePendingDescription(
 	}
 	const nextDescription = checkedDescription.value;
 
-	const changeId = await runWithChangeLog(
-		db,
-		[
-			db
-				.prepare("UPDATE agents SET description = ? WHERE id = ?")
-				.bind(nextDescription, agent.id),
-			db
-				.prepare("DELETE FROM pending_descriptions WHERE agent_id = ?")
-				.bind(agent.id),
-		],
-		{
-			occurredAt: ctx.value.now,
-			actorType: ctx.value.actorType,
-			actorId: ctx.value.actorId,
-			approverId: ctx.value.approverId,
-			action: "description_approved",
-			targetType: "description",
-			targetId: agent.id,
-			beforeJson: JSON.stringify({
-				agentId: agent.id,
-				name: agent.name,
-				description: agent.description,
-			}),
-			afterJson: JSON.stringify({
-				agentId: agent.id,
-				name: agent.name,
-				description: nextDescription,
-			}),
-			revertedAt: null,
-		},
-	);
+	const beforeJson = JSON.stringify({
+		agentId: agent.id,
+		name: agent.name,
+		description: agent.description,
+	});
+	const afterJson = JSON.stringify({
+		agentId: agent.id,
+		name: agent.name,
+		description: nextDescription,
+	});
+	const [, changeRes, deleteRes] = await db.batch([
+		db
+			.prepare(
+				`UPDATE agents
+				SET description = ?
+				WHERE id = ?
+					AND EXISTS (
+						SELECT 1 FROM pending_descriptions
+						WHERE agent_id = ? AND submitted_at = ? AND description = ?
+					)`,
+			)
+			.bind(
+				nextDescription,
+				agent.id,
+				agent.id,
+				pending.submittedAt,
+				pending.description,
+			),
+		db
+			.prepare(
+				`INSERT INTO change_log
+					(occurred_at, actor_type, actor_id, approver_id, action,
+					target_type, target_id, before_json, after_json, reverted_at)
+				SELECT ?, ?, ?, ?, 'description_approved', 'description', ?, ?, ?, NULL
+				WHERE EXISTS (
+					SELECT 1 FROM pending_descriptions
+					WHERE agent_id = ? AND submitted_at = ? AND description = ?
+				)`,
+			)
+			.bind(
+				ctx.value.now,
+				ctx.value.actorType,
+				ctx.value.actorId,
+				ctx.value.approverId,
+				agent.id,
+				beforeJson,
+				afterJson,
+				agent.id,
+				pending.submittedAt,
+				pending.description,
+			),
+		db
+			.prepare(
+				`DELETE FROM pending_descriptions
+				WHERE agent_id = ? AND submitted_at = ? AND description = ?`,
+			)
+			.bind(agent.id, pending.submittedAt, pending.description),
+	]);
+	if ((deleteRes?.meta.changes ?? 0) === 0) {
+		return adminFail(
+			"not_found",
+			"承認待ちの説明文が更新または処理されたため承認できませんでした",
+		);
+	}
+	const changeId = Number(changeRes?.meta.last_row_id);
+	if (!Number.isSafeInteger(changeId) || changeId <= 0) {
+		throw new Error("change_log insert did not return a valid last_row_id");
+	}
 
 	return {
 		ok: true,
@@ -306,30 +342,51 @@ export async function rejectPendingDescription(
 	const agent = agentFromRow(agentRow);
 	const pending = pendingDescriptionFromRow(pendingRow);
 
-	const changeId = await runWithChangeLog(
-		db,
-		[
-			db
-				.prepare("DELETE FROM pending_descriptions WHERE agent_id = ?")
-				.bind(agent.id),
-		],
-		{
-			occurredAt: ctx.value.now,
-			actorType: ctx.value.actorType,
-			actorId: ctx.value.actorId,
-			approverId: ctx.value.approverId,
-			action: "description_rejected",
-			targetType: "description",
-			targetId: agent.id,
-			beforeJson: JSON.stringify({
-				agentId: agent.id,
-				name: agent.name,
-				description: pending.description,
-			}),
-			afterJson: null,
-			revertedAt: null,
-		},
-	);
+	const beforeJson = JSON.stringify({
+		agentId: agent.id,
+		name: agent.name,
+		description: pending.description,
+	});
+	const [changeRes, deleteRes] = await db.batch([
+		db
+			.prepare(
+				`INSERT INTO change_log
+					(occurred_at, actor_type, actor_id, approver_id, action,
+					target_type, target_id, before_json, after_json, reverted_at)
+				SELECT ?, ?, ?, ?, 'description_rejected', 'description', ?, ?, NULL, NULL
+				WHERE EXISTS (
+					SELECT 1 FROM pending_descriptions
+					WHERE agent_id = ? AND submitted_at = ? AND description = ?
+				)`,
+			)
+			.bind(
+				ctx.value.now,
+				ctx.value.actorType,
+				ctx.value.actorId,
+				ctx.value.approverId,
+				agent.id,
+				beforeJson,
+				agent.id,
+				pending.submittedAt,
+				pending.description,
+			),
+		db
+			.prepare(
+				`DELETE FROM pending_descriptions
+				WHERE agent_id = ? AND submitted_at = ? AND description = ?`,
+			)
+			.bind(agent.id, pending.submittedAt, pending.description),
+	]);
+	if ((deleteRes?.meta.changes ?? 0) === 0) {
+		return adminFail(
+			"not_found",
+			"承認待ちの説明文が更新または処理されたため却下できませんでした",
+		);
+	}
+	const changeId = Number(changeRes?.meta.last_row_id);
+	if (!Number.isSafeInteger(changeId) || changeId <= 0) {
+		throw new Error("change_log insert did not return a valid last_row_id");
+	}
 
 	return {
 		ok: true,

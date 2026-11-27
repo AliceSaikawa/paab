@@ -436,19 +436,23 @@ async function resolveAgentName(
 	return row?.name ?? agentId;
 }
 
+function isWebhookAuthMode(value: string): value is WebhookAuthMode {
+	return (WEBHOOK_AUTH_MODES as readonly string[]).includes(value);
+}
+
 async function handleConfigureWebhook(
 	ctx: AdminPostContext,
 ): Promise<Response> {
 	const agentId = ctx.params.id ?? "";
 	const url = ctx.form.get("url") ?? "";
 	const rawAuthMode = ctx.form.get("auth_mode") ?? "";
-	if (!(WEBHOOK_AUTH_MODES as readonly string[]).includes(rawAuthMode)) {
+	if (!isWebhookAuthMode(rawAuthMode)) {
 		return renderAgentsList(ctx, {
 			status: 400,
 			flash: { kind: "error", message: "認証方式が不正です" },
 		});
 	}
-	const authMode = rawAuthMode as WebhookAuthMode;
+	const authMode = rawAuthMode;
 	const headerName = ctx.form.get("header_name");
 	const secret = ctx.form.get("secret");
 

@@ -322,25 +322,30 @@ export async function configureAgentWebhook(
 	}
 
 	const createdAt = existing?.createdAt ?? ctx.value.now;
-	const nextWebhook: AgentWebhook =
-		authMode === "custom_header"
-			? {
-					agentId: agentId.value,
-					url: urlCheck.url,
-					authMode,
-					headerName: validatedHeaderName as string,
-					secret,
-					createdAt,
-					updatedAt: ctx.value.now,
-				}
-			: {
-					agentId: agentId.value,
-					url: urlCheck.url,
-					authMode,
-					secret,
-					createdAt,
-					updatedAt: ctx.value.now,
-				};
+	let nextWebhook: AgentWebhook;
+	if (authMode === "custom_header") {
+		if (validatedHeaderName === null) {
+			return fail("invalid_input", "カスタムヘッダー名を指定してください");
+		}
+		nextWebhook = {
+			agentId: agentId.value,
+			url: urlCheck.url,
+			authMode,
+			headerName: validatedHeaderName,
+			secret,
+			createdAt,
+			updatedAt: ctx.value.now,
+		};
+	} else {
+		nextWebhook = {
+			agentId: agentId.value,
+			url: urlCheck.url,
+			authMode,
+			secret,
+			createdAt,
+			updatedAt: ctx.value.now,
+		};
+	}
 
 	const changeId = await runWithChangeLog(
 		db,

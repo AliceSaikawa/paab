@@ -302,26 +302,32 @@ async function setAgentStatus(
 	}
 
 	const updated: Agent = { ...current, status: nextStatus };
-	const changeId = await runWithChangeLog(
-		db,
-		[
+	const statements: D1PreparedStatement[] = [
+		db
+			.prepare("UPDATE agents SET status = ? WHERE id = ?")
+			.bind(nextStatus, current.id),
+	];
+	if (nextStatus === "suspended") {
+		statements.push(
 			db
-				.prepare("UPDATE agents SET status = ? WHERE id = ?")
-				.bind(nextStatus, current.id),
-		],
-		{
-			occurredAt: ctx.value.now,
-			actorType: ctx.value.actorType,
-			actorId: ctx.value.actorId,
-			approverId: ctx.value.approverId,
-			action: nextStatus === "suspended" ? "agent_suspended" : "agent_resumed",
-			targetType: "agent",
-			targetId: current.id,
-			beforeJson: JSON.stringify(current),
-			afterJson: JSON.stringify(updated),
-			revertedAt: null,
-		},
-	);
+				.prepare(
+					"DELETE FROM webhook_deliveries WHERE agent_id = ? AND status = 'pending'",
+				)
+				.bind(current.id),
+		);
+	}
+	const changeId = await runWithChangeLog(db, statements, {
+		occurredAt: ctx.value.now,
+		actorType: ctx.value.actorType,
+		actorId: ctx.value.actorId,
+		approverId: ctx.value.approverId,
+		action: nextStatus === "suspended" ? "agent_suspended" : "agent_resumed",
+		targetType: "agent",
+		targetId: current.id,
+		beforeJson: JSON.stringify(current),
+		afterJson: JSON.stringify(updated),
+		revertedAt: null,
+	});
 	return { ok: true, data: { agent: updated }, changeId };
 }
 
