@@ -78,6 +78,8 @@ export const AUDIT_EVENT_TYPES = [
 	"admin_tool_denied",
 	"admin_body_read",
 	"description_submitted",
+	"webhook_delivered",
+	"webhook_abandoned",
 ] as const;
 export type AuditEventType = (typeof AUDIT_EVENT_TYPES)[number];
 
@@ -101,6 +103,7 @@ export const REASON_CODES = [
 	"token_revoked",
 	"not_admin_bot",
 	"permission_denied",
+	"webhook_delivery_failed",
 ] as const;
 export type ReasonCode = (typeof REASON_CODES)[number];
 
@@ -206,6 +209,9 @@ export const CHANGE_ACTIONS = [
 	"admin_bot_switches_updated",
 	"description_approved",
 	"description_rejected",
+	"webhook_configured",
+	"webhook_secret_rotated",
+	"webhook_deleted",
 	"change_reverted",
 ] as const;
 export type ChangeAction = (typeof CHANGE_ACTIONS)[number];
@@ -289,4 +295,43 @@ export interface PendingDescription {
 	agentId: string;
 	description: string;
 	submittedAt: UnixMillis;
+}
+
+export const WEBHOOK_AUTH_MODES = [
+	"standard_webhooks",
+	"bearer_header",
+	"custom_header",
+	"paab_hmac",
+] as const;
+export type WebhookAuthMode = (typeof WEBHOOK_AUTH_MODES)[number];
+
+export const WEBHOOK_DELIVERY_STATUSES = [
+	"pending",
+	"delivered",
+	"abandoned",
+] as const;
+export type WebhookDeliveryStatus = (typeof WEBHOOK_DELIVERY_STATUSES)[number];
+
+export type WebhookAuthConfig =
+	| { authMode: "standard_webhooks"; secret: string }
+	| { authMode: "bearer_header"; secret: string }
+	| { authMode: "custom_header"; headerName: string; secret: string }
+	| { authMode: "paab_hmac"; secret: string };
+
+export type AgentWebhook = WebhookAuthConfig & {
+	agentId: string;
+	url: string;
+	createdAt: UnixMillis;
+	updatedAt: UnixMillis;
+};
+
+export interface WebhookDelivery {
+	id: string;
+	agentId: string;
+	status: WebhookDeliveryStatus;
+	attempts: number;
+	nextAttemptAt: UnixMillis;
+	lastError: string | null;
+	createdAt: UnixMillis;
+	updatedAt: UnixMillis;
 }

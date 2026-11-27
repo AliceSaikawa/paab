@@ -52,6 +52,9 @@ export const CHANGE_ACTION_LABELS: Record<ChangeAction, string> = {
 	admin_bot_switches_updated: "管理者ボット権限変更",
 	description_approved: "説明文承認",
 	description_rejected: "説明文却下",
+	webhook_configured: "Webhook設定",
+	webhook_secret_rotated: "Webhook鍵ローテーション",
+	webhook_deleted: "Webhook削除",
 	change_reverted: "変更取消",
 };
 
@@ -254,6 +257,23 @@ function describeDescriptionSnapshot(
 	return `${name}「${preview}」`;
 }
 
+function describeWebhookSnapshot(record: Record<string, unknown>): string {
+	const url = readString(record, "url");
+	const authMode = readString(record, "authMode");
+	const headerName = readString(record, "headerName");
+	const details: string[] = [];
+	if (authMode !== null) {
+		details.push(authMode);
+	}
+	if (headerName !== null) {
+		details.push(`header=${headerName}`);
+	}
+	if (url !== null) {
+		return details.length > 0 ? `${url}（${details.join("・")}）` : url;
+	}
+	return details.length > 0 ? details.join("・") : "Webhook設定";
+}
+
 function describeSnapshot(
 	entry: ChangeLogEntry,
 	raw: string | null,
@@ -319,6 +339,10 @@ function describeSnapshot(
 		case "description_approved":
 		case "description_rejected":
 			return describeDescriptionSnapshot(entry.targetId, record, names);
+		case "webhook_configured":
+		case "webhook_secret_rotated":
+		case "webhook_deleted":
+			return describeWebhookSnapshot(record);
 		case "change_reverted": {
 			switch (entry.targetType) {
 				case "allow_rule":

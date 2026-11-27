@@ -43,6 +43,8 @@ export function migrationByName(name: string): D1Migration {
 
 // Children before parents, so that foreign keys hold while emptying.
 const TABLES = [
+	"webhook_deliveries",
+	"agent_webhooks",
 	"pending_descriptions",
 	"proposals",
 	"admin_bot_config",

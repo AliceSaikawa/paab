@@ -1,16 +1,22 @@
 import {
 	type AdminErrorCode,
 	type ChangeActor,
+	configureAgentWebhook,
 	deleteAgent,
+	deleteAgentWebhook,
 	issueAgentToken,
 	listAgentsWithStatus,
+	listAgentWebhooks,
 	registerAgent,
 	resolveDefaultOwnerId,
 	resumeAgent,
 	revokeAgentTokens,
+	rotateAgentWebhookSecret,
 	suspendAgent,
 	updateAgent,
 } from "../../admin";
+import { allowInsecureLocalhostWebhook } from "../../mcp/config";
+import { WEBHOOK_AUTH_MODES, type WebhookAuthMode } from "../../types";
 import { adminPageResponse, type FlashMessage } from "../layout";
 import type { AdminGetContext, AdminPostContext, AdminRoute } from "../router";
 import {
@@ -19,6 +25,7 @@ import {
 	renderDeleteConfirmBody,
 	renderIssuedTokenBody,
 	renderIssuedUnreadTokenBody,
+	renderRevealedWebhookSecretBody,
 } from "./render";
 
 const AGENTS_PATH = "/admin/agents";
@@ -70,10 +77,14 @@ async function renderAgentsList(
 		registerDraft?: RegisterFormDraft;
 	} = {},
 ): Promise<Response> {
-	const [agents, defaultOwnerId] = await Promise.all([
+	const [agents, defaultOwnerId, webhooks] = await Promise.all([
 		listAgentsWithStatus(ctx.env.DB, ctx.now),
 		resolveDefaultOwnerId(ctx.env.DB),
+		listAgentWebhooks(ctx.env.DB),
 	]);
+	const webhooksByAgentId = new Map(
+		webhooks.map((webhook) => [webhook.agentId, webhook]),
+	);
 	return adminPageResponse(
 		{
 			title: "エージェント",
@@ -83,6 +94,7 @@ async function renderAgentsList(
 			flash: options.flash,
 			body: renderAgentsPageBody({
 				agents,
+				webhooksByAgentId,
 				defaultOwnerId,
 				csrfToken: ctx.csrfToken,
 				registerDraft: options.registerDraft,
@@ -413,6 +425,134 @@ async function handleRevokeUnreadToken(
 	});
 }
 
+async function resolveAgentName(
+	db: D1Database,
+	agentId: string,
+): Promise<string> {
+	const row = await db
+		.prepare("SELECT name FROM agents WHERE id = ?")
+		.bind(agentId)
+		.first<{ name: string }>();
+	return row?.name ?? agentId;
+}
+
+async function handleConfigureWebhook(
+	ctx: AdminPostContext,
+): Promise<Response> {
+	const agentId = ctx.params.id ?? "";
+	const url = ctx.form.get("url") ?? "";
+	const rawAuthMode = ctx.form.get("auth_mode") ?? "";
+	if (!(WEBHOOK_AUTH_MODES as readonly string[]).includes(rawAuthMode)) {
+		return renderAgentsList(ctx, {
+			status: 400,
+			flash: { kind: "error", message: "認証方式が不正です" },
+		});
+	}
+	const authMode = rawAuthMode as WebhookAuthMode;
+	const headerName = ctx.form.get("header_name");
+	const secret = ctx.form.get("secret");
+
+	const result = await configureAgentWebhook(ctx.env.DB, {
+		agentId,
+		url,
+		authMode,
+		headerName,
+		secret,
+		actor: actorFrom(ctx),
+		now: ctx.now,
+		allowInsecureLocalhost: allowInsecureLocalhostWebhook(ctx.env),
+	});
+	if (!result.ok) {
+		return renderAgentsList(ctx, {
+			status: errorStatus(result.code),
+			flash: { kind: "error", message: result.message },
+		});
+	}
+
+	if (result.data.revealedSecret !== null) {
+		const agentName = await resolveAgentName(ctx.env.DB, agentId);
+		return adminPageResponse({
+			title: "Webhook 署名鍵発行",
+			currentPath: AGENTS_PATH,
+			user: ctx.user,
+			devMode: ctx.devMode,
+			flash: {
+				kind: "success",
+				message: `「${agentName}」の Webhook を設定しました`,
+			},
+			body: renderRevealedWebhookSecretBody({
+				agentName,
+				url: result.data.webhook.url,
+				secret: result.data.revealedSecret,
+				rotated: false,
+			}),
+		});
+	}
+
+	return renderAgentsList(ctx, {
+		flash: {
+			kind: "success",
+			message: `Webhook を保存しました（方式: ${result.data.webhook.authMode}）`,
+		},
+	});
+}
+
+async function handleRotateWebhookSecret(
+	ctx: AdminPostContext,
+): Promise<Response> {
+	const agentId = ctx.params.id ?? "";
+	const result = await rotateAgentWebhookSecret(ctx.env.DB, {
+		agentId,
+		actor: actorFrom(ctx),
+		now: ctx.now,
+	});
+	if (!result.ok) {
+		return renderAgentsList(ctx, {
+			status: errorStatus(result.code),
+			flash: { kind: "error", message: result.message },
+		});
+	}
+
+	const agentName = await resolveAgentName(ctx.env.DB, agentId);
+	return adminPageResponse({
+		title: "Webhook 署名鍵ローテーション",
+		currentPath: AGENTS_PATH,
+		user: ctx.user,
+		devMode: ctx.devMode,
+		flash: {
+			kind: "success",
+			message: `「${agentName}」の Webhook 署名鍵をローテーションしました`,
+		},
+		body: renderRevealedWebhookSecretBody({
+			agentName,
+			url: result.data.webhook.url,
+			secret: result.data.revealedSecret,
+			rotated: true,
+		}),
+	});
+}
+
+async function handleDeleteWebhook(ctx: AdminPostContext): Promise<Response> {
+	const result = await deleteAgentWebhook(ctx.env.DB, {
+		agentId: ctx.params.id ?? "",
+		actor: actorFrom(ctx),
+		now: ctx.now,
+	});
+	if (!result.ok) {
+		return renderAgentsList(ctx, {
+			status: errorStatus(result.code),
+			flash: { kind: "error", message: result.message },
+		});
+	}
+
+	return renderAgentsList(ctx, {
+		flash: {
+			kind: "success",
+			message: "Webhook 設定を削除しました",
+		},
+	});
+}
+
 export function agentRoutes(): AdminRoute[] {
 	return [
 		{
@@ -452,6 +592,18 @@ export function agentRoutes(): AdminRoute[] {
 		{
 			pattern: "/admin/agents/:id/unread-token/revoke",
 			post: handleRevokeUnreadToken,
+		},
+		{
+			pattern: "/admin/agents/:id/webhook",
+			post: handleConfigureWebhook,
+		},
+		{
+			pattern: "/admin/agents/:id/webhook/rotate",
+			post: handleRotateWebhookSecret,
+		},
+		{
+			pattern: "/admin/agents/:id/webhook/delete",
+			post: handleDeleteWebhook,
 		},
 	];
 }

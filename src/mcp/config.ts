@@ -5,6 +5,7 @@ export interface McpEnv {
 	DB: D1Database;
 	AUDIT_RECORD_BODIES?: string;
 	AUDIT_BODY_RETENTION_DAYS?: string;
+	WEBHOOK_ALLOW_INSECURE_LOCALHOST?: string;
 }
 
 export function auditBodyConfig(env: McpEnv): AuditBodyConfig {
@@ -12,4 +13,8 @@ export function auditBodyConfig(env: McpEnv): AuditBodyConfig {
 		recordBodies: env.AUDIT_RECORD_BODIES,
 		bodyRetentionDays: env.AUDIT_BODY_RETENTION_DAYS,
 	});
+}
+
+export function allowInsecureLocalhostWebhook(env: McpEnv): boolean {
+	return env.WEBHOOK_ALLOW_INSECURE_LOCALHOST?.trim().toLowerCase() === "true";
 }

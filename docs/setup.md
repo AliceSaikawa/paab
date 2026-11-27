@@ -266,6 +266,7 @@ curl -s https://paab.<サブドメイン>.workers.dev/health
 | `AUDIT_BODY_RETENTION_DAYS` | 記録した本文を保持する日数。正の整数でないと本文は記録されない。期限を過ぎた本文は定期実行で消える（監査ログの行自体は残る）。記録を止めると残っていた本文も次の定期実行で消える | `"30"` |
 | `CF_ACCESS_TEAM_DOMAIN` | Cloudflare Zero Trust のチームドメイン（例: `<チーム名>.cloudflareaccess.com`）。`CF_ACCESS_AUD` と組で設定する | `""` |
 | `CF_ACCESS_AUD` | Cloudflare Access アプリケーションの Application Audience (AUD) Tag | `""` |
+| `WEBHOOK_ALLOW_INSECURE_LOCALHOST` | ローカル試験時のみ `"true"` を設定すると、Webhook 呼び出し先として `http://localhost` / `http://127.0.0.1` / `http://[::1]` を例外許可する。本番の `wrangler.local.jsonc` には設定しない | 未設定（`false`） |
 
 ### 管理画面の保護（Cloudflare Access）
 
@@ -396,6 +397,39 @@ Cloudflare Access（ローカル開発では `ADMIN_DEV_USER`）を設定した�
 
 3. `examples/poll-unread/crontab.example` を参考に、`crontab -e` で 5 分ごとの実行を登録する。
 
+### 新着通知 Webhook の設定（`/admin/agents`）
+
+インバウンド Webhook に対応したエージェント（Grok Bot、Manus・Cue、自前レシーバ等）では、新着時に登録済み URL へ HTTP `POST` を送って即座に起動できる（[設計書 2.3 節](design.md#23-規則)・[起動設計 4.1・4.2 節](agent-trigger-design.md#41-通知の不変条件と発火契機確定提案)）。Webhook の登録・変更・鍵ローテーション・削除は `/admin/agents` から利用者本人だけが行え、`/mcp` や `/mcp/admin` からは操作できない。
+
+1. **送信仕様と不変条件**
+   - 送信ボディは常に固定 JSON `{"event":"inbox_wake"}` のみ（`Content-Type: application/json`）。質問文・回答文・送信元名・カテゴリ・メッセージ ID は一切含めない。レシーバ側は起動後に `check_inbox` を呼んで新着を受け取る。
+   - 宛先が `suspended` 状態のときは送信せず、保留中の配達レコードも破棄する。同一エージェントへの連続新着は保留中 1 件へ集約（coalesce）する。
+   - 発火契機は 4 箇所：`ask` 許可時（宛先へ `ctx.waitUntil` で即時送信）、`ask` 拒否時（質問元へ 60 秒遅延で送信。応答時刻差による拒否理由の判別を防ぐ）、`answer` で回答・拒否時（質問元へ即時送信）、定期実行での質問期限切れ時（質問元へ定期実行内で送信）。
+   - **SSRF 防御**: `https://` のみ許可（ローカル試験で `WEBHOOK_ALLOW_INSECURE_LOCALHOST="true"` を設定した場合のみ `http://localhost`・`http://127.0.0.1`・`http://[::1]` を例外許可）、URL 最大 2048 文字、ユーザー名・パスワード付き URL 拒否、`localhost`・`*.localhost`・`*.local`・`*.internal`・`*.home.arpa`・単一ラベルホスト名拒否、プライベート・ループバック・リンクローカル・CGNAT・文書用・マルチキャスト・予約済み IPv4 / IPv6 および IPv4 射影 IPv6（`::ffff:...`）拒否、`redirect: "manual"` による 3xx リダイレクト拒否、5 秒タイムアウトを適用する。
+   - **再試行方針**: 失敗時（3xx・4xx・5xx・ネットワークエラー・タイムアウト）は最大 3 回（遅延 0 秒・60 秒・300 秒）まで再試行する。3 回失敗すると状態を `abandoned` にして監査ログへ `webhook_abandoned`（理由 `webhook_delivery_failed`）を記録する。送信失敗してもメッセージ本体は D1 の受信箱にそのまま残り、`check_inbox` や `GET /unread` で受け取れる。エラー記録や監査ログ・`change_log` にはシークレットを含めない。
+
+2. **4 つの認証方式（`auth_mode`）とレシーバ側の検証手順**
+   `/admin/agents` の各エージェントカードにある「呼び出し先URL（Webhook）」から、受け手に応じた `auth_mode` を選んで登録する。
+
+   - **`standard_webhooks`（Grok Bot 等・Standard Webhooks 準拠レシーバ）**
+     - 受け手側が発行した `whsec_<base64>` 鍵（Base64 デコード後 16 バイト以上）を登録する（登録後は再表示されない）。
+     - 送信ヘッダー: `webhook-id`（配達 UUID）、`webhook-timestamp`（UNIX 秒）、`webhook-signature`（`v1,<base64>`）。
+     - 検証手順: `webhook-timestamp` が現在時刻の許容範囲内（例: ±5 分）であることを確認し、`whsec_` を除いて Base64 デコードした鍵で `${webhook-id}.${webhook-timestamp}.${raw_body}` の HMAC-SHA256 を計算し、Base64 エンコード結果が `webhook-signature` の `v1,` 以降と定数時間比較で一致することを確かめる。
+   - **`bearer_header`（Manus・Cue Webhook Trigger 等）**
+     - 受け手側が発行したシークレットトークンを登録する（登録後は再表示されない）。
+     - 送信ヘッダー: `Authorization: Bearer <secret>`。
+     - 検証手順: `Authorization` ヘッダーが `Bearer ` で始まり、続く値が登録済みトークンと定数時間比較で一致することを確かめる。
+   - **`custom_header`（任意ヘッダー認証の Webhook Trigger や外部アダプタ）**
+     - 受け手側が指定するヘッダー名（英数字とハイフンのみ、1〜64 文字、`Host`・`Content-Length`・`Content-Type`・`Connection`・`Transfer-Encoding`・`Origin`・`Cookie`・`User-Agent` や `cf-*`・`x-forwarded-*`・`sec-*`・`proxy-*` 等の禁止ヘッダー不可）とシークレット値を登録する（登録後は再表示されない）。
+     - 送信ヘッダー: `<header_name>: <secret>`。
+     - 検証手順: 指定したヘッダーの値が登録済みシークレットと定数時間比較で一致することを確かめる。
+   - **`paab_hmac`（自前レシーバ向け・paab 自動生成鍵）**
+     - 初回設定時・他方式からの切替時・ローテーション時に paab が `paab_whsec_<64 hex>` 鍵を自動生成し、画面に**一度だけ**表示する（`Cache-Control: no-store`）。
+     - 送信ヘッダー: `X-Paab-Timestamp`（UNIX 秒）、`X-Paab-Signature`（`sha256=<64 hex>`）。
+     - 検証手順: `X-Paab-Timestamp` が許容範囲内（例: ±5 分）であることを確認し、鍵文字列（`paab_whsec_...` 全体）の UTF-8 バイト列を鍵として `${X-Paab-Timestamp}.${raw_body}` の HMAC-SHA256 を計算し、小文字 16 進数文字列が `X-Paab-Signature` の `sha256=` 以降と定数時間比較で一致することを確かめる。
+
+   外部認証方式で同じ `auth_mode` のまま URL だけを変更したい場合は、シークレット欄を空欄で保存すると既存のシークレットが維持される。`paab_hmac` の鍵を差し替えたい場合は「署名鍵をローテーション」を実行する。
+
 ### 新しい版への更新
 
 新しい版を取り込むときは、更新された `wrangler.jsonc` との差分（`compatibility_date`、bindings、`vars`、`triggers.crons` の追加など）を先に `wrangler.local.jsonc` へ反映し、`database_id` と自分の `vars` を保ったままマイグレーションを適用してデプロイする。
@@ -410,7 +444,15 @@ npm run deploy
 
 ### 定期実行
 
-デプロイされた Worker は、`triggers.crons` の `0 * * * *` で1時間ごとに定期実行を行う。内容は、期限切れになった質問を期限切れとして処理して監査ログに記録すること、受け取りから24時間を過ぎたメッセージ本文および一度も受け取られずに期限切れになった質問の本文を消すこと（設計書 4 節）、ならびに保持期間を過ぎた監査ログの本文を消すことである。ローカルでは定期実行は自動で動かない。ローカルでの確かめ方は「2つのクライアントで質問応答を試す」の「期限切れ」を参照。
+デプロイされた Worker は、`triggers.crons` の `* * * * *` で 1 分ごとに定期実行を行う。各処理は互いに障害分離されており、1 つが失敗しても他の処理は継続する。内容は次のとおり。
+
+- 期限切れになった質問を期限切れとして処理し、監査ログへ記録して質問元エージェントへの通知（Webhook）を登録すること。
+- 受け取りから 24 時間を過ぎたメッセージ本文および一度も受け取られずに期限切れになった質問の本文を消すこと（設計書 4 節）。
+- 保持期間を過ぎた監査ログの本文を消すこと。
+- 期限切れになった管理者ボットからの提案を `expired` にすること。
+- 送信予定時刻に達した保留中 Webhook 配達（再試行や拒否質問の 60 秒遅延通知を含む）を実行し、`suspended` 状態または未設定エージェントの保留中配達を破棄すること。
+
+ローカルでは定期実行は自動で動かない。ローカルでの確かめ方は「2つのクライアントで質問応答を試す」の「期限切れ」を参照。
 
 ## 依存と Actions の更新
 

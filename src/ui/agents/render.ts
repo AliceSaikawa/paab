@@ -1,6 +1,7 @@
-import type { AgentWithStatus } from "../../admin";
+import type { AgentWebhookSummary, AgentWithStatus } from "../../admin";
+import type { WebhookAuthMode, WebhookDeliveryStatus } from "../../types";
 import { csrfInput } from "../csrf";
-import { html, type SafeHtml } from "../html";
+import { html, rawHtml, type SafeHtml } from "../html";
 import { formatTimestamp } from "../layout";
 
 export interface RegisterFormDraft {
@@ -22,6 +23,197 @@ export interface IssuedUnreadTokenView {
 	token: string;
 	revokedPrevious: boolean;
 	unreadUrl: string;
+}
+
+export interface RevealedWebhookSecretView {
+	agentName: string;
+	url: string;
+	secret: string;
+	rotated: boolean;
+}
+
+const WEBHOOK_AUTH_MODE_OPTIONS: ReadonlyArray<{
+	value: WebhookAuthMode;
+	label: string;
+}> = [
+	{
+		value: "standard_webhooks",
+		label: "Standard Webhooks (standard_webhooks / Grok Bot 等)",
+	},
+	{
+		value: "bearer_header",
+		label: "Bearer 認証ヘッダー (bearer_header / Manus・Cue 等)",
+	},
+	{
+		value: "custom_header",
+		label: "任意ヘッダー (custom_header)",
+	},
+	{
+		value: "paab_hmac",
+		label: "paab 独自 HMAC (paab_hmac / 鍵を自動生成)",
+	},
+];
+
+function renderDeliveryStatusBadge(status: WebhookDeliveryStatus): SafeHtml {
+	switch (status) {
+		case "delivered":
+			return html`<span class="badge badge-ok">配達済</span>`;
+		case "pending":
+			return html`<span class="badge">待機中</span>`;
+		case "abandoned":
+			return html`<span class="badge badge-danger">放棄</span>`;
+	}
+}
+
+function renderWebhookSection(
+	entry: AgentWithStatus,
+	webhook: AgentWebhookSummary | null,
+	csrfToken: string,
+): SafeHtml {
+	const { agent } = entry;
+	const urlInputId = `webhook-url-${agent.id}`;
+	const modeInputId = `webhook-auth-mode-${agent.id}`;
+	const headerInputId = `webhook-header-name-${agent.id}`;
+	const secretInputId = `webhook-secret-${agent.id}`;
+	const selectedMode: WebhookAuthMode =
+		webhook?.authMode ?? "standard_webhooks";
+	const latest = webhook?.latestDelivery ?? null;
+
+	return html`
+		<div class="stack">
+			<div>
+				<strong>呼び出し先URL（Webhook）:</strong>
+				${
+					webhook === null
+						? html`<span class="badge">未設定</span>`
+						: html`<span class="badge badge-ok">設定済み</span>`
+				}
+			</div>
+
+			${
+				webhook !== null
+					? html`
+						<div class="muted stack">
+							<div>
+								URL: <code>${webhook.url}</code> / 認証方式: <code>${webhook.authMode}</code>${
+									webhook.authMode === "custom_header" &&
+									webhook.headerName !== null
+										? html` / ヘッダー名: <code>${webhook.headerName}</code>`
+										: false
+								}
+							</div>
+							${
+								latest !== null
+									? html`
+										<div>
+											最新配達: ${renderDeliveryStatusBadge(latest.status)}
+											（試行 ${latest.attempts} 回 / 更新: ${formatTimestamp(latest.updatedAt)}${
+												latest.status === "pending"
+													? html` / 次回予定: ${formatTimestamp(latest.nextAttemptAt)}`
+													: false
+											}）
+											${
+												latest.lastError !== null
+													? html`<div>最終エラー: <code>${latest.lastError}</code></div>`
+													: false
+											}
+										</div>
+									`
+									: html`<div>最新配達: まだ送信履歴はありません</div>`
+							}
+						</div>
+					`
+					: false
+			}
+
+			<form method="POST" action="${agentActionPath(agent.id, "/webhook")}">
+				${csrfInput(csrfToken)}
+				<div class="field">
+					<label for="${urlInputId}">呼び出し先 URL（HTTPS）</label>
+					<input
+						id="${urlInputId}"
+						type="url"
+						name="url"
+						maxlength="2048"
+						required
+						placeholder="https://example.com/webhook"
+						value="${webhook?.url ?? ""}"
+					>
+				</div>
+				<div class="grid">
+					<div class="field">
+						<label for="${modeInputId}">認証方式（<code>auth_mode</code>）</label>
+						<select id="${modeInputId}" name="auth_mode" required>
+							${WEBHOOK_AUTH_MODE_OPTIONS.map(
+								(option) => html`
+									<option
+										value="${option.value}"${selectedMode === option.value ? rawHtml(" selected") : false}
+									>
+										${option.label}
+									</option>
+								`,
+							)}
+						</select>
+					</div>
+					<div class="field">
+						<label for="${headerInputId}">カスタムヘッダー名（<code>custom_header</code> のみ）</label>
+						<input
+							id="${headerInputId}"
+							type="text"
+							name="header_name"
+							maxlength="64"
+							placeholder="X-Webhook-Token"
+							value="${webhook?.headerName ?? ""}"
+						>
+					</div>
+				</div>
+				<div class="field">
+					<label for="${secretInputId}">認証シークレット（外部認証方式用）</label>
+					<input
+						id="${secretInputId}"
+						type="password"
+						name="secret"
+						maxlength="2048"
+						autocomplete="new-password"
+						placeholder="${
+							webhook !== null && webhook.authMode !== "paab_hmac"
+								? "変更する場合のみ入力（空欄で既存の秘密値を維持）"
+								: "standard_webhooks は whsec_... / paab_hmac は空欄で自動生成"
+						}"
+					>
+					<div class="muted">
+						外部発行シークレットは登録後に再表示されません。<code>paab_hmac</code> は paab 側で <code>paab_whsec_</code> 鍵を自動生成し、生成・ローテーション時に一度だけ表示します。
+					</div>
+				</div>
+				<div class="actions">
+					<button type="submit" class="btn btn-primary">Webhook を保存</button>
+				</div>
+			</form>
+
+			${
+				webhook !== null
+					? html`
+						<div class="actions">
+							${
+								webhook.authMode === "paab_hmac"
+									? html`
+										<form class="inline-form" method="POST" action="${agentActionPath(agent.id, "/webhook/rotate")}">
+											${csrfInput(csrfToken)}
+											<button type="submit" class="btn">署名鍵をローテーション</button>
+										</form>
+									`
+									: false
+							}
+							<form class="inline-form" method="POST" action="${agentActionPath(agent.id, "/webhook/delete")}">
+								${csrfInput(csrfToken)}
+								<button type="submit" class="btn btn-danger">Webhook を削除</button>
+							</form>
+						</div>
+					`
+					: false
+			}
+		</div>
+	`;
 }
 
 function agentActionPath(agentId: string, suffix = ""): string {
@@ -128,7 +320,11 @@ function renderUnreadTokenSection(
 	`;
 }
 
-function renderAgentCard(entry: AgentWithStatus, csrfToken: string): SafeHtml {
+function renderAgentCard(
+	entry: AgentWithStatus,
+	webhook: AgentWebhookSummary | null,
+	csrfToken: string,
+): SafeHtml {
 	const { agent, todayQuestionCount } = entry;
 	const descInputId = `agent-description-${agent.id}`;
 	const limitInputId = `agent-limit-${agent.id}`;
@@ -188,6 +384,8 @@ function renderAgentCard(entry: AgentWithStatus, csrfToken: string): SafeHtml {
 
 			${renderUnreadTokenSection(entry, csrfToken)}
 
+			${renderWebhookSection(entry, webhook, csrfToken)}
+
 			<div class="actions">
 				${statusForm}
 				<a class="btn btn-danger" href="${agentActionPath(agent.id, "/delete")}">削除…</a>
@@ -198,6 +396,7 @@ function renderAgentCard(entry: AgentWithStatus, csrfToken: string): SafeHtml {
 
 export function renderAgentsPageBody(options: {
 	agents: readonly AgentWithStatus[];
+	webhooksByAgentId?: ReadonlyMap<string, AgentWebhookSummary>;
 	defaultOwnerId: string;
 	csrfToken: string;
 	registerDraft?: RegisterFormDraft;
@@ -217,7 +416,11 @@ export function renderAgentsPageBody(options: {
 				</section>
 			`
 			: options.agents.map((entry) =>
-					renderAgentCard(entry, options.csrfToken),
+					renderAgentCard(
+						entry,
+						options.webhooksByAgentId?.get(entry.agent.id) ?? null,
+						options.csrfToken,
+					),
 				);
 
 	return html`
@@ -402,6 +605,50 @@ export function renderIssuedUnreadTokenBody(
 					<ul>
 						<li>呼び出し先: <code>GET ${view.unreadUrl}</code></li>
 						<li>ヘッダー: <code>Authorization: Bearer &lt;コピーしたトークン&gt;</code></li>
+					</ul>
+				</div>
+				<div class="actions">
+					<a class="btn btn-primary" href="/admin/agents">エージェント一覧へ戻る</a>
+				</div>
+			</section>
+		</div>
+	`;
+}
+
+export function renderRevealedWebhookSecretBody(
+	view: RevealedWebhookSecretView,
+): SafeHtml {
+	return html`
+		<div class="stack">
+			<div>
+				<h1>${view.rotated ? "Webhook 署名鍵をローテーションしました" : "Webhook 署名鍵を発行しました"}</h1>
+				<p class="muted">対象エージェント: <strong>${view.agentName}</strong></p>
+			</div>
+
+			${
+				view.rotated
+					? html`
+						<div class="banner banner-warning" role="status">
+							以前の署名鍵は直ちに置き換わりました。レシーバ側の検証鍵を新しい鍵へ更新してください。
+						</div>
+					`
+					: false
+			}
+
+			<section class="card stack">
+				<div class="banner banner-info">
+					この署名鍵はセキュリティ上、今この画面に一度だけ表示されます。画面を閉じると再表示できないため、今すぐ安全な場所へ控えてください。
+				</div>
+				<div class="token-box">${view.secret}</div>
+				<div>
+					<p>
+						paab は新着時に次の固定ペイロードを <code>POST</code> します（メッセージ本文や送信元情報は含みません）。
+					</p>
+					<ul>
+						<li>呼び出し先 URL: <code>${view.url}</code></li>
+						<li>認証方式: <code>paab_hmac</code></li>
+						<li>ボディ: <code>{"event":"inbox_wake"}</code></li>
+						<li>署名ヘッダー: <code>X-Paab-Timestamp</code>（UNIX秒）と <code>X-Paab-Signature: sha256=&lt;hex&gt;</code>（<code>&lt;timestamp&gt;.&lt;raw_body&gt;</code> の HMAC-SHA256）</li>
 					</ul>
 				</div>
 				<div class="actions">

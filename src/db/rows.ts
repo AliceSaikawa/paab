@@ -2,6 +2,7 @@ import {
 	type AdminBotConfig,
 	AGENT_STATUSES,
 	type Agent,
+	type AgentWebhook,
 	type AllowRule,
 	AUDIT_EVENT_TYPES,
 	AUDIT_OUTCOMES,
@@ -23,6 +24,9 @@ import {
 	REASON_CODES,
 	TOKEN_PURPOSES,
 	type Token,
+	WEBHOOK_AUTH_MODES,
+	WEBHOOK_DELIVERY_STATUSES,
+	type WebhookDelivery,
 } from "../types";
 
 /*
@@ -134,6 +138,27 @@ export interface PendingDescriptionRow {
 	agent_id: string;
 	description: string;
 	submitted_at: number;
+}
+
+export interface AgentWebhookRow {
+	agent_id: string;
+	url: string;
+	auth_mode: string;
+	header_name: string | null;
+	secret: string;
+	created_at: number;
+	updated_at: number;
+}
+
+export interface WebhookDeliveryRow {
+	id: string;
+	agent_id: string;
+	status: string;
+	attempts: number;
+	next_attempt_at: number;
+	last_error: string | null;
+	created_at: number;
+	updated_at: number;
 }
 
 /** Narrows a stored string to one of the known values, or throws. */
@@ -356,5 +381,67 @@ export function pendingDescriptionFromRow(
 		agentId: row.agent_id,
 		description: row.description,
 		submittedAt: row.submitted_at,
+	};
+}
+
+export function agentWebhookFromRow(row: AgentWebhookRow): AgentWebhook {
+	const authMode = oneOf(
+		WEBHOOK_AUTH_MODES,
+		row.auth_mode,
+		"agent_webhooks.auth_mode",
+	);
+	if (authMode === "custom_header") {
+		if (row.header_name === null || row.header_name.trim().length === 0) {
+			throw new Error(
+				"agent_webhooks.header_name is required for custom_header",
+			);
+		}
+		return {
+			agentId: row.agent_id,
+			url: row.url,
+			authMode,
+			headerName: row.header_name,
+			secret: row.secret,
+			createdAt: row.created_at,
+			updatedAt: row.updated_at,
+		};
+	}
+	if (row.header_name !== null) {
+		throw new Error(
+			`agent_webhooks.header_name must be null for auth_mode ${authMode}`,
+		);
+	}
+	return {
+		agentId: row.agent_id,
+		url: row.url,
+		authMode,
+		secret: row.secret,
+		createdAt: row.created_at,
+		updatedAt: row.updated_at,
+	};
+}
+
+export function webhookDeliveryFromRow(
+	row: WebhookDeliveryRow,
+): WebhookDelivery {
+	const status = oneOf(
+		WEBHOOK_DELIVERY_STATUSES,
+		row.status,
+		"webhook_deliveries.status",
+	);
+	if (!Number.isSafeInteger(row.attempts) || row.attempts < 0) {
+		throw new Error(
+			`Invalid value in webhook_deliveries.attempts: ${row.attempts}`,
+		);
+	}
+	return {
+		id: row.id,
+		agentId: row.agent_id,
+		status,
+		attempts: row.attempts,
+		nextAttemptAt: row.next_attempt_at,
+		lastError: row.last_error,
+		createdAt: row.created_at,
+		updatedAt: row.updated_at,
 	};
 }

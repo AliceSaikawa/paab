@@ -146,6 +146,25 @@ describe("recordAuditEvent", () => {
 				outcome: "ok",
 				reason: null,
 			},
+			{
+				event: {
+					occurredAt: T0 + 11,
+					eventType: "webhook_delivered",
+					toAgentId: "agent-b",
+				},
+				outcome: "ok",
+				reason: null,
+			},
+			{
+				event: {
+					occurredAt: T0 + 12,
+					eventType: "webhook_abandoned",
+					toAgentId: "agent-b",
+					reasonCode: "webhook_delivery_failed",
+				},
+				outcome: "denied",
+				reason: "webhook_delivery_failed",
+			},
 		];
 
 	it("has a case for every event type", () => {

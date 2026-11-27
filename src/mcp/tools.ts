@@ -15,6 +15,11 @@ import {
 	submitQuestion,
 } from "../inbox";
 import {
+	notifyAgentImmediately,
+	scheduleDelayedWake,
+	type WebhookFetcher,
+} from "../notify";
+import {
 	checkQuestion,
 	DESCRIPTION_MAX_LENGTH,
 	descriptionProblem,
@@ -36,6 +41,9 @@ export interface McpContext {
 	agent: Agent;
 	audit: AuditBodyConfig;
 	now: UnixMillis;
+	waitUntil?: (promise: Promise<unknown>) => void;
+	webhookFetcher?: WebhookFetcher;
+	allowInsecureLocalhostWebhook?: boolean;
 }
 
 export interface ToolOutput {
@@ -138,6 +146,14 @@ const ask = defineTool({
 				messageId: questionId,
 				body: question,
 			});
+			await notifyAgentImmediately(ctx.db, {
+				agentId: decision.toAgentId,
+				now: ctx.now,
+				audit: ctx.audit,
+				waitUntil: ctx.waitUntil,
+				fetcher: ctx.webhookFetcher,
+				allowInsecureLocalhost: ctx.allowInsecureLocalhostWebhook,
+			});
 		} else {
 			({ questionId } = await recordBlockedQuestion(ctx.db, {
 				fromAgentId: ctx.agent.id,
@@ -153,6 +169,10 @@ const ask = defineTool({
 				categoryId: decision.categoryId,
 				reasonCode: decision.reasonCode,
 				messageId: questionId,
+			});
+			await scheduleDelayedWake(ctx.db, {
+				agentId: ctx.agent.id,
+				now: ctx.now,
 			});
 		}
 		// Identical for accepted and blocked questions, so that the asker
@@ -315,6 +335,14 @@ const answer = defineTool({
 			categoryId: result.categoryId,
 			messageId: question_id,
 			body: reply.kind === "answer" ? reply.body : null,
+		});
+		await notifyAgentImmediately(ctx.db, {
+			agentId: result.askerAgentId,
+			now: ctx.now,
+			audit: ctx.audit,
+			waitUntil: ctx.waitUntil,
+			fetcher: ctx.webhookFetcher,
+			allowInsecureLocalhost: ctx.allowInsecureLocalhostWebhook,
 		});
 		return ok(
 			reply.kind === "answer"

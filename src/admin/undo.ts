@@ -204,6 +204,9 @@ export function changedAgentFields(
 		case "admin_bot_cleared":
 		case "admin_bot_switches_updated":
 		case "description_rejected":
+		case "webhook_configured":
+		case "webhook_secret_rotated":
+		case "webhook_deleted":
 		case "change_reverted":
 			return EMPTY_AGENT_FIELDS;
 	}

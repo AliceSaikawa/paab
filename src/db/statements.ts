@@ -1,5 +1,6 @@
 import type {
 	Agent,
+	AgentWebhook,
 	AllowRule,
 	Category,
 	Message,
@@ -8,6 +9,7 @@ import type {
 	PendingDescription,
 	Proposal,
 	Token,
+	WebhookDelivery,
 } from "../types";
 
 /*
@@ -191,4 +193,56 @@ export function upsertPendingDescription(
 				submitted_at = excluded.submitted_at`,
 		)
 		.bind(pending.agentId, pending.description, pending.submittedAt);
+}
+
+export function upsertAgentWebhook(
+	db: D1Database,
+	webhook: AgentWebhook,
+): D1PreparedStatement {
+	const headerName =
+		webhook.authMode === "custom_header" ? webhook.headerName : null;
+	return db
+		.prepare(
+			`INSERT INTO agent_webhooks
+				(agent_id, url, auth_mode, header_name, secret, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT (agent_id) DO UPDATE SET
+				url = excluded.url,
+				auth_mode = excluded.auth_mode,
+				header_name = excluded.header_name,
+				secret = excluded.secret,
+				updated_at = excluded.updated_at`,
+		)
+		.bind(
+			webhook.agentId,
+			webhook.url,
+			webhook.authMode,
+			headerName,
+			webhook.secret,
+			webhook.createdAt,
+			webhook.updatedAt,
+		);
+}
+
+export function insertWebhookDelivery(
+	db: D1Database,
+	delivery: WebhookDelivery,
+): D1PreparedStatement {
+	return db
+		.prepare(
+			`INSERT INTO webhook_deliveries
+				(id, agent_id, status, attempts, next_attempt_at, last_error,
+				created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		)
+		.bind(
+			delivery.id,
+			delivery.agentId,
+			delivery.status,
+			delivery.attempts,
+			delivery.nextAttemptAt,
+			delivery.lastError,
+			delivery.createdAt,
+			delivery.updatedAt,
+		);
 }

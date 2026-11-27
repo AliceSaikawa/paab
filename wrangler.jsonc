@@ -20,6 +20,6 @@
 		"CF_ACCESS_AUD": ""
 	},
 	"triggers": {
-		"crons": ["0 * * * *"]
+		"crons": ["* * * * *"]
 	}
 }

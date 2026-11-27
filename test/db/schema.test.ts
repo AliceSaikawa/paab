@@ -3,10 +3,12 @@ import { beforeEach, describe, expect, it } from "vitest";
 import {
 	type AdminBotConfigRow,
 	type AgentRow,
+	type AgentWebhookRow,
 	type AllowRuleRow,
 	type AuditLogRow,
 	adminBotConfigFromRow,
 	agentFromRow,
+	agentWebhookFromRow,
 	allowRuleFromRow,
 	auditLogEntryFromRow,
 	type CategoryRow,
@@ -22,6 +24,7 @@ import {
 	insertMessage,
 	insertProposal,
 	insertToken,
+	insertWebhookDelivery,
 	type MessageRow,
 	messageFromRow,
 	newId,
@@ -32,10 +35,14 @@ import {
 	proposalFromRow,
 	type TokenRow,
 	tokenFromRow,
+	upsertAgentWebhook,
 	upsertPendingDescription,
+	type WebhookDeliveryRow,
+	webhookDeliveryFromRow,
 } from "../../src/db";
 import type {
 	Agent,
+	AgentWebhook,
 	AllowRule,
 	Message,
 	NewAuditLogEntry,
@@ -43,6 +50,7 @@ import type {
 	PendingDescription,
 	Proposal,
 	Token,
+	WebhookDelivery,
 } from "../../src/types";
 import { createTestDb, migrationByName } from "../helpers/db";
 import { DAY_MS, seedAgent, seedCategory, T0 } from "../helpers/fixtures";
@@ -112,6 +120,7 @@ describe("test database helper", () => {
 		const tables = results.map((row) => row.name);
 		expect(tables).toEqual([
 			"admin_bot_config",
+			"agent_webhooks",
 			"agents",
 			"allow_rules",
 			"audit_log",
@@ -121,6 +130,7 @@ describe("test database helper", () => {
 			"pending_descriptions",
 			"proposals",
 			"tokens",
+			"webhook_deliveries",
 		]);
 		for (const table of tables) {
 			const count = await db
@@ -684,6 +694,8 @@ describe("migrations", () => {
 
 	it("preserves all existing tables when migrating a populated database from 0002 to 0003 and enforces change_log constraints", async () => {
 		await db.batch([
+			db.prepare("DROP TABLE IF EXISTS webhook_deliveries"),
+			db.prepare("DROP TABLE IF EXISTS agent_webhooks"),
 			db.prepare("DROP TABLE IF EXISTS pending_descriptions"),
 			db.prepare("DROP TABLE IF EXISTS proposals"),
 			db.prepare("DROP TABLE IF EXISTS admin_bot_config"),
@@ -839,6 +851,8 @@ describe("migrations", () => {
 
 	it("preserves all existing tables when migrating a populated database from 0003 to 0004 and enforces admin_bot_config constraints", async () => {
 		await db.batch([
+			db.prepare("DROP TABLE IF EXISTS webhook_deliveries"),
+			db.prepare("DROP TABLE IF EXISTS agent_webhooks"),
 			db.prepare("DROP TABLE IF EXISTS pending_descriptions"),
 			db.prepare("DROP TABLE IF EXISTS proposals"),
 			db.prepare("DROP TABLE IF EXISTS admin_bot_config"),
@@ -1011,6 +1025,8 @@ describe("migrations", () => {
 
 	it("preserves all existing tables when migrating a populated database from 0004 to 0005 and enforces proposals constraints", async () => {
 		await db.batch([
+			db.prepare("DROP TABLE IF EXISTS webhook_deliveries"),
+			db.prepare("DROP TABLE IF EXISTS agent_webhooks"),
 			db.prepare("DROP TABLE IF EXISTS pending_descriptions"),
 			db.prepare("DROP TABLE IF EXISTS proposals"),
 			db.prepare("DROP TABLE IF EXISTS admin_bot_config"),
@@ -1157,6 +1173,8 @@ describe("migrations", () => {
 
 	it("preserves all existing tables when migrating a populated database from 0005 to 0006 and enforces pending_descriptions constraints", async () => {
 		await db.batch([
+			db.prepare("DROP TABLE IF EXISTS webhook_deliveries"),
+			db.prepare("DROP TABLE IF EXISTS agent_webhooks"),
 			db.prepare("DROP TABLE IF EXISTS pending_descriptions"),
 			db.prepare("DROP TABLE IF EXISTS proposals"),
 			db.prepare("DROP TABLE IF EXISTS admin_bot_config"),
@@ -1508,6 +1526,8 @@ describe("migration 0002 on populated data", () => {
 		const m0002 = migrationByName("0002_cascade_message_references.sql");
 
 		for (const table of [
+			"webhook_deliveries",
+			"agent_webhooks",
 			"pending_descriptions",
 			"proposals",
 			"admin_bot_config",
@@ -1569,5 +1589,361 @@ describe("migration 0002 on populated data", () => {
 			.prepare("SELECT COUNT(*) AS n FROM messages")
 			.first<{ n: number }>();
 		expect(remaining?.n).toBe(0);
+	});
+});
+
+describe("agent_webhooks and webhook_deliveries (migration 0007)", () => {
+	it("stores, upserts, maps, and cascades agent_webhooks across all 4 auth modes", async () => {
+		const a = await seedAgent(db, { name: "muse" });
+		const b = await seedAgent(db, { name: "grok" });
+		const c = await seedAgent(db, { name: "cue" });
+		const d = await seedAgent(db, { name: "custom" });
+
+		const webhooks: AgentWebhook[] = [
+			{
+				agentId: a.id,
+				url: "https://hooks.example.com/a",
+				authMode: "standard_webhooks",
+				secret: "whsec_MDEyMzQ1Njc4OWFiY2RlZg==",
+				createdAt: T0,
+				updatedAt: T0,
+			},
+			{
+				agentId: b.id,
+				url: "https://hooks.example.com/b",
+				authMode: "bearer_header",
+				secret: "bearer-secret",
+				createdAt: T0,
+				updatedAt: T0,
+			},
+			{
+				agentId: c.id,
+				url: "https://hooks.example.com/c",
+				authMode: "custom_header",
+				headerName: "X-Wake-Key",
+				secret: "custom-secret",
+				createdAt: T0,
+				updatedAt: T0,
+			},
+			{
+				agentId: d.id,
+				url: "https://hooks.example.com/d",
+				authMode: "paab_hmac",
+				secret: `paab_whsec_${"ab".repeat(32)}`,
+				createdAt: T0,
+				updatedAt: T0,
+			},
+		];
+
+		await db.batch(webhooks.map((w) => upsertAgentWebhook(db, w)));
+
+		for (const expected of webhooks) {
+			const row = await db
+				.prepare("SELECT * FROM agent_webhooks WHERE agent_id = ?")
+				.bind(expected.agentId)
+				.first<AgentWebhookRow>();
+			expect(row).not.toBeNull();
+			expect(agentWebhookFromRow(row as AgentWebhookRow)).toEqual(expected);
+		}
+
+		// Upsert preserves created_at and updates fields.
+		await upsertAgentWebhook(db, {
+			agentId: c.id,
+			url: "https://hooks.example.com/c2",
+			authMode: "bearer_header",
+			secret: "new-bearer",
+			createdAt: T0 + 999,
+			updatedAt: T0 + 50,
+		}).run();
+		const updatedRow = await db
+			.prepare("SELECT * FROM agent_webhooks WHERE agent_id = ?")
+			.bind(c.id)
+			.first<AgentWebhookRow>();
+		expect(agentWebhookFromRow(updatedRow as AgentWebhookRow)).toEqual({
+			agentId: c.id,
+			url: "https://hooks.example.com/c2",
+			authMode: "bearer_header",
+			secret: "new-bearer",
+			createdAt: T0,
+			updatedAt: T0 + 50,
+		});
+
+		// Deleting the agent cascades to agent_webhooks.
+		await db.prepare("DELETE FROM agents WHERE id = ?").bind(a.id).run();
+		const afterDelete = await db
+			.prepare("SELECT * FROM agent_webhooks WHERE agent_id = ?")
+			.bind(a.id)
+			.first<AgentWebhookRow>();
+		expect(afterDelete).toBeNull();
+	});
+
+	it("enforces CHECK constraints on agent_webhooks", async () => {
+		const a = await seedAgent(db, { name: "agent-check" });
+
+		// Invalid auth_mode rejected.
+		await expect(
+			db
+				.prepare(
+					`INSERT INTO agent_webhooks
+						(agent_id, url, auth_mode, header_name, secret, created_at, updated_at)
+					VALUES (?, ?, ?, ?, ?, ?, ?)`,
+				)
+				.bind(a.id, "https://example.com/h", "invalid", null, "sec", T0, T0)
+				.run(),
+		).rejects.toThrow(/CHECK/);
+
+		// custom_header without header_name rejected.
+		await expect(
+			db
+				.prepare(
+					`INSERT INTO agent_webhooks
+						(agent_id, url, auth_mode, header_name, secret, created_at, updated_at)
+					VALUES (?, ?, ?, ?, ?, ?, ?)`,
+				)
+				.bind(
+					a.id,
+					"https://example.com/h",
+					"custom_header",
+					null,
+					"sec",
+					T0,
+					T0,
+				)
+				.run(),
+		).rejects.toThrow(/CHECK/);
+
+		// non-custom_header with non-null header_name rejected.
+		await expect(
+			db
+				.prepare(
+					`INSERT INTO agent_webhooks
+						(agent_id, url, auth_mode, header_name, secret, created_at, updated_at)
+					VALUES (?, ?, ?, ?, ?, ?, ?)`,
+				)
+				.bind(
+					a.id,
+					"https://example.com/h",
+					"bearer_header",
+					"X-Extra",
+					"sec",
+					T0,
+					T0,
+				)
+				.run(),
+		).rejects.toThrow(/CHECK/);
+	});
+
+	it("enforces agentWebhookFromRow and webhookDeliveryFromRow validation", () => {
+		expect(() =>
+			agentWebhookFromRow({
+				agent_id: "a1",
+				url: "https://example.com",
+				auth_mode: "unknown",
+				header_name: null,
+				secret: "sec",
+				created_at: T0,
+				updated_at: T0,
+			}),
+		).toThrow(/auth_mode/);
+
+		expect(() =>
+			agentWebhookFromRow({
+				agent_id: "a1",
+				url: "https://example.com",
+				auth_mode: "custom_header",
+				header_name: null,
+				secret: "sec",
+				created_at: T0,
+				updated_at: T0,
+			}),
+		).toThrow(/header_name/);
+
+		expect(() =>
+			agentWebhookFromRow({
+				agent_id: "a1",
+				url: "https://example.com",
+				auth_mode: "paab_hmac",
+				header_name: "X-Unexpected",
+				secret: "sec",
+				created_at: T0,
+				updated_at: T0,
+			}),
+		).toThrow(/header_name/);
+
+		expect(() =>
+			webhookDeliveryFromRow({
+				id: "d1",
+				agent_id: "a1",
+				status: "bogus",
+				attempts: 0,
+				next_attempt_at: T0,
+				last_error: null,
+				created_at: T0,
+				updated_at: T0,
+			}),
+		).toThrow(/status/);
+
+		expect(() =>
+			webhookDeliveryFromRow({
+				id: "d1",
+				agent_id: "a1",
+				status: "pending",
+				attempts: -1,
+				next_attempt_at: T0,
+				last_error: null,
+				created_at: T0,
+				updated_at: T0,
+			}),
+		).toThrow(/attempts/);
+	});
+
+	it("enforces partial unique pending index, CHECK constraints, due index, and cascade on webhook_deliveries", async () => {
+		const a = await seedAgent(db, { name: "agent-deliv" });
+
+		const d1: WebhookDelivery = {
+			id: newId(),
+			agentId: a.id,
+			status: "pending",
+			attempts: 0,
+			nextAttemptAt: T0,
+			lastError: null,
+			createdAt: T0,
+			updatedAt: T0,
+		};
+		await insertWebhookDelivery(db, d1).run();
+
+		// Duplicate pending row for same agent fails unique partial index.
+		await expect(
+			insertWebhookDelivery(db, {
+				...d1,
+				id: newId(),
+			}).run(),
+		).rejects.toThrow(/UNIQUE/);
+
+		// Non-pending rows for the same agent are allowed alongside pending.
+		const d2: WebhookDelivery = {
+			id: newId(),
+			agentId: a.id,
+			status: "delivered",
+			attempts: 1,
+			nextAttemptAt: T0 - 10,
+			lastError: null,
+			createdAt: T0 - 10,
+			updatedAt: T0 - 10,
+		};
+		const d3: WebhookDelivery = {
+			id: newId(),
+			agentId: a.id,
+			status: "abandoned",
+			attempts: 3,
+			nextAttemptAt: T0 - 20,
+			lastError: "HTTP 500",
+			createdAt: T0 - 20,
+			updatedAt: T0 - 20,
+		};
+		await db.batch([
+			insertWebhookDelivery(db, d2),
+			insertWebhookDelivery(db, d3),
+		]);
+
+		const row1 = await db
+			.prepare("SELECT * FROM webhook_deliveries WHERE id = ?")
+			.bind(d1.id)
+			.first<WebhookDeliveryRow>();
+		expect(webhookDeliveryFromRow(row1 as WebhookDeliveryRow)).toEqual(d1);
+
+		// Invalid status / negative attempts fail CHECK.
+		await expect(
+			db
+				.prepare(
+					`INSERT INTO webhook_deliveries
+						(id, agent_id, status, attempts, next_attempt_at, last_error, created_at, updated_at)
+					VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+				)
+				.bind(newId(), a.id, "failed", 0, T0, null, T0, T0)
+				.run(),
+		).rejects.toThrow(/CHECK/);
+		await expect(
+			db
+				.prepare(
+					`INSERT INTO webhook_deliveries
+						(id, agent_id, status, attempts, next_attempt_at, last_error, created_at, updated_at)
+					VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+				)
+				.bind(newId(), a.id, "delivered", -1, T0, null, T0, T0)
+				.run(),
+		).rejects.toThrow(/CHECK/);
+
+		// Due query uses partial due index.
+		const plan = await queryPlan(
+			"SELECT id FROM webhook_deliveries WHERE status = 'pending' AND next_attempt_at <= ? ORDER BY next_attempt_at ASC LIMIT 20",
+			T0,
+		);
+		expect(plan).toContain("webhook_deliveries_due_idx");
+
+		// Deleting agent cascades webhook_deliveries.
+		await db.prepare("DELETE FROM agents WHERE id = ?").bind(a.id).run();
+		const count = await db
+			.prepare("SELECT COUNT(*) AS n FROM webhook_deliveries")
+			.first<{ n: number }>();
+		expect(count?.n).toBe(0);
+	});
+
+	it("preserves populated data when upgrading from migration 0006 to 0007", async () => {
+		await db.batch([
+			db.prepare("DROP TABLE IF EXISTS webhook_deliveries"),
+			db.prepare("DROP TABLE IF EXISTS agent_webhooks"),
+			db.prepare("DROP TABLE IF EXISTS pending_descriptions"),
+			db.prepare("DROP TABLE IF EXISTS proposals"),
+			db.prepare("DROP TABLE IF EXISTS admin_bot_config"),
+			db.prepare("DROP TABLE IF EXISTS change_log"),
+			db.prepare("DROP TABLE IF EXISTS audit_log"),
+			db.prepare("DROP TABLE IF EXISTS messages"),
+			db.prepare("DROP TABLE IF EXISTS allow_rules"),
+			db.prepare("DROP TABLE IF EXISTS tokens"),
+			db.prepare("DROP TABLE IF EXISTS categories"),
+			db.prepare("DROP TABLE IF EXISTS agents"),
+			db.prepare("DROP TABLE IF EXISTS d1_migrations"),
+		]);
+
+		const m1 = migrationByName("0001_initial_schema.sql");
+		const m2 = migrationByName("0002_cascade_message_references.sql");
+		const m3 = migrationByName("0003_change_log.sql");
+		const m4 = migrationByName("0004_admin_bot.sql");
+		const m5 = migrationByName("0005_proposals.sql");
+		const m6 = migrationByName("0006_pending_descriptions.sql");
+		const m7 = migrationByName("0007_webhooks.sql");
+
+		await applyD1Migrations(db, [m1, m2, m3, m4, m5, m6]);
+		const a = await seedAgent(db, { name: "existing-agent" });
+		await upsertPendingDescription(db, {
+			agentId: a.id,
+			description: "Draft description",
+			submittedAt: T0,
+		}).run();
+
+		await applyD1Migrations(db, [m1, m2, m3, m4, m5, m6, m7]);
+
+		const fkCheck = await db.prepare("PRAGMA foreign_key_check").all();
+		expect(fkCheck.results).toEqual([]);
+		const preserved = await db
+			.prepare("SELECT * FROM pending_descriptions WHERE agent_id = ?")
+			.bind(a.id)
+			.first<PendingDescriptionRow>();
+		expect(preserved?.description).toBe("Draft description");
+
+		await upsertAgentWebhook(db, {
+			agentId: a.id,
+			url: "https://hooks.example.com/migrated",
+			authMode: "paab_hmac",
+			secret: `paab_whsec_${"11".repeat(32)}`,
+			createdAt: T0,
+			updatedAt: T0,
+		}).run();
+		const loaded = await db
+			.prepare("SELECT * FROM agent_webhooks WHERE agent_id = ?")
+			.bind(a.id)
+			.first<AgentWebhookRow>();
+		expect(loaded?.url).toBe("https://hooks.example.com/migrated");
 	});
 });
