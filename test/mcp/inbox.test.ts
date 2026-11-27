@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { queryAuditLog, recordAuditEvent } from "../../src/audit";
 import { submitQuestion } from "../../src/inbox";
 import { runScheduledMaintenance } from "../../src/mcp";
-import { DAY_MS, T0 } from "../helpers/fixtures";
+import { DAY_MS, HOUR_MS, T0 } from "../helpers/fixtures";
 import {
 	askBob,
 	call,
@@ -154,6 +154,174 @@ describe("check_inbox", () => {
 
 		const again = await call(alice, "check_inbox");
 		expect(inboxBlocks(again.text)).toEqual([]);
+		expect(withoutFooter(again.text)).toBe("no new messages");
+	});
+
+	it("recovers delivered unanswered questions with mode pending_questions", async () => {
+		const alice = await connect(world.alice.token, { now: T0 });
+		const bob = await connect(world.bob.token, { now: T0 + HOUR_MS });
+		const carol = await connect(world.carol.token, { now: T0 + 2 * HOUR_MS });
+
+		const openId = await askBob(alice, "When are you free?");
+		const answeredId = await askBob(alice, "Book Friday?");
+		const declinedId = await askBob(alice, "Share secret?");
+
+		// Before delivery, recovery returns nothing and leaves unread count intact.
+		const beforeDelivery = await call(bob, "check_inbox", {
+			mode: "pending_questions",
+		});
+		expect(beforeDelivery.isError).toBe(false);
+		expect(withoutFooter(beforeDelivery.text)).toBe("no recoverable messages");
+		expect(unreadCount(beforeDelivery.text)).toBe(3);
+
+		// Initial unread delivery marks all three received.
+		const delivered = await call(bob, "check_inbox", { mode: "unread" });
+		expect(inboxBlocks(delivered.text)).toHaveLength(3);
+		expect(unreadCount(delivered.text)).toBe(0);
+
+		// Answer one, decline one, and add one new undelivered question.
+		await call(bob, "answer", {
+			question_id: answeredId,
+			action: "answer",
+			text: "Booked.",
+		});
+		await call(bob, "answer", { question_id: declinedId, action: "decline" });
+		const unreadId = await askBob(alice, "New unread question?");
+
+		const bobLater = await connect(world.bob.token, { now: T0 + 2 * HOUR_MS });
+		const recovered = await call(bobLater, "check_inbox", {
+			mode: "pending_questions",
+		});
+		expect(recovered.isError).toBe(false);
+		const blocks = inboxBlocks(recovered.text);
+		expect(blocks).toHaveLength(1);
+		expect(blocks[0]).toMatch(/^kind: question$/m);
+		expect(blocks[0]).toContain(`question_id: ${openId}`);
+		expect(blocks[0]).toMatch(/^from: alice$/m);
+		expect(blocks[0]).toMatch(/^category: schedule$/m);
+		expect(framedTexts(recovered.text)).toEqual(["When are you free?"]);
+		// Footer still reflects the one undelivered question waiting for mode "unread".
+		expect(unreadCount(recovered.text)).toBe(1);
+
+		// received_at was neither extended on openId nor set on unreadId.
+		const openRow = await world.db
+			.prepare("SELECT received_at FROM messages WHERE id = ?")
+			.bind(openId)
+			.first<{ received_at: number | null }>();
+		const unreadRow = await world.db
+			.prepare("SELECT received_at FROM messages WHERE id = ?")
+			.bind(unreadId)
+			.first<{ received_at: number | null }>();
+		expect(openRow?.received_at).toBe(T0 + HOUR_MS);
+		expect(unreadRow?.received_at).toBeNull();
+
+		// Other agents cannot recover bob's pending questions.
+		const aliceRecover = await call(alice, "check_inbox", {
+			mode: "pending_questions",
+		});
+		expect(withoutFooter(aliceRecover.text)).toBe("no recoverable messages");
+		const carolRecover = await call(carol, "check_inbox", {
+			mode: "pending_questions",
+		});
+		expect(withoutFooter(carolRecover.text)).toBe("no recoverable messages");
+
+		// Expired delivered question is excluded even before maintenance runs.
+		const bobExpired = await connect(world.bob.token, {
+			now: T0 + 7 * DAY_MS,
+		});
+		const afterExpiry = await call(bobExpired, "check_inbox", {
+			mode: "pending_questions",
+		});
+		expect(withoutFooter(afterExpiry.text)).toBe("no recoverable messages");
+	});
+
+	it("recovers recent answers, rejections, and pending questions until body retention ends", async () => {
+		const alice = await connect(world.alice.token, { now: T0 });
+		const bob = await connect(world.bob.token, { now: T0 + HOUR_MS });
+
+		const answeredId = await askBob(alice, "Lunch Tuesday?");
+		const declinedId = await askBob(alice, "Private note?");
+		const pendingId = await askBob(alice, "Still waiting?");
+
+		const bobDecline = await connect(world.bob.token, {
+			now: T0 + HOUR_MS + 1,
+		});
+		await call(bob, "check_inbox");
+		await call(bob, "answer", {
+			question_id: answeredId,
+			action: "answer",
+			text: "Yes, noon.",
+		});
+		await call(bobDecline, "answer", {
+			question_id: declinedId,
+			action: "decline",
+		});
+
+		// Alice fetches her answer and rejection at T0 + 2h.
+		const fetchedAt = T0 + 2 * HOUR_MS;
+		const aliceFetch = await connect(world.alice.token, { now: fetchedAt });
+		const initial = await call(aliceFetch, "check_inbox");
+		expect(inboxBlocks(initial.text)).toHaveLength(2);
+
+		// Within 24h, Alice recovers both the framed answer and the ID-only rejection.
+		const aliceRecover = await connect(world.alice.token, {
+			now: fetchedAt + 23 * HOUR_MS,
+		});
+		const recovered = await call(aliceRecover, "check_inbox", {
+			mode: "recent",
+		});
+		expect(recovered.isError).toBe(false);
+		const blocks = inboxBlocks(recovered.text);
+		expect(blocks).toHaveLength(2);
+		expect(blocks[0]).toMatch(/^kind: answer$/m);
+		expect(blocks[0]).toContain(`question_id: ${answeredId}`);
+		expect(blocks[0]).toMatch(/^from: bob$/m);
+		expect(blocks[0]).toMatch(/^category: schedule$/m);
+		expect(framedTexts(recovered.text)).toEqual(["Yes, noon."]);
+
+		const rejectionLines = blocks[1]?.split("\n") ?? [];
+		expect(rejectionLines).toEqual([
+			"kind: rejection",
+			expect.stringMatching(/^message_id: \S+$/),
+			`question_id: ${declinedId}`,
+		]);
+		expect(unreadCount(recovered.text)).toBe(0);
+
+		// Recovery does not extend received_at on replies.
+		const replyTimes = await world.db
+			.prepare(
+				"SELECT received_at FROM messages WHERE to_agent_id = ? ORDER BY created_at ASC",
+			)
+			.bind(world.alice.agent.id)
+			.all<{ received_at: number | null }>();
+		expect(replyTimes.results.map((r) => r.received_at)).toEqual([
+			fetchedAt,
+			fetchedAt,
+		]);
+
+		// Bob recovers his delivered pending question via mode "recent", and Carol sees nothing.
+		const bobRecover = await connect(world.bob.token, {
+			now: fetchedAt + 23 * HOUR_MS,
+		});
+		const bobRecent = await call(bobRecover, "check_inbox", { mode: "recent" });
+		expect(inboxBlocks(bobRecent.text)).toHaveLength(1);
+		expect(bobRecent.text).toContain(`question_id: ${pendingId}`);
+		expect(framedTexts(bobRecent.text)).toEqual(["Still waiting?"]);
+
+		const carol = await connect(world.carol.token, {
+			now: fetchedAt + 23 * HOUR_MS,
+		});
+		const carolRecent = await call(carol, "check_inbox", { mode: "recent" });
+		expect(withoutFooter(carolRecent.text)).toBe("no recoverable messages");
+
+		// Once 24 hours pass and maintenance deletes bodies, Alice's replies are no longer recoverable.
+		const cutoff = fetchedAt + DAY_MS;
+		await runScheduledMaintenance(env, cutoff);
+		const aliceAfterPurge = await connect(world.alice.token, { now: cutoff });
+		const afterPurge = await call(aliceAfterPurge, "check_inbox", {
+			mode: "recent",
+		});
+		expect(withoutFooter(afterPurge.text)).toBe("no recoverable messages");
 	});
 
 	it("records a long expiry backlog with batched writes", async () => {
