@@ -1,5 +1,6 @@
 export {
 	deleteAgent,
+	lowerAgentDailyLimit,
 	registerAgent,
 	resumeAgent,
 	suspendAgent,
@@ -41,6 +42,9 @@ export type {
 	DeletedCategorySummary,
 	IssueAgentTokenInput,
 	IssuedAgentToken,
+	LowerAgentDailyLimitFailure,
+	LowerAgentDailyLimitInput,
+	LowerAgentDailyLimitResult,
 	RegisterAgentInput,
 	RevokeAgentTokensInput,
 	RevokeAgentTokensResult,

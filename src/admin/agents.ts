@@ -14,6 +14,8 @@ import type {
 	AgentStatusChangeInput,
 	DeleteAgentInput,
 	DeletedAgentSummary,
+	LowerAgentDailyLimitInput,
+	LowerAgentDailyLimitResult,
 	RegisterAgentInput,
 	UpdateAgentInput,
 	UpdateAgentResult,
@@ -167,41 +169,112 @@ export async function updateAgent(
 		}
 	}
 
-	const updated: Agent = {
-		...current,
-		name: nextName,
-		description: nextDescription,
-		dailyQuestionLimit: nextLimit,
-	};
+	const nameChanged = nextName !== current.name;
+	const descChanged = nextDescription !== current.description;
+	const limitChanged = nextLimit !== current.dailyQuestionLimit;
+
+	const setClauses: string[] = [];
+	const setBinds: (string | number)[] = [];
+	const diffClauses: string[] = [];
+	const diffBinds: (string | number)[] = [];
+	const afterBinds: (string | number)[] = [];
+
+	if (nameChanged) {
+		setClauses.push("name = ?");
+		setBinds.push(nextName);
+		diffClauses.push("name <> ?");
+		diffBinds.push(nextName);
+		afterBinds.push(nextName);
+	}
+	if (descChanged) {
+		setClauses.push("description = ?");
+		setBinds.push(nextDescription);
+		diffClauses.push("description <> ?");
+		diffBinds.push(nextDescription);
+		afterBinds.push(nextDescription);
+	}
+	if (limitChanged) {
+		setClauses.push("daily_question_limit = ?");
+		setBinds.push(nextLimit);
+		diffClauses.push("daily_question_limit <> ?");
+		diffBinds.push(nextLimit);
+		afterBinds.push(nextLimit);
+	}
+
+	const diffSql = diffClauses.join(" OR ");
+	const afterNameExpr = nameChanged ? "?" : "a.name";
+	const afterDescExpr = descChanged ? "?" : "a.description";
+	const afterLimitExpr = limitChanged
+		? "CAST(? AS INTEGER)"
+		: "a.daily_question_limit";
 
 	try {
-		const changeId = await runWithChangeLog(
-			db,
-			[
-				db
-					.prepare(
-						"UPDATE agents SET name = ?, description = ?, daily_question_limit = ? WHERE id = ?",
-					)
-					.bind(
-						updated.name,
-						updated.description,
-						updated.dailyQuestionLimit,
-						updated.id,
-					),
-			],
-			{
-				occurredAt: ctx.value.now,
-				actorType: ctx.value.actorType,
-				actorId: ctx.value.actorId,
-				approverId: ctx.value.approverId,
-				action: "agent_updated",
-				targetType: "agent",
-				targetId: updated.id,
-				beforeJson: JSON.stringify(current),
-				afterJson: JSON.stringify(updated),
-				revertedAt: null,
-			},
-		);
+		const [changeResult, updateResult, afterResult] = await db.batch([
+			db
+				.prepare(
+					`INSERT INTO change_log
+						(occurred_at, actor_type, actor_id, approver_id, action,
+						target_type, target_id, before_json, after_json, reverted_at)
+					SELECT ?, ?, ?, ?, 'agent_updated',
+						'agent', a.id,
+						json_object(
+							'id', a.id,
+							'ownerId', a.owner_id,
+							'name', a.name,
+							'description', a.description,
+							'status', a.status,
+							'dailyQuestionLimit', a.daily_question_limit,
+							'createdAt', a.created_at
+						),
+						json_object(
+							'id', a.id,
+							'ownerId', a.owner_id,
+							'name', ${afterNameExpr},
+							'description', ${afterDescExpr},
+							'status', a.status,
+							'dailyQuestionLimit', ${afterLimitExpr},
+							'createdAt', a.created_at
+						),
+						NULL
+					FROM agents AS a
+					WHERE a.id = ?
+						AND (${diffSql})`,
+				)
+				.bind(
+					ctx.value.now,
+					ctx.value.actorType,
+					ctx.value.actorId,
+					ctx.value.approverId,
+					...afterBinds,
+					current.id,
+					...diffBinds,
+				),
+			db
+				.prepare(
+					`UPDATE agents
+					SET ${setClauses.join(", ")}
+					WHERE id = ?
+						AND (${diffSql})`,
+				)
+				.bind(...setBinds, current.id, ...diffBinds),
+			db.prepare("SELECT * FROM agents WHERE id = ?").bind(current.id),
+		]);
+		const updatedRow = (afterResult?.results[0] ?? null) as AgentRow | null;
+		if (updatedRow === null) {
+			return fail("not_found", "指定されたエージェントが見つかりません");
+		}
+		const updated = agentFromRow(updatedRow);
+		if ((updateResult?.meta.changes ?? 0) === 0) {
+			return {
+				ok: true,
+				data: { agent: updated, changed: false },
+				changeId: null,
+			};
+		}
+		const changeId = Number(changeResult?.meta.last_row_id);
+		if (!Number.isSafeInteger(changeId) || changeId <= 0) {
+			throw new Error("change_log insert did not return a valid last_row_id");
+		}
 		return { ok: true, data: { agent: updated, changed: true }, changeId };
 	} catch (error) {
 		if (isUniqueConstraintError(error)) {
@@ -212,6 +285,96 @@ export async function updateAgent(
 		}
 		throw error;
 	}
+}
+
+export async function lowerAgentDailyLimit(
+	db: D1Database,
+	input: LowerAgentDailyLimitInput,
+): Promise<LowerAgentDailyLimitResult> {
+	const ctx = validateContext(input.actor, input.now);
+	if (!ctx.ok) return ctx;
+
+	const agentId = validateId(input.agentId, "エージェントID");
+	if (!agentId.ok) return agentId;
+
+	const limitCheck = validateDailyLimit(input.newLimit);
+	if (!limitCheck.ok) return limitCheck;
+
+	const [beforeResult, changeResult, updateResult] = await db.batch([
+		db.prepare("SELECT * FROM agents WHERE id = ?").bind(agentId.value),
+		db
+			.prepare(
+				`INSERT INTO change_log
+					(occurred_at, actor_type, actor_id, approver_id, action,
+					target_type, target_id, before_json, after_json, reverted_at)
+				SELECT ?1, ?2, ?3, ?4, 'agent_updated',
+					'agent', a.id,
+					json_object(
+						'id', a.id,
+						'ownerId', a.owner_id,
+						'name', a.name,
+						'description', a.description,
+						'status', a.status,
+						'dailyQuestionLimit', a.daily_question_limit,
+						'createdAt', a.created_at
+					),
+					json_object(
+						'id', a.id,
+						'ownerId', a.owner_id,
+						'name', a.name,
+						'description', a.description,
+						'status', a.status,
+						'dailyQuestionLimit', CAST(?5 AS INTEGER),
+						'createdAt', a.created_at
+					),
+					NULL
+				FROM agents AS a
+				WHERE a.id = ?6
+					AND a.daily_question_limit > ?5`,
+			)
+			.bind(
+				ctx.value.now,
+				ctx.value.actorType,
+				ctx.value.actorId,
+				ctx.value.approverId,
+				limitCheck.value,
+				agentId.value,
+			),
+		db
+			.prepare(
+				`UPDATE agents
+				SET daily_question_limit = ?1
+				WHERE id = ?2
+					AND daily_question_limit > ?1`,
+			)
+			.bind(limitCheck.value, agentId.value),
+	]);
+
+	const beforeRow = (beforeResult?.results[0] ?? null) as AgentRow | null;
+	if (beforeRow === null) {
+		return fail("not_found", "指定されたエージェントが見つかりません");
+	}
+	const before = agentFromRow(beforeRow);
+	if ((updateResult?.meta.changes ?? 0) === 0) {
+		return {
+			ok: false,
+			code: "limit_not_lower",
+			message: `現在の1日あたりの質問数上限（${before.dailyQuestionLimit}）より小さい値を指定してください`,
+			currentLimit: before.dailyQuestionLimit,
+		};
+	}
+	const changeId = Number(changeResult?.meta.last_row_id);
+	if (!Number.isSafeInteger(changeId) || changeId <= 0) {
+		throw new Error("change_log insert did not return a valid last_row_id");
+	}
+	return {
+		ok: true,
+		data: {
+			agent: { ...before, dailyQuestionLimit: limitCheck.value },
+			previousLimit: before.dailyQuestionLimit,
+		},
+		changeId,
+	};
 }
 
 export async function deleteAgent(

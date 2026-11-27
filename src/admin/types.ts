@@ -42,6 +42,30 @@ export type UpdateAgentResult =
 	| { ok: true; data: { agent: Agent; changed: false }; changeId: null }
 	| AdminFailure;
 
+export interface LowerAgentDailyLimitInput {
+	agentId: string;
+	newLimit: number;
+	actor: ChangeActor;
+	now: UnixMillis;
+}
+
+export type LowerAgentDailyLimitFailure =
+	| AdminFailure
+	| {
+			ok: false;
+			code: "limit_not_lower";
+			message: string;
+			currentLimit: number;
+	  };
+
+export type LowerAgentDailyLimitResult =
+	| {
+			ok: true;
+			data: { agent: Agent; previousLimit: number };
+			changeId: number;
+	  }
+	| LowerAgentDailyLimitFailure;
+
 export type RevokeAgentTokensResult =
 	| { ok: true; data: { revokedCount: number }; changeId: number }
 	| { ok: true; data: { revokedCount: 0 }; changeId: null }

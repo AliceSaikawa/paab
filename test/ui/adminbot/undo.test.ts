@@ -495,4 +495,63 @@ describe("/admin/adminbot 1-click Undo UI", () => {
 		);
 		expect(noCsrf.status).toBe(403);
 	});
+
+	it("handles simultaneous double-click revert POSTs atomically with one 200 and one 409", async () => {
+		const owner = { actorType: "owner" as const, actorId: ADMIN_EMAIL };
+		const museReg = await registerAgent(db, {
+			name: "muse",
+			dailyQuestionLimit: 20,
+			actor: owner,
+			now: T0,
+		});
+		const grokReg = await registerAgent(db, {
+			name: "grok",
+			dailyQuestionLimit: 15,
+			actor: owner,
+			now: T0 + 1,
+		});
+		if (!museReg.ok || !grokReg.ok) throw new Error("register failed");
+		await designateAdminBot(db, {
+			agentId: museReg.data.agent.id,
+			actor: owner,
+			now: T0 + 2,
+		});
+		const issued = await issueAdminBotToken(db, {
+			agentId: museReg.data.agent.id,
+			actor: owner,
+			now: T0 + 3,
+		});
+		if (!issued.ok) throw new Error("token issue failed");
+
+		const mcpClient = await connectAdminMcp(issued.data.token, T0 + 10);
+		expect(
+			(await call(mcpClient, "suspend_agent", { agent: "grok" })).isError,
+		).toBe(false);
+		const [botSuspend] = await queryChangeLog(db, { actorType: "admin_bot" });
+		if (!botSuspend) throw new Error("Expected bot suspend change");
+
+		const { session } = await openAdminBotSession(T0 + 20);
+		const results = await Promise.all([
+			adminPost(
+				session,
+				`/admin/adminbot/changes/${botSuspend.id}/revert`,
+				{},
+				T0 + 21,
+			),
+			adminPost(
+				session,
+				`/admin/adminbot/changes/${botSuspend.id}/revert`,
+				{},
+				T0 + 21,
+			),
+		]);
+		const statuses = results.map((r) => r.response.status).sort();
+		expect(statuses).toEqual([200, 409]);
+		const conflictRes = results.find((r) => r.response.status === 409);
+		expect(conflictRes?.html).toContain("すでに元に戻されています");
+		expect((await loadAgent(grokReg.data.agent.id)).status).toBe("active");
+		expect(
+			(await queryChangeLog(db)).filter((e) => e.action === "change_reverted"),
+		).toHaveLength(1);
+	});
 });

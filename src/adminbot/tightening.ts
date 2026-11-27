@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { revokeAllowRule, suspendAgent, updateAgent } from "../admin";
+import { lowerAgentDailyLimit, revokeAllowRule, suspendAgent } from "../admin";
 import { type AgentRow, agentFromRow } from "../db";
 import { type Frame, renderFramed } from "../mcp/frame";
 import { normalizeName } from "../policy";
@@ -219,20 +219,22 @@ export const lowerDailyLimitTool: AdminToolDefinition<
 		}
 		const target = agentFromRow(row);
 
-		if (args.new_limit >= target.dailyQuestionLimit) {
-			return fail(
-				`cannot set daily_question_limit to ${args.new_limit}: current limit is ${target.dailyQuestionLimit} and admin_bot can only lower it`,
-				{ toAgentId: target.id, deniedReason: "permission_denied" },
-			);
-		}
-
-		const result = await updateAgent(ctx.db, {
+		const result = await lowerAgentDailyLimit(ctx.db, {
 			agentId: target.id,
-			dailyQuestionLimit: args.new_limit,
+			newLimit: args.new_limit,
 			actor: botActor(ctx),
 			now: ctx.now,
 		});
 		if (!result.ok) {
+			if (result.code === "limit_not_lower") {
+				return fail(
+					`cannot set daily_question_limit to ${args.new_limit}: current limit is ${result.currentLimit} and admin_bot can only lower it`,
+					{ toAgentId: target.id, deniedReason: "permission_denied" },
+				);
+			}
+			if (result.code === "not_found") {
+				return fail("agent not found");
+			}
 			return fail(result.message, { toAgentId: target.id });
 		}
 
@@ -241,12 +243,12 @@ export const lowerDailyLimitTool: AdminToolDefinition<
 				[
 					framedField("agent", result.data.agent.name, frame),
 					`agent_id: ${result.data.agent.id}`,
-					`previous_limit: ${target.dailyQuestionLimit}`,
+					`previous_limit: ${result.data.previousLimit}`,
 					`daily_question_limit: ${result.data.agent.dailyQuestionLimit}`,
 					`change_id: ${result.changeId}`,
 				].join("\n"),
 			),
-			{ toAgentId: target.id },
+			{ toAgentId: result.data.agent.id },
 		);
 	},
 };
