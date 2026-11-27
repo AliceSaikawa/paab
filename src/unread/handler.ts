@@ -1,5 +1,4 @@
-import { recordAuditEvent } from "../audit";
-import { auditReasonCode, authenticate } from "../auth";
+import { authenticate, recordAuthFailureAudit } from "../auth";
 import { countUnread } from "../inbox";
 import { auditBodyConfig, type McpEnv } from "../mcp/config";
 import type { UnixMillis } from "../types";
@@ -36,11 +35,11 @@ export async function handleUnreadRequest(
 	);
 
 	if (!auth.ok) {
-		await recordAuditEvent(db, audit, {
-			eventType: "auth_failed",
+		await recordAuthFailureAudit(db, audit, {
+			endpoint: "unread",
+			reason: auth.reason,
 			occurredAt: now,
 			fromAgentId: auth.agentId,
-			reasonCode: auditReasonCode(auth.reason),
 		});
 		return new Response(null, {
 			status: 401,
@@ -52,11 +51,11 @@ export async function handleUnreadRequest(
 	}
 
 	if (auth.suspended) {
-		await recordAuditEvent(db, audit, {
-			eventType: "auth_failed",
+		await recordAuthFailureAudit(db, audit, {
+			endpoint: "unread",
+			reason: "sender_suspended",
 			occurredAt: now,
 			fromAgentId: auth.agent.id,
-			reasonCode: "sender_suspended",
 		});
 		return new Response("agent suspended", {
 			status: 403,

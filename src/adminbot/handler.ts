@@ -1,6 +1,5 @@
 import { createMcpHandler } from "@modelcontextprotocol/server";
-import { recordAuditEvent } from "../audit";
-import { auditReasonCode, authenticate } from "../auth";
+import { authenticate, recordAuthFailureAudit } from "../auth";
 import { auditBodyConfig, type McpEnv } from "../mcp/config";
 import type { UnixMillis } from "../types";
 import { getAdminBotConfig } from "./config";
@@ -26,11 +25,11 @@ export async function handleAdminMcpRequest(
 	);
 
 	if (!auth.ok) {
-		await recordAuditEvent(db, audit, {
-			eventType: "auth_failed",
+		await recordAuthFailureAudit(db, audit, {
+			endpoint: "admin_mcp",
+			reason: auth.reason,
 			occurredAt: now,
 			fromAgentId: auth.agentId,
-			reasonCode: auditReasonCode(auth.reason),
 		});
 		return new Response(null, {
 			status: 401,
@@ -39,22 +38,22 @@ export async function handleAdminMcpRequest(
 	}
 
 	if (auth.suspended) {
-		await recordAuditEvent(db, audit, {
-			eventType: "auth_failed",
+		await recordAuthFailureAudit(db, audit, {
+			endpoint: "admin_mcp",
+			reason: "sender_suspended",
 			occurredAt: now,
 			fromAgentId: auth.agent.id,
-			reasonCode: "sender_suspended",
 		});
 		return new Response("agent suspended", { status: 403 });
 	}
 
 	const config = await getAdminBotConfig(db);
 	if (config.agentId !== auth.agent.id) {
-		await recordAuditEvent(db, audit, {
-			eventType: "auth_failed",
+		await recordAuthFailureAudit(db, audit, {
+			endpoint: "admin_mcp",
+			reason: "not_admin_bot",
 			occurredAt: now,
 			fromAgentId: auth.agent.id,
-			reasonCode: "not_admin_bot",
 		});
 		return new Response("not designated admin bot", { status: 403 });
 	}

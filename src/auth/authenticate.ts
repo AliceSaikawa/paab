@@ -6,13 +6,15 @@ import { hashToken, isWellFormedToken } from "./token";
  * Why authentication failed. For the audit log only: every failure must look
  * the same to the client (a bare 401).
  * - `token_missing`: no `Authorization: Bearer ...` header.
- * - `token_unknown`: no such token, or one that is not even token-shaped.
+ * - `token_malformed`: Bearer token does not match the `paab_` token shape.
+ * - `token_unknown`: well-formed token with no matching row in D1.
  * - `token_revoked`: the token was revoked or replaced by a reissue.
  * - `token_wrong_purpose`: a valid token of another purpose, for example an
  *   unread count token presented to the MCP endpoint.
  */
 export type AuthFailureReason =
 	| "token_missing"
+	| "token_malformed"
 	| "token_unknown"
 	| "token_revoked"
 	| "token_wrong_purpose";
@@ -42,7 +44,10 @@ export type AuthResult =
  * unknown.
  */
 export function auditReasonCode(reason: AuthFailureReason): ReasonCode {
-	return reason === "token_wrong_purpose" ? "token_unknown" : reason;
+	if (reason === "token_wrong_purpose" || reason === "token_malformed") {
+		return "token_unknown";
+	}
+	return reason;
 }
 
 /**
@@ -102,7 +107,7 @@ export async function authenticate(
 		return { ok: false, reason: "token_missing", agentId: null };
 	}
 	if (!isWellFormedToken(token)) {
-		return { ok: false, reason: "token_unknown", agentId: null };
+		return { ok: false, reason: "token_malformed", agentId: null };
 	}
 
 	const tokenHash = await hashToken(token);

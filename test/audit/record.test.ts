@@ -7,11 +7,12 @@ import {
 	queryAuditLog,
 	recordAuditEvent,
 	recordAuditEvents,
+	recordDailyLimitBlockedAudit,
 } from "../../src/audit";
 import type { AuditLogRow } from "../../src/db";
 import { AUDIT_EVENT_TYPES } from "../../src/types";
 import { createTestDb } from "../helpers/db";
-import { T0 } from "../helpers/fixtures";
+import { DAY_MS, T0 } from "../helpers/fixtures";
 
 const RECORDING: AuditBodyConfig = {
 	recordBodies: true,
@@ -451,5 +452,133 @@ describe("recordAuditEvent", () => {
 			expect(await storedRows()).toEqual([]);
 			expect(error).toHaveBeenCalledTimes(1);
 		});
+	});
+});
+
+describe("recordDailyLimitBlockedAudit", () => {
+	it("writes at most one row per agent per UTC day and skips INSERT on repeats", async () => {
+		expect(
+			await recordDailyLimitBlockedAudit(
+				db,
+				RECORDING,
+				{
+					occurredAt: T0,
+					fromAgentId: "agent-a",
+					toAgentId: "agent-b",
+					categoryId: "category-schedule",
+					messageId: "q-1",
+				},
+				T0,
+				T0 + DAY_MS,
+			),
+		).toBe(true);
+
+		const prepare = vi.spyOn(db, "prepare");
+		expect(
+			await recordDailyLimitBlockedAudit(
+				db,
+				RECORDING,
+				{
+					occurredAt: T0 + 1000,
+					fromAgentId: "agent-a",
+					toAgentId: "agent-b",
+					categoryId: "category-schedule",
+					messageId: "q-2",
+				},
+				T0,
+				T0 + DAY_MS,
+			),
+		).toBe(false);
+		expect(prepare.mock.calls.some(([sql]) => /INSERT/i.test(sql))).toBe(false);
+		prepare.mockRestore();
+
+		// Another agent on the same day gets its own single row.
+		expect(
+			await recordDailyLimitBlockedAudit(
+				db,
+				RECORDING,
+				{
+					occurredAt: T0 + 2000,
+					fromAgentId: "agent-b",
+					toAgentId: "agent-a",
+					categoryId: "category-schedule",
+					messageId: "q-3",
+				},
+				T0,
+				T0 + DAY_MS,
+			),
+		).toBe(true);
+
+		// Next UTC day allows agent-a to record one new row.
+		expect(
+			await recordDailyLimitBlockedAudit(
+				db,
+				RECORDING,
+				{
+					occurredAt: T0 + DAY_MS,
+					fromAgentId: "agent-a",
+					toAgentId: "agent-b",
+					categoryId: "category-schedule",
+					messageId: "q-4",
+				},
+				T0 + DAY_MS,
+				T0 + 2 * DAY_MS,
+			),
+		).toBe(true);
+
+		const rows = await storedRows();
+		expect(
+			rows.map((row) => [row.from_agent_id, row.message_id, row.body]),
+		).toEqual([
+			["agent-a", "q-1", null],
+			["agent-b", "q-3", null],
+			["agent-a", "q-4", null],
+		]);
+	});
+
+	it("writes only one row under concurrent first hits", async () => {
+		const results = await Promise.all(
+			Array.from({ length: 5 }, (_, i) =>
+				recordDailyLimitBlockedAudit(
+					db,
+					AUDIT_BODY_RECORDING_DISABLED,
+					{
+						occurredAt: T0 + i,
+						fromAgentId: "agent-a",
+						toAgentId: "agent-b",
+						categoryId: "category-schedule",
+						messageId: `q-${i}`,
+					},
+					T0,
+					T0 + DAY_MS,
+				),
+			),
+		);
+		expect(results.filter(Boolean)).toHaveLength(1);
+		expect(await storedRows()).toHaveLength(1);
+	});
+
+	it("resolves to false without throwing when D1 fails", async () => {
+		const error = vi.spyOn(console, "error").mockImplementation(() => {});
+		const failingDb = {
+			prepare() {
+				throw new Error("D1 is down");
+			},
+		} as unknown as D1Database;
+
+		expect(
+			await recordDailyLimitBlockedAudit(
+				failingDb,
+				AUDIT_BODY_RECORDING_DISABLED,
+				{
+					occurredAt: T0,
+					fromAgentId: "agent-a",
+					messageId: "q-err",
+				},
+				T0,
+				T0 + DAY_MS,
+			),
+		).toBe(false);
+		expect(error).toHaveBeenCalledTimes(1);
 	});
 });

@@ -138,7 +138,7 @@ describe("a question the bridge does not allow", () => {
 		expect(await inbox(bob)).toEqual([rejectionOf(questionId)]);
 	});
 
-	it("over the daily limit never reaches bob", async () => {
+	it("over the daily limit never reaches bob and suppresses repeated writes", async () => {
 		const limit = 2;
 		await connectBoth(
 			await startBridge({
@@ -153,17 +153,23 @@ describe("a question the bridge does not allow", () => {
 		const first = await ask(alice, "bob", "予定");
 		const second = await ask(alice, "bob", "予定");
 		const overLimit = await ask(alice, "bob", "予定");
+		const overLimitAgain = await ask(alice, "bob", "予定");
+		expect(overLimitAgain).not.toBe(overLimit);
 
 		const delivered = (await inbox(bob)).map(questionIdOf);
 		expect(delivered.sort()).toEqual([first, second].sort());
-		expect(await inbox(alice)).toEqual([rejectionOf(overLimit)]);
-		expect(await auditLog()).toContainEqual(
-			expect.objectContaining({
-				eventType: "question_blocked",
-				reasonCode: "daily_limit_exceeded",
-				messageId: overLimit,
-			}),
+		expect(await inbox(alice)).toEqual([]);
+		const limitAudits = (await auditLog()).filter(
+			(entry) =>
+				entry.eventType === "question_blocked" &&
+				entry.reasonCode === "daily_limit_exceeded",
 		);
+		expect(limitAudits).toHaveLength(1);
+		expect(limitAudits[0]).toMatchObject({
+			eventType: "question_blocked",
+			reasonCode: "daily_limit_exceeded",
+			messageId: overLimit,
+		});
 
 		vi.setSystemTime(T0 + DAY_MS);
 		const nextDay = await ask(alice, "bob", "予定");

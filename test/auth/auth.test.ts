@@ -1,5 +1,8 @@
 import { beforeEach, describe, expect, it } from "vitest";
+import { AUDIT_BODY_RECORDING_DISABLED, queryAuditLog } from "../../src/audit";
 import {
+	AUTH_FAILURE_AUDIT_MAX_PER_WINDOW,
+	AUTH_FAILURE_AUDIT_WINDOW_MS,
 	auditReasonCode,
 	authenticate,
 	createToken,
@@ -8,6 +11,9 @@ import {
 	issueToken,
 	isWellFormedToken,
 	parseBearerToken,
+	recordAuthFailureAudit,
+	resetAuthFailureAuditLimiter,
+	shouldAuditAuthFailure,
 	TOKEN_PREFIX,
 } from "../../src/auth";
 import { REASON_CODES } from "../../src/types";
@@ -112,7 +118,7 @@ describe("authenticate", () => {
 		}
 	});
 
-	it("fails for a token that was never issued", async () => {
+	it("fails for a well-formed token that was never issued", async () => {
 		const agent = await seedAgent(db);
 		await issueToken(db, {
 			agentId: agent.id,
@@ -120,10 +126,33 @@ describe("authenticate", () => {
 			now: T0,
 		});
 
-		for (const token of [generateToken(), "not-a-token", "paab_short"]) {
-			expect(await authenticate(db, bearer(token), "participant")).toEqual({
+		expect(
+			await authenticate(db, bearer(generateToken()), "participant"),
+		).toEqual({
+			ok: false,
+			reason: "token_unknown",
+			agentId: null,
+		});
+	});
+
+	it("fails with token_malformed without querying D1 for non-token-shaped values", async () => {
+		const uncalledDb = {
+			prepare() {
+				throw new Error("unexpected D1 access");
+			},
+		} as unknown as D1Database;
+		for (const token of [
+			"not-a-token",
+			"paab_short",
+			`paab_${"A".repeat(42)}`,
+			`paab_${"A".repeat(44)}`,
+			`paab_${"!".repeat(43)}`,
+		]) {
+			expect(
+				await authenticate(uncalledDb, bearer(token), "participant"),
+			).toEqual({
 				ok: false,
-				reason: "token_unknown",
+				reason: "token_malformed",
 				agentId: null,
 			});
 		}
@@ -236,14 +265,102 @@ describe("auditReasonCode", () => {
 	it("maps every failure to a shared reason code", () => {
 		for (const reason of [
 			"token_missing",
+			"token_malformed",
 			"token_unknown",
 			"token_revoked",
 			"token_wrong_purpose",
 		] as const) {
 			expect(REASON_CODES).toContain(auditReasonCode(reason));
 		}
+		expect(auditReasonCode("token_malformed")).toBe("token_unknown");
 		expect(auditReasonCode("token_wrong_purpose")).toBe("token_unknown");
 		expect(auditReasonCode("token_revoked")).toBe("token_revoked");
+	});
+});
+
+describe("recordAuthFailureAudit", () => {
+	it("skips D1 writes for missing and malformed credentials", async () => {
+		expect(shouldAuditAuthFailure("token_missing")).toBe(false);
+		expect(shouldAuditAuthFailure("token_malformed")).toBe(false);
+		const uncalledDb = {
+			prepare() {
+				throw new Error("unexpected D1 access");
+			},
+		} as unknown as D1Database;
+
+		for (const reason of ["token_missing", "token_malformed"] as const) {
+			expect(
+				await recordAuthFailureAudit(
+					uncalledDb,
+					AUDIT_BODY_RECORDING_DISABLED,
+					{
+						endpoint: "mcp",
+						reason,
+						occurredAt: T0,
+						fromAgentId: null,
+					},
+				),
+			).toBe(false);
+		}
+		expect(await queryAuditLog(db)).toEqual([]);
+	});
+
+	it("throttles writes per endpoint and reason within a fixed window and resets cleanly", async () => {
+		for (let i = 0; i < AUTH_FAILURE_AUDIT_MAX_PER_WINDOW + 5; i++) {
+			const wrote = await recordAuthFailureAudit(
+				db,
+				AUDIT_BODY_RECORDING_DISABLED,
+				{
+					endpoint: "mcp",
+					reason: "token_unknown",
+					occurredAt: T0 + i,
+					fromAgentId: null,
+				},
+			);
+			expect(wrote).toBe(i < AUTH_FAILURE_AUDIT_MAX_PER_WINDOW);
+		}
+
+		// Different reason and different endpoint keep independent buckets.
+		expect(
+			await recordAuthFailureAudit(db, AUDIT_BODY_RECORDING_DISABLED, {
+				endpoint: "mcp",
+				reason: "token_revoked",
+				occurredAt: T0 + 100,
+				fromAgentId: "agent-a",
+			}),
+		).toBe(true);
+		expect(
+			await recordAuthFailureAudit(db, AUDIT_BODY_RECORDING_DISABLED, {
+				endpoint: "unread",
+				reason: "token_unknown",
+				occurredAt: T0 + 100,
+				fromAgentId: null,
+			}),
+		).toBe(true);
+
+		// Next 1-minute window allows writes again.
+		expect(
+			await recordAuthFailureAudit(db, AUDIT_BODY_RECORDING_DISABLED, {
+				endpoint: "mcp",
+				reason: "token_unknown",
+				occurredAt: T0 + AUTH_FAILURE_AUDIT_WINDOW_MS,
+				fromAgentId: null,
+			}),
+		).toBe(true);
+
+		// Explicit reset clears the current window.
+		resetAuthFailureAuditLimiter();
+		expect(
+			await recordAuthFailureAudit(db, AUDIT_BODY_RECORDING_DISABLED, {
+				endpoint: "mcp",
+				reason: "token_unknown",
+				occurredAt: T0,
+				fromAgentId: null,
+			}),
+		).toBe(true);
+
+		const entries = await queryAuditLog(db);
+		expect(entries).toHaveLength(AUTH_FAILURE_AUDIT_MAX_PER_WINDOW + 4);
 	});
 });
 

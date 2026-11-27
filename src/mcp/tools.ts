@@ -4,7 +4,9 @@ import {
 	type AuditBodyConfig,
 	recordAuditEvent,
 	recordAuditEvents,
+	recordDailyLimitBlockedAudit,
 } from "../audit";
+import { newId } from "../db";
 import {
 	type AnswerFailureReason,
 	type AnswerQuestionInput,
@@ -24,6 +26,8 @@ import {
 	DESCRIPTION_MAX_LENGTH,
 	descriptionProblem,
 	listAllowedRecipients,
+	UTC_DAY_MS,
+	utcDayStart,
 } from "../policy";
 import type { Agent, UnixMillis } from "../types";
 import { type Frame, renderFramed } from "./frame";
@@ -154,6 +158,22 @@ const ask = defineTool({
 				fetcher: ctx.webhookFetcher,
 				allowInsecureLocalhost: ctx.allowInsecureLocalhostWebhook,
 			});
+		} else if (decision.reasonCode === "daily_limit_exceeded") {
+			questionId = newId();
+			const dayStart = utcDayStart(ctx.now);
+			await recordDailyLimitBlockedAudit(
+				ctx.db,
+				ctx.audit,
+				{
+					occurredAt: ctx.now,
+					fromAgentId: ctx.agent.id,
+					toAgentId: decision.toAgentId,
+					categoryId: decision.categoryId,
+					messageId: questionId,
+				},
+				dayStart,
+				dayStart + UTC_DAY_MS,
+			);
 		} else {
 			({ questionId } = await recordBlockedQuestion(ctx.db, {
 				fromAgentId: ctx.agent.id,

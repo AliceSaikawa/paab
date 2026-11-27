@@ -217,3 +217,100 @@ export async function recordAuditEvents(
 		return false;
 	}
 }
+
+export interface DailyLimitBlockedAuditEvent {
+	occurredAt: UnixMillis;
+	fromAgentId: string;
+	toAgentId?: string | null;
+	categoryId?: string | null;
+	messageId?: string | null;
+}
+
+/**
+ * Records at most one `question_blocked` (`daily_limit_exceeded`) audit row
+ * per agent within `[dayStart, dayEnd)`. Checks with a read-only `SELECT`
+ * first so repeat over-limit calls perform zero D1 writes, and guards the
+ * insert with `WHERE NOT EXISTS` against concurrent first hits.
+ *
+ * Follows `recordAuditEvent`: never throws or rejects. Returns `true` when
+ * a new row was written and `false` when suppressed or on error.
+ */
+export async function recordDailyLimitBlockedAudit(
+	db: D1Database,
+	config: AuditBodyConfig,
+	event: DailyLimitBlockedAuditEvent,
+	dayStart: UnixMillis,
+	dayEnd: UnixMillis,
+): Promise<boolean> {
+	try {
+		if (!Number.isSafeInteger(dayStart) || !Number.isSafeInteger(dayEnd)) {
+			throw new Error(
+				"dayStart and dayEnd must be integers of UNIX milliseconds",
+			);
+		}
+		const entry = buildAuditLogEntry(config, {
+			eventType: "question_blocked",
+			occurredAt: event.occurredAt,
+			fromAgentId: event.fromAgentId,
+			toAgentId: event.toAgentId,
+			categoryId: event.categoryId,
+			reasonCode: "daily_limit_exceeded",
+			messageId: event.messageId,
+		});
+		const existing = await db
+			.prepare(
+				`SELECT 1 AS found FROM audit_log
+				WHERE occurred_at >= ? AND occurred_at < ?
+					AND event_type = 'question_blocked'
+					AND from_agent_id = ?
+					AND reason_code = 'daily_limit_exceeded'
+				LIMIT 1`,
+			)
+			.bind(dayStart, dayEnd, entry.fromAgentId)
+			.first<{ found: number }>();
+		if (existing !== null) {
+			return false;
+		}
+		const result = await db
+			.prepare(
+				`INSERT INTO audit_log
+					(occurred_at, event_type, from_agent_id, to_agent_id, category_id,
+					outcome, reason_code, message_id, body)
+				SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+				WHERE NOT EXISTS (
+					SELECT 1 FROM audit_log
+					WHERE occurred_at >= ? AND occurred_at < ?
+						AND event_type = 'question_blocked'
+						AND from_agent_id = ?
+						AND reason_code = 'daily_limit_exceeded'
+				)`,
+			)
+			.bind(
+				entry.occurredAt,
+				entry.eventType,
+				entry.fromAgentId,
+				entry.toAgentId,
+				entry.categoryId,
+				entry.outcome,
+				entry.reasonCode,
+				entry.messageId,
+				entry.body,
+				dayStart,
+				dayEnd,
+				entry.fromAgentId,
+			)
+			.run();
+		return (result.meta.changes ?? 0) > 0;
+	} catch (error) {
+		try {
+			console.error("audit log write failed", {
+				eventType: "question_blocked",
+				messageId: event?.messageId ?? null,
+				error: describeFailure(error, null),
+			});
+		} catch {
+			// Reporting must not throw either.
+		}
+		return false;
+	}
+}

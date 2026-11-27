@@ -1,6 +1,5 @@
 import { createMcpHandler } from "@modelcontextprotocol/server";
-import { recordAuditEvent } from "../audit";
-import { auditReasonCode, authenticate } from "../auth";
+import { authenticate, recordAuthFailureAudit } from "../auth";
 import type { WebhookFetcher } from "../notify";
 import type { UnixMillis } from "../types";
 import {
@@ -36,11 +35,11 @@ export async function handleMcpRequest(
 	);
 
 	if (!auth.ok) {
-		await recordAuditEvent(db, audit, {
-			eventType: "auth_failed",
+		await recordAuthFailureAudit(db, audit, {
+			endpoint: "mcp",
+			reason: auth.reason,
 			occurredAt: now,
 			fromAgentId: auth.agentId,
-			reasonCode: auditReasonCode(auth.reason),
 		});
 		// Every failure looks the same to the client; the reason is in the audit log.
 		return new Response(null, {
@@ -49,11 +48,11 @@ export async function handleMcpRequest(
 		});
 	}
 	if (auth.suspended) {
-		await recordAuditEvent(db, audit, {
-			eventType: "auth_failed",
+		await recordAuthFailureAudit(db, audit, {
+			endpoint: "mcp",
+			reason: "sender_suspended",
 			occurredAt: now,
 			fromAgentId: auth.agent.id,
-			reasonCode: "sender_suspended",
 		});
 		return new Response("agent suspended", { status: 403 });
 	}

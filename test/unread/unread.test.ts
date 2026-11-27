@@ -10,7 +10,7 @@ import {
 } from "../../src/admin";
 import { designateAdminBot, handleAdminMcpRequest } from "../../src/adminbot";
 import { queryAuditLog } from "../../src/audit";
-import { issueToken } from "../../src/auth";
+import { AUTH_FAILURE_AUDIT_MAX_PER_WINDOW, issueToken } from "../../src/auth";
 import {
 	answerQuestion,
 	fetchInbox,
@@ -305,7 +305,7 @@ describe("GET /unread", () => {
 		}
 	});
 
-	it("rejects query parameter ?token=... without Authorization header and missing/invalid tokens with 401", async () => {
+	it("rejects query parameter ?token=..., missing, and malformed headers with 401 and zero audit writes, while auditing well-formed unknown tokens", async () => {
 		const queryTokenRes = await unreadGet(
 			null,
 			`${UNREAD_URL}?token=${encodeURIComponent(aliceUnreadToken)}`,
@@ -316,8 +316,20 @@ describe("GET /unread", () => {
 		expect(queryTokenRes.headers.get("Cache-Control")).toBe("no-store");
 		expect(await queryTokenRes.text()).toBe("");
 
-		const unknownRes = await unreadGet(
+		for (const header of [
+			"Basic dXNlcjpwYXNz",
 			"Bearer paab_unknown_token_value_12345678901234567890",
+			"Bearer garbage",
+		]) {
+			const malformedRes = await unreadGet(header, UNREAD_URL, T0 + 15);
+			expect(malformedRes.status).toBe(401);
+			expect(malformedRes.headers.get("Cache-Control")).toBe("no-store");
+		}
+		expect(await authFailedAudits()).toEqual([]);
+
+		const wellFormedUnknown = `paab_${"A".repeat(43)}`;
+		const unknownRes = await unreadGet(
+			`Bearer ${wellFormedUnknown}`,
 			UNREAD_URL,
 			T0 + 20,
 		);
@@ -325,10 +337,22 @@ describe("GET /unread", () => {
 		expect(unknownRes.headers.get("Cache-Control")).toBe("no-store");
 
 		const audits = await authFailedAudits();
-		expect(audits.map((entry) => entry.reasonCode)).toEqual([
-			"token_missing",
-			"token_unknown",
-		]);
+		expect(audits.map((entry) => entry.reasonCode)).toEqual(["token_unknown"]);
+	});
+
+	it("throttles burst auth_failed audit writes on GET /unread while still returning 401", async () => {
+		const wellFormedUnknown = `paab_${"D".repeat(43)}`;
+		for (let i = 0; i < AUTH_FAILURE_AUDIT_MAX_PER_WINDOW + 5; i++) {
+			const res = await unreadGet(
+				`Bearer ${wellFormedUnknown}`,
+				UNREAD_URL,
+				T0 + i,
+			);
+			expect(res.status).toBe(401);
+		}
+		expect(await authFailedAudits()).toHaveLength(
+			AUTH_FAILURE_AUDIT_MAX_PER_WINDOW,
+		);
 	});
 
 	it("rejects non-GET methods (POST, HEAD, PUT) with 405 and Allow: GET", async () => {

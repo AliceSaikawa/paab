@@ -1,7 +1,7 @@
 import type { AgentRow, CategoryRow } from "../db";
 import type { ReasonCode, UnixMillis } from "../types";
 
-const DAY_MS = 24 * 60 * 60 * 1000;
+export const UTC_DAY_MS = 24 * 60 * 60 * 1000;
 
 /** The reasons the policy check itself can give for a denial. */
 export type PolicyReasonCode = Extract<
@@ -48,7 +48,7 @@ export type QuestionDecision =
 
 /** Returns the start of the UTC day that contains `now`. */
 export function utcDayStart(now: UnixMillis): UnixMillis {
-	return Math.floor(now / DAY_MS) * DAY_MS;
+	return Math.floor(now / UTC_DAY_MS) * UTC_DAY_MS;
 }
 
 /**
@@ -68,7 +68,7 @@ export function countDailyQuestions(
 			WHERE kind = 'question' AND from_agent_id = ?
 				AND created_at >= ? AND created_at < ?`,
 		)
-		.bind(fromAgentId, dayStart, dayStart + DAY_MS);
+		.bind(fromAgentId, dayStart, dayStart + UTC_DAY_MS);
 }
 
 /**
@@ -76,20 +76,25 @@ export function countDailyQuestions(
  *
  * When several denial conditions hold, the first of these wins:
  *   1. sender_suspended
- *   2. recipient_not_found
- *   3. self_addressed
- *   4. recipient_suspended
- *   5. category_not_found
- *   6. no_allow_rule
- *   7. daily_limit_exceeded
+ *   2. daily_limit_exceeded
+ *   3. recipient_not_found
+ *   4. self_addressed
+ *   5. recipient_suspended
+ *   6. category_not_found
+ *   7. no_allow_rule
+ *
+ * Checking `daily_limit_exceeded` right after `sender_suspended` keeps a
+ * runaway agent from bypassing over-limit write suppression by sending
+ * questions to unknown recipients or disallowed categories.
  *
  * The daily limit compares the number of questions the sender already has
  * on the current UTC day, not counting the one being checked, against
  * `daily_question_limit`. This function only reads. The caller inserts the
- * question row afterwards (`pending` when allowed, `blocked` when denied),
- * and that row is what makes the question count. Because the check and the
- * insert are separate, questions checked concurrently can each see the same
- * count and exceed the limit by the number of concurrent requests minus one.
+ * question row afterwards (`pending` when allowed, `blocked` when denied
+ * below the daily limit), and that row is what makes the question count.
+ * Because the check and the insert are separate, questions checked
+ * concurrently can each see the same count and exceed the limit by the
+ * number of concurrent requests minus one.
  *
  * Throws if `fromAgentId` does not exist, since the sender comes from
  * authentication and not from the caller's input.
@@ -139,13 +144,13 @@ export async function checkQuestion(
 	});
 
 	if (sender.status !== "active") return deny("sender_suspended");
+	if (count >= sender.daily_question_limit) {
+		return deny("daily_limit_exceeded");
+	}
 	if (recipient === null) return deny("recipient_not_found");
 	if (recipient.id === sender.id) return deny("self_addressed");
 	if (recipient.status !== "active") return deny("recipient_suspended");
 	if (category === null) return deny("category_not_found");
 	if (!hasRule) return deny("no_allow_rule");
-	if (count >= sender.daily_question_limit) {
-		return deny("daily_limit_exceeded");
-	}
 	return { allowed: true, toAgentId: recipient.id, categoryId: category.id };
 }
