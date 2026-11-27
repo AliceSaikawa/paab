@@ -14,12 +14,14 @@ const DESCRIPTIONS_TITLE = "説明文";
 
 function statusForDescriptionError(
 	code: DescriptionErrorCode,
-): 400 | 403 | 404 {
+): 400 | 403 | 404 | 409 {
 	switch (code) {
 		case "not_found":
 			return 404;
 		case "self_approval_forbidden":
 			return 403;
+		case "submission_changed":
+			return 409;
 		default:
 			return 400;
 	}
@@ -60,8 +62,16 @@ async function handleApproveDescription(
 	ctx: AdminPostContext,
 ): Promise<Response> {
 	const agentId = ctx.params.agentId ?? "";
+	const submissionId = ctx.form.get("submission_id") ?? "";
+	if (submissionId.trim().length === 0) {
+		return renderDescriptionsScreen(ctx, {
+			status: 400,
+			flash: { kind: "error", message: "提出IDを指定してください" },
+		});
+	}
 	const result = await approvePendingDescription(ctx.env.DB, {
 		agentId,
+		expectedSubmissionId: submissionId,
 		actor: { actorType: "owner", actorId: ctx.user.email },
 		now: ctx.now,
 	});
@@ -84,8 +94,16 @@ async function handleRejectDescription(
 	ctx: AdminPostContext,
 ): Promise<Response> {
 	const agentId = ctx.params.agentId ?? "";
+	const submissionId = ctx.form.get("submission_id") ?? "";
+	if (submissionId.trim().length === 0) {
+		return renderDescriptionsScreen(ctx, {
+			status: 400,
+			flash: { kind: "error", message: "提出IDを指定してください" },
+		});
+	}
 	const result = await rejectPendingDescription(ctx.env.DB, {
 		agentId,
+		expectedSubmissionId: submissionId,
 		actor: { actorType: "owner", actorId: ctx.user.email },
 		now: ctx.now,
 	});

@@ -8,6 +8,7 @@ import {
 import {
 	type AgentRow,
 	agentFromRow,
+	newId,
 	oneOf,
 	type PendingDescriptionRow,
 	pendingDescriptionFromRow,
@@ -22,7 +23,13 @@ import {
 } from "../types";
 import { getAdminBotConfig } from "./config";
 
-export type DescriptionErrorCode = AdminErrorCode | "self_approval_forbidden";
+export type DescriptionErrorCode =
+	| AdminErrorCode
+	| "self_approval_forbidden"
+	| "submission_changed";
+
+const SUBMISSION_CHANGED_MESSAGE =
+	"承認待ちの説明文が新しい内容へ更新されたため処理できませんでした。最新の内容を確認し直してください";
 
 export interface DescriptionFailure {
 	ok: false;
@@ -46,6 +53,7 @@ export type SubmitPendingDescriptionResult =
 
 export interface PendingDescriptionView {
 	agentId: string;
+	submissionId: string;
 	agentName: string;
 	agentStatus: AgentStatus;
 	currentDescription: string;
@@ -56,6 +64,7 @@ export interface PendingDescriptionView {
 
 export interface ReviewPendingDescriptionInput {
 	agentId: string;
+	expectedSubmissionId: string;
 	actor: ChangeActor;
 	now: UnixMillis;
 }
@@ -73,6 +82,7 @@ export interface RejectedDescriptionData {
 
 interface PendingDescriptionJoinRow {
 	agent_id: string;
+	submission_id: string;
 	pending_description: string;
 	submitted_at: number;
 	agent_name: string;
@@ -82,6 +92,20 @@ interface PendingDescriptionJoinRow {
 
 function fail(code: DescriptionErrorCode, message: string): DescriptionFailure {
 	return { ok: false, code, message };
+}
+
+async function classifyMissingPendingDelete(
+	db: D1Database,
+	agentId: string,
+): Promise<DescriptionFailure> {
+	const currentPending = await db
+		.prepare("SELECT agent_id FROM pending_descriptions WHERE agent_id = ?")
+		.bind(agentId)
+		.first<{ agent_id: string }>();
+	if (currentPending !== null) {
+		return fail("submission_changed", SUBMISSION_CHANGED_MESSAGE);
+	}
+	return adminFail("not_found", "承認待ちの説明文が見つかりません");
 }
 
 /**
@@ -113,6 +137,7 @@ export async function submitPendingDescription(
 
 	const pending: PendingDescription = {
 		agentId: agentId.value,
+		submissionId: newId(),
 		description: description.value,
 		submittedAt: input.now,
 	};
@@ -139,6 +164,7 @@ export async function listPendingDescriptions(
 			.prepare(
 				`SELECT
 					pd.agent_id,
+					pd.submission_id,
 					pd.description AS pending_description,
 					pd.submitted_at,
 					a.name AS agent_name,
@@ -152,15 +178,24 @@ export async function listPendingDescriptions(
 		getAdminBotConfig(db),
 	]);
 
-	return rowsResult.results.map((row) => ({
-		agentId: row.agent_id,
-		agentName: row.agent_name,
-		agentStatus: oneOf(AGENT_STATUSES, row.agent_status, "agents.status"),
-		currentDescription: row.current_description,
-		pendingDescription: row.pending_description,
-		submittedAt: row.submitted_at,
-		isAdminBot: config.agentId !== null && config.agentId === row.agent_id,
-	}));
+	return rowsResult.results.map((row) => {
+		const pending = pendingDescriptionFromRow({
+			agent_id: row.agent_id,
+			submission_id: row.submission_id,
+			description: row.pending_description,
+			submitted_at: row.submitted_at,
+		});
+		return {
+			agentId: pending.agentId,
+			submissionId: pending.submissionId,
+			agentName: row.agent_name,
+			agentStatus: oneOf(AGENT_STATUSES, row.agent_status, "agents.status"),
+			currentDescription: row.current_description,
+			pendingDescription: pending.description,
+			submittedAt: pending.submittedAt,
+			isAdminBot: config.agentId !== null && config.agentId === row.agent_id,
+		};
+	});
 }
 
 /**
@@ -169,7 +204,8 @@ export async function listPendingDescriptions(
  * `description_approved` in `change_log`.
  *
  * Refuses self-approval when `actor` is `admin_bot` matching `agentId`
- * (design 5.4).
+ * (design 5.4), and refuses approval unless `expectedSubmissionId` matches the
+ * currently pending submission (TOCTOU protection).
  */
 export async function approvePendingDescription(
 	db: D1Database,
@@ -180,6 +216,9 @@ export async function approvePendingDescription(
 
 	const agentId = validateId(input.agentId, "エージェントID");
 	if (!agentId.ok) return agentId;
+
+	const expectedSubmissionId = validateId(input.expectedSubmissionId, "提出ID");
+	if (!expectedSubmissionId.ok) return expectedSubmissionId;
 
 	if (
 		ctx.value.actorType === "admin_bot" &&
@@ -209,6 +248,10 @@ export async function approvePendingDescription(
 
 	const agent = agentFromRow(agentRow);
 	const pending = pendingDescriptionFromRow(pendingRow);
+	if (pending.submissionId !== expectedSubmissionId.value) {
+		return fail("submission_changed", SUBMISSION_CHANGED_MESSAGE);
+	}
+
 	const checkedDescription = validateDescription(pending.description);
 	if (!checkedDescription.ok) {
 		return checkedDescription;
@@ -233,16 +276,10 @@ export async function approvePendingDescription(
 				WHERE id = ?
 					AND EXISTS (
 						SELECT 1 FROM pending_descriptions
-						WHERE agent_id = ? AND submitted_at = ? AND description = ?
+						WHERE agent_id = ? AND submission_id = ?
 					)`,
 			)
-			.bind(
-				nextDescription,
-				agent.id,
-				agent.id,
-				pending.submittedAt,
-				pending.description,
-			),
+			.bind(nextDescription, agent.id, agent.id, expectedSubmissionId.value),
 		db
 			.prepare(
 				`INSERT INTO change_log
@@ -251,7 +288,7 @@ export async function approvePendingDescription(
 				SELECT ?, ?, ?, ?, 'description_approved', 'description', ?, ?, ?, NULL
 				WHERE EXISTS (
 					SELECT 1 FROM pending_descriptions
-					WHERE agent_id = ? AND submitted_at = ? AND description = ?
+					WHERE agent_id = ? AND submission_id = ?
 				)`,
 			)
 			.bind(
@@ -263,21 +300,17 @@ export async function approvePendingDescription(
 				beforeJson,
 				afterJson,
 				agent.id,
-				pending.submittedAt,
-				pending.description,
+				expectedSubmissionId.value,
 			),
 		db
 			.prepare(
 				`DELETE FROM pending_descriptions
-				WHERE agent_id = ? AND submitted_at = ? AND description = ?`,
+				WHERE agent_id = ? AND submission_id = ?`,
 			)
-			.bind(agent.id, pending.submittedAt, pending.description),
+			.bind(agent.id, expectedSubmissionId.value),
 	]);
 	if ((deleteRes?.meta.changes ?? 0) === 0) {
-		return adminFail(
-			"not_found",
-			"承認待ちの説明文が更新または処理されたため承認できませんでした",
-		);
+		return classifyMissingPendingDelete(db, agent.id);
 	}
 	const changeId = Number(changeRes?.meta.last_row_id);
 	if (!Number.isSafeInteger(changeId) || changeId <= 0) {
@@ -301,7 +334,8 @@ export async function approvePendingDescription(
  * `change_log`.
  *
  * Refuses self-rejection when `actor` is `admin_bot` matching `agentId`
- * (design 5.4).
+ * (design 5.4), and refuses rejection unless `expectedSubmissionId` matches the
+ * currently pending submission (TOCTOU protection).
  */
 export async function rejectPendingDescription(
 	db: D1Database,
@@ -312,6 +346,9 @@ export async function rejectPendingDescription(
 
 	const agentId = validateId(input.agentId, "エージェントID");
 	if (!agentId.ok) return agentId;
+
+	const expectedSubmissionId = validateId(input.expectedSubmissionId, "提出ID");
+	if (!expectedSubmissionId.ok) return expectedSubmissionId;
 
 	if (
 		ctx.value.actorType === "admin_bot" &&
@@ -341,6 +378,9 @@ export async function rejectPendingDescription(
 
 	const agent = agentFromRow(agentRow);
 	const pending = pendingDescriptionFromRow(pendingRow);
+	if (pending.submissionId !== expectedSubmissionId.value) {
+		return fail("submission_changed", SUBMISSION_CHANGED_MESSAGE);
+	}
 
 	const beforeJson = JSON.stringify({
 		agentId: agent.id,
@@ -356,7 +396,7 @@ export async function rejectPendingDescription(
 				SELECT ?, ?, ?, ?, 'description_rejected', 'description', ?, ?, NULL, NULL
 				WHERE EXISTS (
 					SELECT 1 FROM pending_descriptions
-					WHERE agent_id = ? AND submitted_at = ? AND description = ?
+					WHERE agent_id = ? AND submission_id = ?
 				)`,
 			)
 			.bind(
@@ -367,21 +407,17 @@ export async function rejectPendingDescription(
 				agent.id,
 				beforeJson,
 				agent.id,
-				pending.submittedAt,
-				pending.description,
+				expectedSubmissionId.value,
 			),
 		db
 			.prepare(
 				`DELETE FROM pending_descriptions
-				WHERE agent_id = ? AND submitted_at = ? AND description = ?`,
+				WHERE agent_id = ? AND submission_id = ?`,
 			)
-			.bind(agent.id, pending.submittedAt, pending.description),
+			.bind(agent.id, expectedSubmissionId.value),
 	]);
 	if ((deleteRes?.meta.changes ?? 0) === 0) {
-		return adminFail(
-			"not_found",
-			"承認待ちの説明文が更新または処理されたため却下できませんでした",
-		);
+		return classifyMissingPendingDelete(db, agent.id);
 	}
 	const changeId = Number(changeRes?.meta.last_row_id);
 	if (!Number.isSafeInteger(changeId) || changeId <= 0) {

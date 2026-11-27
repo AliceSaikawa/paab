@@ -68,11 +68,16 @@ describe("submit_description tool", () => {
 			"remains visible in list_agents until approved",
 		);
 
-		expect(await loadPending(world.bob.agent.id)).toEqual({
+		const firstPending = await loadPending(world.bob.agent.id);
+		expect(firstPending).toEqual({
 			agentId: world.bob.agent.id,
+			submissionId: expect.any(String),
 			description: "Draft v1:\tmanages personal schedule\nand reminders.",
 			submittedAt: T0 + 10,
 		});
+		expect(withoutFooter(firstSubmit.text)).toContain(
+			`submission_id: ${firstPending?.submissionId}`,
+		);
 		expect(await loadAgentDescription(world.bob.agent.id)).toBe("bob knows");
 
 		// Other agents still see only the previously approved description.
@@ -80,17 +85,23 @@ describe("submit_description tool", () => {
 		expect(duringPending.text).toContain("bob knows");
 		expect(duringPending.text).not.toContain("Draft v1");
 
-		// Resubmitting replaces the previous pending draft (with NFC normalization).
+		// Resubmitting replaces the previous pending draft (with NFC normalization) and issues a fresh submission_id.
 		const bob2 = await connect(world.bob.token, { now: T0 + 25 });
 		const secondSubmit = await call(bob2, "submit_description", {
 			description: "か\u3099担当の予定エージェント",
 		});
 		expect(secondSubmit.isError).toBe(false);
-		expect(await loadPending(world.bob.agent.id)).toEqual({
+		const secondPending = await loadPending(world.bob.agent.id);
+		expect(secondPending).toEqual({
 			agentId: world.bob.agent.id,
+			submissionId: expect.any(String),
 			description: "が担当の予定エージェント",
 			submittedAt: T0 + 25,
 		});
+		expect(secondPending?.submissionId).not.toBe(firstPending?.submissionId);
+		expect(withoutFooter(secondSubmit.text)).toContain(
+			`submission_id: ${secondPending?.submissionId}`,
+		);
 		expect(await loadAgentDescription(world.bob.agent.id)).toBe("bob knows");
 
 		// Still only one pending row for bob.
@@ -105,6 +116,7 @@ describe("submit_description tool", () => {
 		// Once approved, list_agents returns the newly approved description.
 		const approved = await approvePendingDescription(world.db, {
 			agentId: world.bob.agent.id,
+			expectedSubmissionId: secondPending?.submissionId ?? "",
 			actor: { actorType: "owner", actorId: "owner@example.com" },
 			now: T0 + 30,
 		});

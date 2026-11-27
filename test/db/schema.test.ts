@@ -1225,6 +1225,7 @@ describe("migrations", () => {
 
 		const draft: PendingDescription = {
 			agentId: a.id,
+			submissionId: newId(),
 			description: "Updated agent description",
 			submittedAt: T0 + 10,
 		};
@@ -1236,9 +1237,10 @@ describe("migrations", () => {
 			.first<PendingDescriptionRow>();
 		expect(loaded && pendingDescriptionFromRow(loaded)).toEqual(draft);
 
-		// Upsert replaces the previous draft for the same agent.
+		// Upsert replaces the previous draft and submission_id for the same agent.
 		const revised: PendingDescription = {
 			agentId: a.id,
+			submissionId: newId(),
 			description: "Revised agent description",
 			submittedAt: T0 + 20,
 		};
@@ -1253,21 +1255,32 @@ describe("migrations", () => {
 		await expect(
 			db
 				.prepare(
-					`INSERT INTO pending_descriptions (agent_id, description, submitted_at)
-					VALUES (?, 'desc', 'not-int')`,
+					`INSERT INTO pending_descriptions (agent_id, submission_id, description, submitted_at)
+					VALUES (?, ?, 'desc', 'not-int')`,
 				)
-				.bind(b.id)
+				.bind(b.id, newId())
 				.run(),
 		).rejects.toThrow(/STRICT|datatype/i);
+
+		// NOT NULL check on submission_id.
+		await expect(
+			db
+				.prepare(
+					`INSERT INTO pending_descriptions (agent_id, submission_id, description, submitted_at)
+					VALUES (?, NULL, 'desc', ?)`,
+				)
+				.bind(b.id, T0)
+				.run(),
+		).rejects.toThrow(/NOT NULL/);
 
 		// NOT NULL check on description.
 		await expect(
 			db
 				.prepare(
-					`INSERT INTO pending_descriptions (agent_id, description, submitted_at)
-					VALUES (?, NULL, ?)`,
+					`INSERT INTO pending_descriptions (agent_id, submission_id, description, submitted_at)
+					VALUES (?, ?, NULL, ?)`,
 				)
-				.bind(b.id, T0)
+				.bind(b.id, newId(), T0)
 				.run(),
 		).rejects.toThrow(/NOT NULL/);
 
@@ -1275,6 +1288,7 @@ describe("migrations", () => {
 		await expect(
 			upsertPendingDescription(db, {
 				agentId: newId(),
+				submissionId: newId(),
 				description: "ghost",
 				submittedAt: T0,
 			}).run(),
@@ -1294,11 +1308,13 @@ describe("pending_descriptions", () => {
 		const b = await seedAgent(db, { name: "b" });
 		const second: PendingDescription = {
 			agentId: b.id,
+			submissionId: newId(),
 			description: "second",
 			submittedAt: T0 + 20,
 		};
 		const first: PendingDescription = {
 			agentId: a.id,
+			submissionId: newId(),
 			description: "first",
 			submittedAt: T0 + 10,
 		};
@@ -1517,6 +1533,25 @@ describe("row conversion", () => {
 				}),
 			),
 		).toThrow(/newLimit/);
+	});
+
+	it("rejects empty or blank pending_descriptions.submission_id", () => {
+		expect(() =>
+			pendingDescriptionFromRow({
+				agent_id: "a1",
+				submission_id: "",
+				description: "desc",
+				submitted_at: T0,
+			}),
+		).toThrow(/pending_descriptions\.submission_id/);
+		expect(() =>
+			pendingDescriptionFromRow({
+				agent_id: "a1",
+				submission_id: "   ",
+				description: "desc",
+				submitted_at: T0,
+			}),
+		).toThrow(/pending_descriptions\.submission_id/);
 	});
 });
 
@@ -1939,8 +1974,10 @@ describe("agent_webhooks and webhook_deliveries (migration 0007)", () => {
 
 		await applyD1Migrations(db, [m1, m2, m3, m4, m5, m6]);
 		const a = await seedAgent(db, { name: "existing-agent" });
+		const submissionId = newId();
 		await upsertPendingDescription(db, {
 			agentId: a.id,
+			submissionId,
 			description: "Draft description",
 			submittedAt: T0,
 		}).run();
@@ -1954,6 +1991,7 @@ describe("agent_webhooks and webhook_deliveries (migration 0007)", () => {
 			.bind(a.id)
 			.first<PendingDescriptionRow>();
 		expect(preserved?.description).toBe("Draft description");
+		expect(preserved?.submission_id).toBe(submissionId);
 
 		await upsertAgentWebhook(db, {
 			agentId: a.id,

@@ -521,13 +521,15 @@ describe("revertAdminBotChange", () => {
 			status: "active",
 		});
 
-		await submitPendingDescription(db, {
+		const sub1 = await submitPendingDescription(db, {
 			agentId: grok.id,
 			description: "approved bio v1",
 			now: T0 + 1,
 		});
+		if (!sub1.ok) throw new Error("submit 1 failed");
 		const approved1 = await approvePendingDescription(db, {
 			agentId: grok.id,
+			expectedSubmissionId: sub1.data.pending.submissionId,
 			actor: BOT,
 			now: T0 + 2,
 		});
@@ -542,13 +544,15 @@ describe("revertAdminBotChange", () => {
 			actor: OWNER,
 			now: T0 + 4,
 		});
-		await submitPendingDescription(db, {
+		const subReject = await submitPendingDescription(db, {
 			agentId: grok.id,
 			description: "rejected draft",
 			now: T0 + 5,
 		});
+		if (!subReject.ok) throw new Error("submit reject failed");
 		const rejected = await rejectPendingDescription(db, {
 			agentId: grok.id,
+			expectedSubmissionId: subReject.data.pending.submissionId,
 			actor: BOT,
 			now: T0 + 6,
 		});
@@ -596,23 +600,27 @@ describe("revertAdminBotChange", () => {
 		).toMatchObject({ ok: false, code: "already_reverted" });
 
 		// A newer description_approved blocks reverting an earlier description_approved until undone newest-first.
-		await submitPendingDescription(db, {
+		const sub2 = await submitPendingDescription(db, {
 			agentId: grok.id,
 			description: "approved bio v2",
 			now: T0 + 10,
 		});
+		if (!sub2.ok) throw new Error("submit 2 failed");
 		const approved2 = await approvePendingDescription(db, {
 			agentId: grok.id,
+			expectedSubmissionId: sub2.data.pending.submissionId,
 			actor: BOT,
 			now: T0 + 11,
 		});
-		await submitPendingDescription(db, {
+		const sub3 = await submitPendingDescription(db, {
 			agentId: grok.id,
 			description: "approved bio v3",
 			now: T0 + 12,
 		});
+		if (!sub3.ok) throw new Error("submit 3 failed");
 		const approved3 = await approvePendingDescription(db, {
 			agentId: grok.id,
+			expectedSubmissionId: sub3.data.pending.submissionId,
 			actor: BOT,
 			now: T0 + 13,
 		});

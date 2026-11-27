@@ -160,6 +160,27 @@ async function loadPendingRow(
 		.first<PendingDescriptionRow>();
 }
 
+function extractFormSubmissionId(
+	html: string,
+	agentId: string,
+	action: "approve" | "reject",
+): string {
+	const escapedAction =
+		`/admin/descriptions/${encodeURIComponent(agentId)}/${action}`.replace(
+			/[.*+?^${}()|[\]\\]/g,
+			"\\$&",
+		);
+	const match = new RegExp(
+		`action="${escapedAction}"[\\s\\S]*?<input type="hidden" name="submission_id" value="([^"]+)"`,
+	).exec(html);
+	if (!match?.[1]) {
+		throw new Error(
+			`Expected hidden submission_id input for ${action} of ${agentId}`,
+		);
+	}
+	return match[1];
+}
+
 async function sha256HeaderValue(text: string): Promise<string> {
 	const digest = await crypto.subtle.digest(
 		"SHA-256",
@@ -198,16 +219,17 @@ describe("GET /admin/descriptions", () => {
 
 		const xssPending =
 			'<script>alert("xss")</script> & <img src=x onerror=alert(1)>';
-		await submitPendingDescription(db, {
+		const museSub = await submitPendingDescription(db, {
 			agentId: muse.id,
 			description: "Muse updated bio",
 			now: T0 + 10,
 		});
-		await submitPendingDescription(db, {
+		const carolSub = await submitPendingDescription(db, {
 			agentId: carol.id,
 			description: xssPending,
 			now: T0 + 20,
 		});
+		if (!museSub.ok || !carolSub.ok) throw new Error("Expected submits");
 
 		const { response, html } = await openDescriptionsSession(T0 + 30);
 		expect(response.status).toBe(200);
@@ -228,6 +250,18 @@ describe("GET /admin/descriptions", () => {
 		);
 		expect(html).toContain("承認して公開する");
 		expect(html).toContain("却下する");
+		expect(extractFormSubmissionId(html, muse.id, "approve")).toBe(
+			museSub.data.pending.submissionId,
+		);
+		expect(extractFormSubmissionId(html, muse.id, "reject")).toBe(
+			museSub.data.pending.submissionId,
+		);
+		expect(extractFormSubmissionId(html, carol.id, "approve")).toBe(
+			carolSub.data.pending.submissionId,
+		);
+		expect(extractFormSubmissionId(html, carol.id, "reject")).toBe(
+			carolSub.data.pending.submissionId,
+		);
 	});
 });
 
@@ -240,11 +274,39 @@ describe("POST /admin/descriptions/:agentId/approve and /reject", () => {
 			now: T0 + 5,
 		});
 
-		const { session } = await openDescriptionsSession(T0 + 10);
-		const approveBot = await adminPost(
+		const { session, html: initialHtml } = await openDescriptionsSession(
+			T0 + 10,
+		);
+		const museSubmissionId = extractFormSubmissionId(
+			initialHtml,
+			muse.id,
+			"approve",
+		);
+
+		// Missing submission_id returns 400 and leaves pending row untouched.
+		const missingSubmissionApprove = await adminPost(
 			`/admin/descriptions/${encodeURIComponent(muse.id)}/approve`,
 			session,
 			{},
+			T0 + 14,
+		);
+		expect(missingSubmissionApprove.response.status).toBe(400);
+		expect(missingSubmissionApprove.html).toContain("提出IDを指定してください");
+		expect(await loadPendingRow(muse.id)).not.toBeNull();
+
+		const missingSubmissionReject = await adminPost(
+			`/admin/descriptions/${encodeURIComponent(muse.id)}/reject`,
+			session,
+			{ submission_id: "   " },
+			T0 + 14,
+		);
+		expect(missingSubmissionReject.response.status).toBe(400);
+		expect(missingSubmissionReject.html).toContain("提出IDを指定してください");
+
+		const approveBot = await adminPost(
+			`/admin/descriptions/${encodeURIComponent(muse.id)}/approve`,
+			session,
+			{ submission_id: museSubmissionId },
 			T0 + 15,
 		);
 		expect(approveBot.response.status).toBe(200);
@@ -256,21 +318,22 @@ describe("POST /admin/descriptions/:agentId/approve and /reject", () => {
 
 		// Clear admin bot designation: owner handles all agents on /admin/descriptions.
 		await clearAdminBot(db, { actor: OWNER, now: T0 + 20 });
-		await submitPendingDescription(db, {
+		const grokSub = await submitPendingDescription(db, {
 			agentId: grok.id,
 			description: "Approved while no admin bot",
 			now: T0 + 25,
 		});
-		await submitPendingDescription(db, {
+		const carolSub = await submitPendingDescription(db, {
 			agentId: carol.id,
 			description: "Rejected while no admin bot",
 			now: T0 + 26,
 		});
+		if (!grokSub.ok || !carolSub.ok) throw new Error("Expected submits");
 
 		const approveGrok = await adminPost(
 			`/admin/descriptions/${encodeURIComponent(grok.id)}/approve`,
 			session,
-			{},
+			{ submission_id: grokSub.data.pending.submissionId },
 			T0 + 30,
 		);
 		expect(approveGrok.response.status).toBe(200);
@@ -296,7 +359,7 @@ describe("POST /admin/descriptions/:agentId/approve and /reject", () => {
 		const rejectCarol = await adminPost(
 			`/admin/descriptions/${encodeURIComponent(carol.id)}/reject`,
 			session,
-			{},
+			{ submission_id: carolSub.data.pending.submissionId },
 			T0 + 35,
 		);
 		expect(rejectCarol.response.status).toBe(200);
@@ -308,7 +371,7 @@ describe("POST /admin/descriptions/:agentId/approve and /reject", () => {
 		const doubleApprove = await adminPost(
 			`/admin/descriptions/${encodeURIComponent(grok.id)}/approve`,
 			session,
-			{},
+			{ submission_id: grokSub.data.pending.submissionId },
 			T0 + 40,
 		);
 		expect(doubleApprove.response.status).toBe(404);
@@ -333,15 +396,116 @@ describe("POST /admin/descriptions/:agentId/approve and /reject", () => {
 		expect(noCsrf.status).toBe(403);
 	});
 
+	it("returns 409 Conflict on TOCTOU overwrite between GET /admin/descriptions and POST approve/reject, then succeeds with fresh submission_id", async () => {
+		const grokToken = (
+			await issueToken(db, {
+				agentId: grok.id,
+				purpose: "participant",
+				now: T0,
+			})
+		).token;
+
+		const grokMcp1 = await connect(grokToken, { now: T0 + 5 });
+		const submitD1 = await call(grokMcp1, "submit_description", {
+			description: "Benign D1 bio for UI review",
+		});
+		expect(submitD1.isError).toBe(false);
+
+		// Owner opens /admin/descriptions and sees benign D1 with hidden submission_id S1.
+		const { session, html: pageD1 } = await openDescriptionsSession(T0 + 10);
+		expect(pageD1).toContain("Benign D1 bio for UI review");
+		const s1Approve = extractFormSubmissionId(pageD1, grok.id, "approve");
+		const s1Reject = extractFormSubmissionId(pageD1, grok.id, "reject");
+		expect(s1Approve).toBe(s1Reject);
+
+		// Agent overwrites pending description with malicious D2 before owner submits form.
+		const grokMcp2 = await connect(grokToken, { now: T0 + 15 });
+		const submitD2 = await call(grokMcp2, "submit_description", {
+			description: "Malicious D2 bio swapped before click",
+		});
+		expect(submitD2.isError).toBe(false);
+
+		// Approving with stale S1 fails with HTTP 409, leaving agents.description and change_log untouched.
+		const staleApprove = await adminPost(
+			`/admin/descriptions/${encodeURIComponent(grok.id)}/approve`,
+			session,
+			{ submission_id: s1Approve },
+			T0 + 20,
+		);
+		expect(staleApprove.response.status).toBe(409);
+		expect(staleApprove.html).toContain(
+			"承認待ちの説明文が新しい内容へ更新されたため処理できませんでした",
+		);
+		expect(staleApprove.html).toContain(
+			"Malicious D2 bio swapped before click",
+		);
+		expect((await loadAgent(grok.id)).description).toBe(
+			"Published grok description",
+		);
+		expect(
+			await queryChangeLog(db, { targetType: "description" }),
+		).toHaveLength(0);
+		expect((await loadPendingRow(grok.id))?.description).toBe(
+			"Malicious D2 bio swapped before click",
+		);
+
+		// Rejecting with stale S1 also fails with HTTP 409 and keeps D2 pending.
+		const staleReject = await adminPost(
+			`/admin/descriptions/${encodeURIComponent(grok.id)}/reject`,
+			session,
+			{ submission_id: s1Reject },
+			T0 + 21,
+		);
+		expect(staleReject.response.status).toBe(409);
+		expect(staleReject.html).toContain(
+			"承認待ちの説明文が新しい内容へ更新されたため処理できませんでした",
+		);
+		expect((await loadAgent(grok.id)).description).toBe(
+			"Published grok description",
+		);
+		expect(
+			await queryChangeLog(db, { targetType: "description" }),
+		).toHaveLength(0);
+		expect((await loadPendingRow(grok.id))?.description).toBe(
+			"Malicious D2 bio swapped before click",
+		);
+
+		// Extracting D2's fresh submission_id S2 from the refreshed screen and approving succeeds.
+		const s2Approve = extractFormSubmissionId(
+			staleApprove.html,
+			grok.id,
+			"approve",
+		);
+		expect(s2Approve).not.toBe(s1Approve);
+
+		const freshApprove = await adminPost(
+			`/admin/descriptions/${encodeURIComponent(grok.id)}/approve`,
+			session,
+			{ submission_id: s2Approve },
+			T0 + 25,
+		);
+		expect(freshApprove.response.status).toBe(200);
+		expect(freshApprove.html).toContain("説明文を承認して公開しました");
+		expect((await loadAgent(grok.id)).description).toBe(
+			"Malicious D2 bio swapped before click",
+		);
+		expect(await loadPendingRow(grok.id)).toBeNull();
+		expect(
+			await queryChangeLog(db, { targetType: "description" }),
+		).toHaveLength(1);
+	});
+
 	it("displays description changes cleanly in /admin/rules and lets owner 1-click undo admin bot approvals in /admin/adminbot", async () => {
 		await designateAdminBot(db, { agentId: muse.id, actor: OWNER, now: T0 });
-		await submitPendingDescription(db, {
+		const sub = await submitPendingDescription(db, {
 			agentId: grok.id,
 			description: "Bot-approved grok bio",
 			now: T0 + 10,
 		});
+		if (!sub.ok) throw new Error("Expected submit to succeed");
 		const botApprove = await approvePendingDescription(db, {
 			agentId: grok.id,
+			expectedSubmissionId: sub.data.pending.submissionId,
 			actor: { actorType: "admin_bot", actorId: muse.id },
 			now: T0 + 20,
 		});

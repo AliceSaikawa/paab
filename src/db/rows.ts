@@ -136,6 +136,7 @@ export interface ProposalRow {
 
 export interface PendingDescriptionRow {
 	agent_id: string;
+	submission_id: string;
 	description: string;
 	submitted_at: number;
 }
@@ -378,8 +379,17 @@ export function proposalFromRow(row: ProposalRow): Proposal {
 export function pendingDescriptionFromRow(
 	row: PendingDescriptionRow,
 ): PendingDescription {
+	if (
+		typeof row.submission_id !== "string" ||
+		row.submission_id.trim().length === 0
+	) {
+		throw new Error(
+			"Invalid value in pending_descriptions.submission_id: must be non-empty",
+		);
+	}
 	return {
 		agentId: row.agent_id,
+		submissionId: row.submission_id,
 		description: row.description,
 		submittedAt: row.submitted_at,
 	};

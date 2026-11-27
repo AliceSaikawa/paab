@@ -61,6 +61,7 @@ function renderPendingDescriptionCard(
 					action="/admin/descriptions/${encodedId}/approve"
 				>
 					${csrfInput(csrfToken)}
+					<input type="hidden" name="submission_id" value="${item.submissionId}">
 					<button type="submit" class="btn btn-primary">承認して公開する</button>
 				</form>
 				<form
@@ -69,6 +70,7 @@ function renderPendingDescriptionCard(
 					action="/admin/descriptions/${encodedId}/reject"
 				>
 					${csrfInput(csrfToken)}
+					<input type="hidden" name="submission_id" value="${item.submissionId}">
 					<button type="submit" class="btn btn-danger">却下する</button>
 				</form>
 			</div>

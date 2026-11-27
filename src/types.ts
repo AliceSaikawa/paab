@@ -293,6 +293,7 @@ export interface Proposal {
 
 export interface PendingDescription {
 	agentId: string;
+	submissionId: string;
 	description: string;
 	submittedAt: UnixMillis;
 }

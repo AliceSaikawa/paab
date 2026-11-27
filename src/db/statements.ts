@@ -186,13 +186,19 @@ export function upsertPendingDescription(
 	return db
 		.prepare(
 			`INSERT INTO pending_descriptions
-				(agent_id, description, submitted_at)
-			VALUES (?, ?, ?)
+				(agent_id, submission_id, description, submitted_at)
+			VALUES (?, ?, ?, ?)
 			ON CONFLICT (agent_id) DO UPDATE SET
+				submission_id = excluded.submission_id,
 				description = excluded.description,
 				submitted_at = excluded.submitted_at`,
 		)
-		.bind(pending.agentId, pending.description, pending.submittedAt);
+		.bind(
+			pending.agentId,
+			pending.submissionId,
+			pending.description,
+			pending.submittedAt,
+		);
 }
 
 export function upsertAgentWebhook(

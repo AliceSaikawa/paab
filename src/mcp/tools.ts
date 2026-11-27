@@ -414,6 +414,7 @@ const submitDescription = defineTool({
 		return ok(
 			block([
 				"status: submitted",
+				`submission_id: ${result.data.pending.submissionId}`,
 				`submitted_at: ${new Date(result.data.pending.submittedAt).toISOString()}`,
 				"note: your description is pending approval; your existing description remains visible in list_agents until approved",
 			]),
