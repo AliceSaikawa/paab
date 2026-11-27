@@ -5,6 +5,7 @@ import type {
 	Message,
 	NewAuditLogEntry,
 	NewChangeLogEntry,
+	Proposal,
 	Token,
 } from "../types";
 
@@ -146,5 +147,31 @@ export function insertChangeLogEntry(
 			entry.beforeJson,
 			entry.afterJson,
 			entry.revertedAt,
+		);
+}
+
+export function insertProposal(
+	db: D1Database,
+	proposal: Proposal,
+): D1PreparedStatement {
+	return db
+		.prepare(
+			`INSERT INTO proposals
+				(id, kind, proposer_agent_id, payload_json, reason, status,
+				created_at, expires_at, resolved_at, resolved_by, change_log_id)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		)
+		.bind(
+			proposal.id,
+			proposal.kind,
+			proposal.proposerAgentId,
+			JSON.stringify(proposal.payload),
+			proposal.reason,
+			proposal.status,
+			proposal.createdAt,
+			proposal.expiresAt,
+			proposal.resolvedAt,
+			proposal.resolvedBy,
+			proposal.changeLogId,
 		);
 }

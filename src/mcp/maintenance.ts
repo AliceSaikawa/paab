@@ -1,10 +1,11 @@
+import { expireProposals } from "../adminbot/proposals";
 import { purgeExpiredAuditBodies, recordAuditEvents } from "../audit";
 import { runInboxMaintenance } from "../inbox";
 import type { UnixMillis } from "../types";
 import { auditBodyConfig, type McpEnv } from "./config";
 
 function reportMaintenanceFailure(
-	step: "inbox" | "audit_purge",
+	step: "inbox" | "audit_purge" | "proposals",
 	error: unknown,
 ): void {
 	try {
@@ -55,6 +56,13 @@ export async function runScheduledMaintenance(
 		await purgeExpiredAuditBodies(db, audit, now);
 	} catch (error) {
 		reportMaintenanceFailure("audit_purge", error);
+		errors.push(error);
+	}
+
+	try {
+		await expireProposals(db, now);
+	} catch (error) {
+		reportMaintenanceFailure("proposals", error);
 		errors.push(error);
 	}
 

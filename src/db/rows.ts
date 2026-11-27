@@ -14,6 +14,11 @@ import {
 	MESSAGE_KINDS,
 	MESSAGE_STATUSES,
 	type Message,
+	PROPOSAL_KINDS,
+	PROPOSAL_STATUSES,
+	type Proposal,
+	type ProposalKind,
+	type ProposalPayload,
 	REASON_CODES,
 	TOKEN_PURPOSES,
 	type Token,
@@ -108,6 +113,20 @@ export interface AdminBotConfigRow {
 	read_bodies: number;
 	superadmin_until: number | null;
 	updated_at: number;
+}
+
+export interface ProposalRow {
+	id: string;
+	kind: string;
+	proposer_agent_id: string;
+	payload_json: string;
+	reason: string;
+	status: string;
+	created_at: number;
+	expires_at: number;
+	resolved_at: number | null;
+	resolved_by: string | null;
+	change_log_id: number | null;
 }
 
 /** Narrows a stored string to one of the known values, or throws. */
@@ -236,5 +255,89 @@ export function adminBotConfigFromRow(row: AdminBotConfigRow): AdminBotConfig {
 		readBodies: row.read_bodies === 1,
 		superadminUntil: row.superadmin_until,
 		updatedAt: row.updated_at,
+	};
+}
+
+function readRequiredString(
+	record: Record<string, unknown>,
+	key: string,
+	context: string,
+): string {
+	const value = record[key];
+	if (typeof value !== "string" || value.trim().length === 0) {
+		throw new Error(`Invalid ${key} in ${context}`);
+	}
+	return value;
+}
+
+/** Parses and validates a stored `proposals.payload_json` against its `kind`. */
+export function parseProposalPayload(
+	kind: ProposalKind,
+	json: string,
+): ProposalPayload {
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(json);
+	} catch {
+		throw new Error("Invalid JSON in proposals.payload_json");
+	}
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+		throw new Error("proposals.payload_json must be a JSON object");
+	}
+	const record = parsed as Record<string, unknown>;
+	if (record.kind !== kind) {
+		throw new Error(
+			`Mismatched kind in proposals.payload_json: expected ${kind}, got ${String(record.kind)}`,
+		);
+	}
+	const context = `proposals.payload_json (${kind})`;
+	switch (kind) {
+		case "grant_allow_rule":
+			return {
+				kind,
+				fromAgentId: readRequiredString(record, "fromAgentId", context),
+				toAgentId: readRequiredString(record, "toAgentId", context),
+				categoryId: readRequiredString(record, "categoryId", context),
+			};
+		case "create_category":
+			return {
+				kind,
+				name: readRequiredString(record, "name", context),
+			};
+		case "raise_daily_limit": {
+			const agentId = readRequiredString(record, "agentId", context);
+			const newLimit = record.newLimit;
+			if (
+				typeof newLimit !== "number" ||
+				!Number.isSafeInteger(newLimit) ||
+				newLimit < 0
+			) {
+				throw new Error(`Invalid newLimit in ${context}`);
+			}
+			return { kind, agentId, newLimit };
+		}
+		case "resume_agent":
+			return {
+				kind,
+				agentId: readRequiredString(record, "agentId", context),
+			};
+	}
+}
+
+export function proposalFromRow(row: ProposalRow): Proposal {
+	const kind = oneOf(PROPOSAL_KINDS, row.kind, "proposals.kind");
+	const status = oneOf(PROPOSAL_STATUSES, row.status, "proposals.status");
+	return {
+		id: row.id,
+		kind,
+		proposerAgentId: row.proposer_agent_id,
+		payload: parseProposalPayload(kind, row.payload_json),
+		reason: row.reason,
+		status,
+		createdAt: row.created_at,
+		expiresAt: row.expires_at,
+		resolvedAt: row.resolved_at,
+		resolvedBy: row.resolved_by,
+		changeLogId: row.change_log_id,
 	};
 }

@@ -17,6 +17,40 @@ export {
 } from "./config";
 export { handleAdminMcpRequest } from "./handler";
 export { ADMIN_SERVER_INSTRUCTIONS } from "./instructions";
+export {
+	listProposalsTool,
+	PROPOSAL_TOOLS,
+	proposeAllowRuleTool,
+	proposeCategoryTool,
+	proposeRaiseDailyLimitTool,
+	proposeResumeAgentTool,
+	type ResolvedAllowRuleTargets,
+	resolveAllowRuleTargets,
+	resolveRaiseLimitTarget,
+	resolveResumeAgentTarget,
+	validateCategoryNameArg,
+	validateProposalReasonArg,
+} from "./proposal-tools";
+export {
+	approveProposal,
+	type CreateProposalInput,
+	createProposal,
+	DEFAULT_PROPOSAL_LIST_LIMIT,
+	describeProposalEffect,
+	expireProposals,
+	type ListProposalsFilter,
+	listProposals,
+	MAX_PENDING_PROPOSALS,
+	MAX_PROPOSAL_LIST_LIMIT,
+	PROPOSAL_REASON_MAX_LENGTH,
+	PROPOSAL_TTL_MS,
+	type ProposalEffectNames,
+	type ProposalErrorCode,
+	type ProposalFailure,
+	type ProposalResult,
+	type ResolveProposalInput,
+	rejectProposal,
+} from "./proposals";
 export { createAdminMcpServer } from "./server";
 export {
 	lowerDailyLimitTool,

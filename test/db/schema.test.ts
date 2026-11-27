@@ -20,10 +20,14 @@ import {
 	insertCategory,
 	insertChangeLogEntry,
 	insertMessage,
+	insertProposal,
 	insertToken,
 	type MessageRow,
 	messageFromRow,
 	newId,
+	type ProposalRow,
+	parseProposalPayload,
+	proposalFromRow,
 	type TokenRow,
 	tokenFromRow,
 } from "../../src/db";
@@ -33,6 +37,7 @@ import type {
 	Message,
 	NewAuditLogEntry,
 	NewChangeLogEntry,
+	Proposal,
 	Token,
 } from "../../src/types";
 import { createTestDb, migrationByName } from "../helpers/db";
@@ -109,6 +114,7 @@ describe("test database helper", () => {
 			"categories",
 			"change_log",
 			"messages",
+			"proposals",
 			"tokens",
 		]);
 		for (const table of tables) {
@@ -673,6 +679,7 @@ describe("migrations", () => {
 
 	it("preserves all existing tables when migrating a populated database from 0002 to 0003 and enforces change_log constraints", async () => {
 		await db.batch([
+			db.prepare("DROP TABLE IF EXISTS proposals"),
 			db.prepare("DROP TABLE IF EXISTS admin_bot_config"),
 			db.prepare("DROP TABLE IF EXISTS change_log"),
 			db.prepare("DROP TABLE IF EXISTS audit_log"),
@@ -826,6 +833,7 @@ describe("migrations", () => {
 
 	it("preserves all existing tables when migrating a populated database from 0003 to 0004 and enforces admin_bot_config constraints", async () => {
 		await db.batch([
+			db.prepare("DROP TABLE IF EXISTS proposals"),
 			db.prepare("DROP TABLE IF EXISTS admin_bot_config"),
 			db.prepare("DROP TABLE IF EXISTS change_log"),
 			db.prepare("DROP TABLE IF EXISTS audit_log"),
@@ -993,6 +1001,252 @@ describe("migrations", () => {
 				.run(),
 		).rejects.toThrow(/FOREIGN KEY/);
 	});
+
+	it("preserves all existing tables when migrating a populated database from 0004 to 0005 and enforces proposals constraints", async () => {
+		await db.batch([
+			db.prepare("DROP TABLE IF EXISTS proposals"),
+			db.prepare("DROP TABLE IF EXISTS admin_bot_config"),
+			db.prepare("DROP TABLE IF EXISTS change_log"),
+			db.prepare("DROP TABLE IF EXISTS audit_log"),
+			db.prepare("DROP TABLE IF EXISTS messages"),
+			db.prepare("DROP TABLE IF EXISTS allow_rules"),
+			db.prepare("DROP TABLE IF EXISTS tokens"),
+			db.prepare("DROP TABLE IF EXISTS categories"),
+			db.prepare("DROP TABLE IF EXISTS agents"),
+			db.prepare("DROP TABLE IF EXISTS d1_migrations"),
+		]);
+
+		const m1 = migration("0001_initial_schema.sql");
+		const m2 = migration("0002_cascade_message_references.sql");
+		const m3 = migration("0003_change_log.sql");
+		const m4 = migration("0004_admin_bot.sql");
+		const m5 = migration("0005_proposals.sql");
+		await applyD1Migrations(db, [m1, m2, m3, m4]);
+
+		const a = await seedAgent(db, { name: "a" });
+		const b = await seedAgent(db, { name: "b" });
+		const category = await seedCategory(db, { name: "schedule" });
+		await db
+			.prepare(
+				`INSERT INTO admin_bot_config (id, agent_id, read_bodies, superadmin_until, updated_at)
+				VALUES (1, ?, 0, NULL, ?)`,
+			)
+			.bind(a.id, T0)
+			.run();
+
+		await applyD1Migrations(db, [m1, m2, m3, m4, m5]);
+
+		const fkViolations = await db.prepare("PRAGMA foreign_key_check").all();
+		expect(fkViolations.results).toEqual([]);
+
+		expect(
+			(
+				await db.prepare("SELECT * FROM agents ORDER BY name").all<AgentRow>()
+			).results.map(agentFromRow),
+		).toEqual([a, b]);
+		const configRow = await db
+			.prepare("SELECT * FROM admin_bot_config WHERE id = 1")
+			.first<AdminBotConfigRow>();
+		expect(configRow?.agent_id).toBe(a.id);
+
+		const proposal: Proposal = {
+			id: newId(),
+			kind: "grant_allow_rule",
+			proposerAgentId: a.id,
+			payload: {
+				kind: "grant_allow_rule",
+				fromAgentId: a.id,
+				toAgentId: b.id,
+				categoryId: category.id,
+			},
+			reason: "Allow schedule lookup",
+			status: "pending",
+			createdAt: T0,
+			expiresAt: T0 + 14 * DAY_MS,
+			resolvedAt: null,
+			resolvedBy: null,
+			changeLogId: null,
+		};
+		await insertProposal(db, proposal).run();
+
+		const loaded = await db
+			.prepare("SELECT * FROM proposals WHERE id = ?")
+			.bind(proposal.id)
+			.first<ProposalRow>();
+		expect(loaded && proposalFromRow(loaded)).toEqual(proposal);
+
+		await expect(
+			db
+				.prepare(
+					`INSERT INTO proposals
+						(id, kind, proposer_agent_id, payload_json, reason, status, created_at, expires_at, resolved_at)
+					VALUES (?, 'unknown_kind', ?, '{}', 'r', 'pending', ?, ?, NULL)`,
+				)
+				.bind(newId(), a.id, T0, T0 + 14 * DAY_MS)
+				.run(),
+		).rejects.toThrow(/CHECK/);
+
+		await expect(
+			db
+				.prepare(
+					`INSERT INTO proposals
+						(id, kind, proposer_agent_id, payload_json, reason, status, created_at, expires_at, resolved_at)
+					VALUES (?, 'create_category', ?, '{"kind":"create_category","name":"x"}', 'r', 'cancelled', ?, ?, ?)`,
+				)
+				.bind(newId(), a.id, T0, T0 + 14 * DAY_MS, T0 + 1)
+				.run(),
+		).rejects.toThrow(/CHECK/);
+
+		// Pending row with non-null resolved_at violates CHECK.
+		await expect(
+			insertProposal(db, {
+				...proposal,
+				id: newId(),
+				status: "pending",
+				resolvedAt: T0 + 1,
+			}).run(),
+		).rejects.toThrow(/CHECK/);
+
+		// Resolved row with null resolved_at violates CHECK.
+		for (const status of ["approved", "rejected", "expired"] as const) {
+			await expect(
+				insertProposal(db, {
+					...proposal,
+					id: newId(),
+					status,
+					resolvedAt: null,
+				}).run(),
+			).rejects.toThrow(/CHECK/);
+		}
+
+		// STRICT type check on created_at.
+		await expect(
+			db
+				.prepare(
+					`INSERT INTO proposals
+						(id, kind, proposer_agent_id, payload_json, reason, status, created_at, expires_at, resolved_at)
+					VALUES (?, 'create_category', ?, '{"kind":"create_category","name":"x"}', 'r', 'pending', 'not-int', ?, NULL)`,
+				)
+				.bind(newId(), a.id, T0 + 14 * DAY_MS)
+				.run(),
+		).rejects.toThrow(/STRICT|datatype/i);
+
+		// Foreign key on proposer_agent_id and ON DELETE CASCADE.
+		await expect(
+			insertProposal(db, {
+				...proposal,
+				id: newId(),
+				proposerAgentId: newId(),
+			}).run(),
+		).rejects.toThrow(/FOREIGN KEY/);
+
+		await db.prepare("DELETE FROM agents WHERE id = ?").bind(a.id).run();
+		const remaining = await db
+			.prepare("SELECT COUNT(*) AS n FROM proposals")
+			.first<{ n: number }>();
+		expect(remaining?.n).toBe(0);
+	});
+});
+
+describe("proposals", () => {
+	it("stores all payload variants and uses status and expiry indexes", async () => {
+		const bot = await seedAgent(db, { name: "bot" });
+		const target = await seedAgent(db, { name: "target" });
+		const cat = await seedCategory(db, { name: "work" });
+
+		const entries: Proposal[] = [
+			{
+				id: newId(),
+				kind: "grant_allow_rule",
+				proposerAgentId: bot.id,
+				payload: {
+					kind: "grant_allow_rule",
+					fromAgentId: bot.id,
+					toAgentId: target.id,
+					categoryId: cat.id,
+				},
+				reason: "Allow work",
+				status: "pending",
+				createdAt: T0,
+				expiresAt: T0 + 14 * DAY_MS,
+				resolvedAt: null,
+				resolvedBy: null,
+				changeLogId: null,
+			},
+			{
+				id: newId(),
+				kind: "create_category",
+				proposerAgentId: bot.id,
+				payload: { kind: "create_category", name: "travel" },
+				reason: "Add travel",
+				status: "approved",
+				createdAt: T0 + 1,
+				expiresAt: T0 + 14 * DAY_MS + 1,
+				resolvedAt: T0 + 10,
+				resolvedBy: "owner@example.com",
+				changeLogId: 42,
+			},
+			{
+				id: newId(),
+				kind: "raise_daily_limit",
+				proposerAgentId: bot.id,
+				payload: {
+					kind: "raise_daily_limit",
+					agentId: target.id,
+					newLimit: 50,
+				},
+				reason: "Higher traffic",
+				status: "rejected",
+				createdAt: T0 + 2,
+				expiresAt: T0 + 14 * DAY_MS + 2,
+				resolvedAt: T0 + 20,
+				resolvedBy: "owner@example.com",
+				changeLogId: null,
+			},
+			{
+				id: newId(),
+				kind: "resume_agent",
+				proposerAgentId: bot.id,
+				payload: { kind: "resume_agent", agentId: target.id },
+				reason: "Issue resolved",
+				status: "expired",
+				createdAt: T0 + 3,
+				expiresAt: T0 + 14 * DAY_MS + 3,
+				resolvedAt: T0 + 14 * DAY_MS + 3,
+				resolvedBy: null,
+				changeLogId: null,
+			},
+		];
+
+		await db.batch(entries.map((entry) => insertProposal(db, entry)));
+
+		const { results } = await db
+			.prepare("SELECT * FROM proposals ORDER BY created_at ASC")
+			.all<ProposalRow>();
+		expect(results.map(proposalFromRow)).toEqual(entries);
+
+		const { results: indexes } = await db
+			.prepare(
+				"SELECT name FROM sqlite_schema WHERE type = 'index' AND tbl_name = 'proposals' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+			)
+			.all<{ name: string }>();
+		expect(indexes.map((row) => row.name)).toEqual([
+			"proposals_expiry_idx",
+			"proposals_status_idx",
+		]);
+		expect(
+			await queryPlan(
+				"SELECT * FROM proposals WHERE status = ? ORDER BY created_at DESC",
+				"pending",
+			),
+		).toContain("proposals_status_idx");
+		expect(
+			await queryPlan(
+				"SELECT id FROM proposals INDEXED BY proposals_expiry_idx WHERE status = 'pending' AND expires_at <= ?",
+				T0 + 14 * DAY_MS,
+			),
+		).toContain("proposals_expiry_idx");
+	});
 });
 
 describe("row conversion", () => {
@@ -1039,6 +1293,63 @@ describe("row conversion", () => {
 			}),
 		).toThrow(/admin_bot_config\.read_bodies/);
 	});
+
+	it("validates proposal kind, status, and payload_json strictly", () => {
+		const validRow: ProposalRow = {
+			id: "p1",
+			kind: "create_category",
+			proposer_agent_id: "a1",
+			payload_json: JSON.stringify({ kind: "create_category", name: "travel" }),
+			reason: "Need travel",
+			status: "pending",
+			created_at: T0,
+			expires_at: T0 + 14 * DAY_MS,
+			resolved_at: null,
+			resolved_by: null,
+			change_log_id: null,
+		};
+		expect(proposalFromRow(validRow).payload).toEqual({
+			kind: "create_category",
+			name: "travel",
+		});
+
+		expect(() => proposalFromRow({ ...validRow, kind: "bogus" })).toThrow(
+			/proposals\.kind/,
+		);
+		expect(() => proposalFromRow({ ...validRow, status: "bogus" })).toThrow(
+			/proposals\.status/,
+		);
+		expect(() => parseProposalPayload("create_category", "{bad json")).toThrow(
+			/Invalid JSON/,
+		);
+		expect(() =>
+			parseProposalPayload(
+				"create_category",
+				JSON.stringify({ kind: "resume_agent", agentId: "a1" }),
+			),
+		).toThrow(/Mismatched kind/);
+		expect(() =>
+			parseProposalPayload(
+				"grant_allow_rule",
+				JSON.stringify({
+					kind: "grant_allow_rule",
+					fromAgentId: "a1",
+					toAgentId: "",
+					categoryId: "c1",
+				}),
+			),
+		).toThrow(/toAgentId/);
+		expect(() =>
+			parseProposalPayload(
+				"raise_daily_limit",
+				JSON.stringify({
+					kind: "raise_daily_limit",
+					agentId: "a1",
+					newLimit: -1,
+				}),
+			),
+		).toThrow(/newLimit/);
+	});
 });
 
 describe("migration 0002 on populated data", () => {
@@ -1047,6 +1358,7 @@ describe("migration 0002 on populated data", () => {
 		const m0002 = migrationByName("0002_cascade_message_references.sql");
 
 		for (const table of [
+			"proposals",
 			"admin_bot_config",
 			"change_log",
 			"audit_log",
