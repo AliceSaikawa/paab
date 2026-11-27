@@ -312,6 +312,7 @@ export const proposeAllowRuleTool: AdminToolDefinition<
 	}>
 > = {
 	name: "propose_allow_rule",
+	mutating: true,
 	description:
 		"Grant a directional allow rule (from -> to for a category). By default submits a proposal that takes effect after owner approval in the Admin UI; when owner-enabled superadmin permission is active, applies immediately.",
 	inputSchema: z.object({
@@ -383,6 +384,7 @@ export const proposeCategoryTool: AdminToolDefinition<
 	}>
 > = {
 	name: "propose_category",
+	mutating: true,
 	description:
 		"Create a new question category. By default submits a proposal that takes effect after owner approval in the Admin UI; when owner-enabled superadmin permission is active, applies immediately.",
 	inputSchema: z.object({
@@ -438,6 +440,7 @@ export const proposeRaiseDailyLimitTool: AdminToolDefinition<
 	}>
 > = {
 	name: "propose_raise_daily_limit",
+	mutating: true,
 	description:
 		"Raise an agent's daily question limit (new_limit must be strictly greater than its current limit). By default submits a proposal that takes effect after owner approval in the Admin UI; when owner-enabled superadmin permission is active, applies immediately.",
 	inputSchema: z.object({
@@ -513,6 +516,7 @@ export const proposeResumeAgentTool: AdminToolDefinition<
 	}>
 > = {
 	name: "propose_resume_agent",
+	mutating: true,
 	description:
 		"Resume a suspended agent. By default submits a proposal that takes effect after owner approval in the Admin UI; when owner-enabled superadmin permission is active, applies immediately.",
 	inputSchema: z.object({
@@ -656,6 +660,7 @@ export const listProposalsTool: AdminToolDefinition<
 	typeof listProposalsInputSchema
 > = {
 	name: "list_proposals",
+	mutating: false,
 	description:
 		"List proposals submitted by this admin bot with optional status filter (pending, approved, rejected, expired).",
 	inputSchema: listProposalsInputSchema,

@@ -520,7 +520,9 @@ describe("/mcp/admin description review tools", () => {
 		expect(JSON.parse(changes[0]?.beforeJson ?? "{}")).toEqual({
 			agentId: carol.id,
 			name: "carol",
+			submissionId: carolSubmissionId,
 			description: "Unwanted carol draft",
+			submittedAt: T0 + 12,
 		});
 		expect(changes[1]).toMatchObject({
 			actorType: "admin_bot",

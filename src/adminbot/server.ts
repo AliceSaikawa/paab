@@ -1,5 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/server";
+import { countRecentAdminBotMutations } from "../admin";
 import { recordAuditEvent } from "../audit";
+import { DEFAULT_ADMIN_BOT_HOURLY_MUTATION_LIMIT } from "../mcp/config";
 import { ADMIN_SERVER_INSTRUCTIONS } from "./instructions";
 import {
 	ADMIN_TOOLS,
@@ -25,6 +27,32 @@ export function createAdminMcpServer(
 			tool.name,
 			{ description: tool.description, inputSchema: tool.inputSchema },
 			async (args) => {
+				if (tool.mutating) {
+					const limit =
+						ctx.hourlyMutationLimit ?? DEFAULT_ADMIN_BOT_HOURLY_MUTATION_LIMIT;
+					const recentMutations = await countRecentAdminBotMutations(
+						ctx.db,
+						ctx.now,
+					);
+					if (recentMutations >= limit) {
+						await recordAuditEvent(ctx.db, ctx.audit, {
+							eventType: "admin_tool_denied",
+							occurredAt: ctx.now,
+							fromAgentId: ctx.agent.id,
+							reasonCode: "admin_rate_limit_exceeded",
+						});
+						return {
+							content: [
+								{
+									type: "text",
+									text: `admin bot hourly mutation limit exceeded (${limit} per hour); try again later or ask the owner to adjust ADMIN_BOT_HOURLY_MUTATION_LIMIT`,
+								},
+							],
+							isError: true,
+						};
+					}
+				}
+
 				const output = await tool.run(ctx, args);
 				if (output.audit?.deniedReason !== undefined) {
 					await recordAuditEvent(ctx.db, ctx.audit, {

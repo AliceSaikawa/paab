@@ -103,6 +103,7 @@ export const REASON_CODES = [
 	"token_revoked",
 	"not_admin_bot",
 	"permission_denied",
+	"admin_rate_limit_exceeded",
 	"webhook_delivery_failed",
 ] as const;
 export type ReasonCode = (typeof REASON_CODES)[number];

@@ -7,9 +7,14 @@ export {
 } from "./agents";
 export { createCategory, deleteCategory } from "./categories";
 export {
+	ADMIN_BOT_MUTATION_WINDOW_MS,
 	buildChangeLogQuery,
 	type ChangeLogQuery,
+	countRecentAdminBotMutations,
+	countUnrevertedAdminBotChanges,
 	DEFAULT_CHANGE_LOG_LIMIT,
+	type ListAdminBotChangesOptions,
+	listAdminBotChanges,
 	listAgentsWithStatus,
 	listAllowRulesGrouped,
 	listCategoriesWithUsage,
@@ -49,8 +54,9 @@ export type {
 	UpdateAgentResult,
 } from "./types";
 export {
+	type ChangeUndoAvailability,
+	inspectAdminBotChangesUndoState,
 	isUndoableChangeAction,
-	listAdminBotChanges,
 	type RevertAdminBotChangeInput,
 	type RevertedChangeSummary,
 	revertAdminBotChange,

@@ -385,7 +385,9 @@ export async function rejectPendingDescription(
 	const beforeJson = JSON.stringify({
 		agentId: agent.id,
 		name: agent.name,
+		submissionId: pending.submissionId,
 		description: pending.description,
+		submittedAt: pending.submittedAt,
 	});
 	const [changeRes, deleteRes] = await db.batch([
 		db

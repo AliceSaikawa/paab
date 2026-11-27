@@ -267,6 +267,7 @@ curl -s https://paab.<サブドメイン>.workers.dev/health
 | `CF_ACCESS_TEAM_DOMAIN` | Cloudflare Zero Trust のチームドメイン（例: `<チーム名>.cloudflareaccess.com`）。`CF_ACCESS_AUD` と組で設定する | `""` |
 | `CF_ACCESS_AUD` | Cloudflare Access アプリケーションの Application Audience (AUD) Tag | `""` |
 | `WEBHOOK_ALLOW_INSECURE_LOCALHOST` | ローカル試験時のみ `"true"` を設定すると、Webhook 呼び出し先として `http://localhost` / `http://127.0.0.1` / `http://[::1]` を例外許可する。本番の `wrangler.local.jsonc` には設定しない | 未設定（`false`） |
+| `ADMIN_BOT_HOURLY_MUTATION_LIMIT` | `/mcp/admin` で管理者ボットが直近 1 時間に実行できる変更系ツール呼び出しの上限（0 以上の整数）。`view_audit_log`・`list_proposals`・`list_pending_descriptions` の読み取りツールは対象外。上限超過時は `audit_log` に `admin_tool_denied`（`admin_rate_limit_exceeded`）を記録して拒否する | `"60"` |
 
 ### 管理画面の保護（Cloudflare Access）
 
@@ -339,6 +340,11 @@ Cloudflare Access（ローカル開発では `ADMIN_DEV_USER`）を設定した�
    - 管理者ボットは `https://<Worker URL>/mcp/admin` に `Authorization: Bearer <管理者トークン>` ヘッダーを付けて接続する。
    - 指名されていないエージェント、`suspended` 状態のエージェント、または失効済みトークンでの接続は拒否され、監査ログに `auth_failed` が記録される。
    - トークンの発行・再発行、エージェントの登録・削除、管理者ボットの指名替え、権限スイッチの変更は人間専用の操作であり、`/mcp/admin` からは実行できない。`view_audit_log` ツールで監査ログ（本文なし）を参照でき、呼び出しは監査ログに `admin_tool_called` として記録される。
+   - `/mcp/admin` の変更系ツール呼び出しは直近 1 時間あたり既定 60 回（`ADMIN_BOT_HOURLY_MUTATION_LIMIT` で変更可能）に制限される。上限に達すると変更系ツールのみ拒否され、`audit_log` に `admin_tool_denied`（`admin_rate_limit_exceeded`）が残る。読み取り専用ツールはそのまま利用できる。
+4. **変更履歴の確認と 1 操作での取消（`/admin/adminbot`）**
+   - `/admin/adminbot` の変更履歴一覧は、`before_id` によるページ送り（「古い変更を表示」）と「未取消のみ」「対象」での絞り込みに対応しており、100 件を超える履歴もさかのぼって取り消せる。
+   - 説明文の却下（`description_rejected`）も 1 操作で承認待ち状態へ戻せる（対象エージェントが削除済み、または新しい承認待ち説明文がすでにある場合を除く）。
+   - 同じ対象に管理者ボットの変更が複数重なっている行には「以降もまとめて元に戻す」ボタンが表示され、所有者の変更が挟まっていない限り、指定した変更以降の管理者ボット変更を逆順に 1 操作で巻き戻せる。
 
 ### 未読件数窓口と件数確認トークン（`GET /unread`）
 

@@ -50,6 +50,7 @@ export const suspendAgentTool: AdminToolDefinition<
 	z.ZodObject<{ agent: z.ZodString }>
 > = {
 	name: "suspend_agent",
+	mutating: true,
 	description:
 		"Immediately suspend an agent by exact name so it cannot send or receive questions or connect to /mcp or /mcp/admin.",
 	inputSchema: z.object({
@@ -98,6 +99,7 @@ export const revokeAllowRuleTool: AdminToolDefinition<
 	}>
 > = {
 	name: "revoke_allow_rule",
+	mutating: true,
 	description:
 		"Immediately revoke an existing directional allow rule (from -> to for a category) by exact names.",
 	inputSchema: z.object({
@@ -192,6 +194,7 @@ export const lowerDailyLimitTool: AdminToolDefinition<
 	}>
 > = {
 	name: "lower_daily_limit",
+	mutating: true,
 	description:
 		"Immediately lower an agent's daily question limit (new_limit must be an integer >= 0 and strictly less than its current limit).",
 	inputSchema: z.object({
