@@ -37,6 +37,7 @@ async function handleAuditGet(ctx: AdminGetContext): Promise<Response> {
 		currentPath: ctx.url.pathname,
 		user: ctx.user,
 		devMode: ctx.devMode,
+		flash: ctx.flash,
 		body: renderAuditPage({
 			raw: parsed.query.raw,
 			query: parsed.query,

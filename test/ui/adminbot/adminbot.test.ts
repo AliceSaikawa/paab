@@ -9,6 +9,7 @@ import { handleAdminMcpRequest } from "../../../src/adminbot";
 import { hashToken } from "../../../src/auth";
 import { newId } from "../../../src/db";
 import {
+	csrfCookieName,
 	handleAdminRequest,
 	type JwkKey,
 	type JwksFetcher,
@@ -16,11 +17,13 @@ import {
 } from "../../../src/ui";
 import { createTestDb } from "../../helpers/db";
 import { T0 } from "../../helpers/fixtures";
+import { findSetCookie, TestCookieJar } from "../../helpers/ui-cookies";
 
 const TEAM_DOMAIN = "paab-team.cloudflareaccess.com";
 const TEST_AUD = "adminbot-ui-aud";
 const ADMIN_EMAIL = "owner-admin@example.com";
 const ADMIN_MCP_URL = "https://paab.test/mcp/admin";
+const ADMIN_ORIGIN = new URL("https://paab.test");
 
 interface SigningKeyPair {
 	kid: string;
@@ -115,10 +118,19 @@ function jwksFetcher(): JwksFetcher {
 }
 
 interface AdminSession {
+	jar: TestCookieJar;
 	cookie: string;
 	csrfToken: string;
 	jwt: string;
 	fetcher: JwksFetcher;
+}
+
+function syncSession(session: AdminSession): void {
+	session.cookie = session.jar.header();
+	const token = session.jar.csrfToken(ADMIN_ORIGIN);
+	if (token !== undefined) {
+		session.csrfToken = token;
+	}
 }
 
 function extractCsrfToken(htmlText: string): string {
@@ -144,12 +156,12 @@ async function openAdminBotSession(
 		now,
 		{ fetchJwks: fetcher },
 	);
-	const setCookie = response.headers.get("Set-Cookie") ?? "";
-	const cookie = setCookie.split(";", 1)[0] ?? "";
+	const jar = new TestCookieJar();
+	jar.applyResponse(response);
 	const html = await response.text();
 	const csrfToken = extractCsrfToken(html);
 	return {
-		session: { cookie, csrfToken, jwt, fetcher },
+		session: { jar, cookie: jar.header(), csrfToken, jwt, fetcher },
 		response,
 		html,
 	};
@@ -164,7 +176,7 @@ async function adminGet(
 		new Request(`https://paab.test${path}`, {
 			method: "GET",
 			headers: {
-				Cookie: session.cookie,
+				Cookie: session.jar.header(),
 				"Cf-Access-Jwt-Assertion": session.jwt,
 			},
 		}),
@@ -172,6 +184,8 @@ async function adminGet(
 		now,
 		{ fetchJwks: session.fetcher },
 	);
+	session.jar.applyResponse(response);
+	syncSession(session);
 	return { response, html: await response.text() };
 }
 
@@ -180,16 +194,21 @@ async function adminPost(
 	path: string,
 	fields: Record<string, string>,
 	now = T0,
-): Promise<{ response: Response; html: string }> {
+): Promise<{
+	response: Response;
+	postResponse: Response;
+	location: string | null;
+	html: string;
+}> {
 	const body = new URLSearchParams({
 		csrf_token: session.csrfToken,
 		...fields,
 	});
-	const response = await handleAdminRequest(
+	const postResponse = await handleAdminRequest(
 		new Request(`https://paab.test${path}`, {
 			method: "POST",
 			headers: {
-				Cookie: session.cookie,
+				Cookie: session.jar.header(),
 				Origin: "https://paab.test",
 				"Cf-Access-Jwt-Assertion": session.jwt,
 			},
@@ -199,7 +218,27 @@ async function adminPost(
 		now,
 		{ fetchJwks: session.fetcher },
 	);
-	return { response, html: await response.text() };
+	session.jar.applyResponse(postResponse);
+	syncSession(session);
+	if (postResponse.status === 303) {
+		const location = postResponse.headers.get("Location");
+		if (location === null) {
+			throw new Error("Expected Location header on 303 response");
+		}
+		const followed = await adminGet(session, location, now);
+		return {
+			response: followed.response,
+			postResponse,
+			location,
+			html: followed.html,
+		};
+	}
+	return {
+		response: postResponse,
+		postResponse,
+		location: null,
+		html: await postResponse.text(),
+	};
 }
 
 function extractIssuedToken(htmlText: string): string {
@@ -314,6 +353,7 @@ describe("/admin/adminbot UI", () => {
 		expect(designated.html).toContain("指名を解除する");
 		expect(designated.html).toContain("https://paab.test/mcp/admin");
 
+		const csrfBeforeIssue = initial.session.csrfToken;
 		const issued = await adminPost(
 			initial.session,
 			"/admin/adminbot/token",
@@ -322,7 +362,12 @@ describe("/admin/adminbot UI", () => {
 		);
 		expect(issued.response.status).toBe(200);
 		expect(issued.response.headers.get("Cache-Control")).toBe("no-store");
-		expect(issued.response.headers.get("Set-Cookie")).toBeNull();
+		const rotatedCookie = findSetCookie(
+			issued.response,
+			csrfCookieName(ADMIN_ORIGIN),
+		);
+		expect(rotatedCookie).toBeTruthy();
+		expect(initial.session.csrfToken).not.toBe(csrfBeforeIssue);
 		expect(issued.response.headers.get("Location")).toBeNull();
 		expect(issued.html).toContain("今この画面に一度だけ表示されます");
 		expect(issued.html).toContain("https://paab.test/mcp/admin");
@@ -331,6 +376,8 @@ describe("/admin/adminbot UI", () => {
 		expect(issued.html.match(/<script>/g)).toHaveLength(1);
 
 		const museAdminToken = extractIssuedToken(issued.html);
+		expect(rotatedCookie).not.toContain(museAdminToken);
+		expect(rotatedCookie).not.toContain(museAdminToken.slice("paab_".length));
 		await assertNoTokenLeakInDb(museAdminToken);
 
 		const afterIssue = await adminGet(
@@ -446,7 +493,9 @@ describe("/admin/adminbot UI", () => {
 			{ agent_id: "" },
 			T0 + 2,
 		);
-		expect(emptyDesignate.response.status).toBe(400);
+		expect(emptyDesignate.postResponse.status).toBe(303);
+		expect(emptyDesignate.location).toBe("/admin/adminbot");
+		expect(emptyDesignate.html).toContain('class="banner banner-error"');
 
 		const missingDesignate = await adminPost(
 			session,
@@ -454,7 +503,8 @@ describe("/admin/adminbot UI", () => {
 			{ agent_id: newId() },
 			T0 + 3,
 		);
-		expect(missingDesignate.response.status).toBe(404);
+		expect(missingDesignate.postResponse.status).toBe(303);
+		expect(missingDesignate.html).toContain('class="banner banner-error"');
 
 		const issueWhenUnset = await adminPost(
 			session,
@@ -462,7 +512,8 @@ describe("/admin/adminbot UI", () => {
 			{},
 			T0 + 4,
 		);
-		expect(issueWhenUnset.response.status).toBe(400);
+		expect(issueWhenUnset.postResponse.status).toBe(303);
+		expect(issueWhenUnset.html).toContain('class="banner banner-error"');
 
 		const issueNonDesignated = await adminPost(
 			session,
@@ -470,7 +521,8 @@ describe("/admin/adminbot UI", () => {
 			{ agent_id: museId },
 			T0 + 5,
 		);
-		expect(issueNonDesignated.response.status).toBe(409);
+		expect(issueNonDesignated.postResponse.status).toBe(303);
+		expect(issueNonDesignated.html).toContain('class="banner banner-error"');
 
 		const logsBefore = await queryChangeLog(db);
 		const clearWhenUnset = await adminPost(

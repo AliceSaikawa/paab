@@ -28,12 +28,14 @@ import {
 import { describeChangeBeforeAfter } from "../../../src/ui/rules/render";
 import { createTestDb } from "../../helpers/db";
 import { DAY_MS, HOUR_MS, seedCategory, T0 } from "../../helpers/fixtures";
+import { TestCookieJar } from "../../helpers/ui-cookies";
 import { call } from "../../mcp/support";
 
 const TEAM_DOMAIN = "paab-team.cloudflareaccess.com";
 const TEST_AUD = "adminbot-superadmin-ui-aud";
 const ADMIN_EMAIL = "owner-admin@example.com";
 const ADMIN_MCP_URL = "https://paab.test/mcp/admin";
+const ADMIN_ORIGIN = new URL("https://paab.test");
 
 interface SigningKeyPair {
 	kid: string;
@@ -128,10 +130,19 @@ function jwksFetcher(): JwksFetcher {
 }
 
 interface AdminSession {
+	jar: TestCookieJar;
 	cookie: string;
 	csrfToken: string;
 	jwt: string;
 	fetcher: JwksFetcher;
+}
+
+function syncSession(session: AdminSession): void {
+	session.cookie = session.jar.header();
+	const token = session.jar.csrfToken(ADMIN_ORIGIN);
+	if (token !== undefined) {
+		session.csrfToken = token;
+	}
 }
 
 function extractCsrfToken(htmlText: string): string {
@@ -156,11 +167,15 @@ async function openAdminBotSession(
 		now,
 		{ fetchJwks: fetcher },
 	);
-	const setCookie = response.headers.get("Set-Cookie") ?? "";
-	const cookie = setCookie.split(";", 1)[0] ?? "";
+	const jar = new TestCookieJar();
+	jar.applyResponse(response);
 	const html = await response.text();
 	const csrfToken = extractCsrfToken(html);
-	return { session: { cookie, csrfToken, jwt, fetcher }, response, html };
+	return {
+		session: { jar, cookie: jar.header(), csrfToken, jwt, fetcher },
+		response,
+		html,
+	};
 }
 
 async function adminGet(
@@ -172,7 +187,7 @@ async function adminGet(
 		new Request(`https://paab.test${path}`, {
 			method: "GET",
 			headers: {
-				Cookie: session.cookie,
+				Cookie: session.jar.header(),
 				"Cf-Access-Jwt-Assertion": session.jwt,
 			},
 		}),
@@ -180,6 +195,8 @@ async function adminGet(
 		now,
 		{ fetchJwks: session.fetcher },
 	);
+	session.jar.applyResponse(response);
+	syncSession(session);
 	return { response, html: await response.text() };
 }
 
@@ -188,12 +205,17 @@ async function adminPost(
 	path: string,
 	fields: Record<string, string>,
 	now = T0,
-): Promise<{ response: Response; html: string }> {
-	const response = await handleAdminRequest(
+): Promise<{
+	response: Response;
+	postResponse: Response;
+	location: string | null;
+	html: string;
+}> {
+	const postResponse = await handleAdminRequest(
 		new Request(`https://paab.test${path}`, {
 			method: "POST",
 			headers: {
-				Cookie: session.cookie,
+				Cookie: session.jar.header(),
 				Origin: "https://paab.test",
 				"Cf-Access-Jwt-Assertion": session.jwt,
 			},
@@ -206,7 +228,27 @@ async function adminPost(
 		now,
 		{ fetchJwks: session.fetcher },
 	);
-	return { response, html: await response.text() };
+	session.jar.applyResponse(postResponse);
+	syncSession(session);
+	if (postResponse.status === 303) {
+		const location = postResponse.headers.get("Location");
+		if (location === null) {
+			throw new Error("Expected Location header on 303 response");
+		}
+		const followed = await adminGet(session, location, now);
+		return {
+			response: followed.response,
+			postResponse,
+			location,
+			html: followed.html,
+		};
+	}
+	return {
+		response: postResponse,
+		postResponse,
+		location: null,
+		html: await postResponse.text(),
+	};
 }
 
 async function connectAdminMcp(token: string, now = T0): Promise<Client> {
@@ -252,7 +294,7 @@ describe("/admin/adminbot superadmin switch UI", () => {
 		const museId = museReg.data.agent.id;
 		await seedCategory(db, { name: "schedule" });
 
-		// Before designation: superadmin form is hidden and POST returns 409.
+		// Before designation: superadmin form is hidden and POST redirects 303 with error flash.
 		const before = await openAdminBotSession(T0 + 2);
 		expect(before.response.status).toBe(200);
 		expect(before.html).not.toContain(
@@ -264,7 +306,9 @@ describe("/admin/adminbot superadmin switch UI", () => {
 			{ duration: "7" },
 			T0 + 3,
 		);
-		expect(unsetPost.response.status).toBe(409);
+		expect(unsetPost.postResponse.status).toBe(303);
+		expect(unsetPost.location).toBe("/admin/adminbot");
+		expect(unsetPost.html).toContain('class="banner banner-error"');
 
 		// Designate muse and issue admin token.
 		await designateAdminBot(db, {
@@ -599,7 +643,9 @@ describe("/admin/adminbot superadmin switch UI", () => {
 				badFields,
 				T0 + 3,
 			);
-			expect(res.response.status).toBe(400);
+			expect(res.postResponse.status).toBe(303);
+			expect(res.location).toBe("/admin/adminbot");
+			expect(res.html).toContain('class="banner banner-error"');
 			expect(res.html).toContain("最高管理者権限の有効期間の指定が不正です");
 		}
 		expect((await getAdminBotConfig(db)).superadminUntil).toBeNull();

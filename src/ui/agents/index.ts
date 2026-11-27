@@ -1,5 +1,4 @@
 import {
-	type AdminErrorCode,
 	type ChangeActor,
 	configureAgentWebhook,
 	deleteAgent,
@@ -17,10 +16,11 @@ import {
 } from "../../admin";
 import { allowInsecureLocalhostWebhook } from "../../mcp/config";
 import { WEBHOOK_AUTH_MODES, type WebhookAuthMode } from "../../types";
+import { rotateCsrfCookie } from "../csrf";
+import { adminRedirectResponse, type FlashKind } from "../flash";
 import { adminPageResponse, type FlashMessage } from "../layout";
 import type { AdminGetContext, AdminPostContext, AdminRoute } from "../router";
 import {
-	type RegisterFormDraft,
 	renderAgentsPageBody,
 	renderDeleteConfirmBody,
 	renderIssuedTokenBody,
@@ -35,8 +35,12 @@ function actorFrom(ctx: AdminPostContext): ChangeActor {
 	return { actorType: "owner", actorId: ctx.user.email };
 }
 
-function errorStatus(code: AdminErrorCode): 400 | 404 {
-	return code === "not_found" ? 404 : 400;
+function redirectAgents(
+	ctx: AdminPostContext,
+	kind: FlashKind,
+	message: string,
+): Response {
+	return adminRedirectResponse(AGENTS_PATH, ctx.url, { kind, message });
 }
 
 function normalizeTextareaLineBreaks(raw: string): string {
@@ -74,7 +78,6 @@ async function renderAgentsList(
 	options: {
 		status?: number;
 		flash?: FlashMessage;
-		registerDraft?: RegisterFormDraft;
 	} = {},
 ): Promise<Response> {
 	const [agents, defaultOwnerId, webhooks] = await Promise.all([
@@ -91,13 +94,12 @@ async function renderAgentsList(
 			currentPath: AGENTS_PATH,
 			user: ctx.user,
 			devMode: ctx.devMode,
-			flash: options.flash,
+			flash: options.flash ?? ctx.flash,
 			body: renderAgentsPageBody({
 				agents,
 				webhooksByAgentId,
 				defaultOwnerId,
 				csrfToken: ctx.csrfToken,
-				registerDraft: options.registerDraft,
 			}),
 		},
 		options.status ?? 200,
@@ -115,28 +117,14 @@ async function handleRegisterAgent(ctx: AdminPostContext): Promise<Response> {
 	);
 	const rawLimit = ctx.form.get("daily_question_limit");
 	const rawOwnerId = ctx.form.get("owner_id");
-	const registerDraft: RegisterFormDraft = {
-		name: name ?? "",
-		description,
-		dailyQuestionLimit: rawLimit ?? "",
-		ownerId: rawOwnerId ?? "",
-	};
 
 	if (name === null) {
-		return renderAgentsList(ctx, {
-			status: 400,
-			flash: { kind: "error", message: "エージェント名を入力してください" },
-			registerDraft,
-		});
+		return redirectAgents(ctx, "error", "エージェント名を入力してください");
 	}
 
 	const limit = parseDailyQuestionLimit(rawLimit);
 	if (!limit.ok) {
-		return renderAgentsList(ctx, {
-			status: 400,
-			flash: { kind: "error", message: limit.message },
-			registerDraft,
-		});
+		return redirectAgents(ctx, "error", limit.message);
 	}
 
 	const ownerId =
@@ -153,29 +141,21 @@ async function handleRegisterAgent(ctx: AdminPostContext): Promise<Response> {
 		now: ctx.now,
 	});
 	if (!result.ok) {
-		return renderAgentsList(ctx, {
-			status: errorStatus(result.code),
-			flash: { kind: "error", message: result.message },
-			registerDraft,
-		});
+		return redirectAgents(ctx, "error", result.message);
 	}
 
-	return renderAgentsList(ctx, {
-		flash: {
-			kind: "success",
-			message: `エージェント「${result.data.agent.name}」を登録しました`,
-		},
-	});
+	return redirectAgents(
+		ctx,
+		"success",
+		`エージェント「${result.data.agent.name}」を登録しました`,
+	);
 }
 
 async function handleUpdateAgent(ctx: AdminPostContext): Promise<Response> {
 	const agentId = ctx.params.id ?? "";
 	const limit = parseDailyQuestionLimit(ctx.form.get("daily_question_limit"));
 	if (!limit.ok) {
-		return renderAgentsList(ctx, {
-			status: 400,
-			flash: { kind: "error", message: limit.message },
-		});
+		return redirectAgents(ctx, "error", limit.message);
 	}
 
 	const rawDescription = ctx.form.get("description");
@@ -192,23 +172,20 @@ async function handleUpdateAgent(ctx: AdminPostContext): Promise<Response> {
 		now: ctx.now,
 	});
 	if (!result.ok) {
-		return renderAgentsList(ctx, {
-			status: errorStatus(result.code),
-			flash: { kind: "error", message: result.message },
-		});
+		return redirectAgents(ctx, "error", result.message);
 	}
 
-	return renderAgentsList(ctx, {
-		flash: result.data.changed
-			? {
-					kind: "success",
-					message: `エージェント「${result.data.agent.name}」を更新しました`,
-				}
-			: {
-					kind: "info",
-					message: `エージェント「${result.data.agent.name}」に変更はありませんでした`,
-				},
-	});
+	return result.data.changed
+		? redirectAgents(
+				ctx,
+				"success",
+				`エージェント「${result.data.agent.name}」を更新しました`,
+			)
+		: redirectAgents(
+				ctx,
+				"info",
+				`エージェント「${result.data.agent.name}」に変更はありませんでした`,
+			);
 }
 
 async function handleStatusChange(
@@ -222,18 +199,14 @@ async function handleStatusChange(
 		now: ctx.now,
 	});
 	if (!result.ok) {
-		return renderAgentsList(ctx, {
-			status: errorStatus(result.code),
-			flash: { kind: "error", message: result.message },
-		});
+		return redirectAgents(ctx, "error", result.message);
 	}
 	const verb = nextStatus === "suspended" ? "停止" : "再開";
-	return renderAgentsList(ctx, {
-		flash: {
-			kind: "success",
-			message: `エージェント「${result.data.agent.name}」を${verb}しました`,
-		},
-	});
+	return redirectAgents(
+		ctx,
+		"success",
+		`エージェント「${result.data.agent.name}」を${verb}しました`,
+	);
 }
 
 async function handleGetDeleteConfirm(ctx: AdminGetContext): Promise<Response> {
@@ -255,6 +228,7 @@ async function handleGetDeleteConfirm(ctx: AdminGetContext): Promise<Response> {
 		currentPath: AGENTS_PATH,
 		user: ctx.user,
 		devMode: ctx.devMode,
+		flash: ctx.flash,
 		body: renderDeleteConfirmBody({
 			entry,
 			csrfToken: ctx.csrfToken,
@@ -269,22 +243,18 @@ async function handleDeleteAgent(ctx: AdminPostContext): Promise<Response> {
 		now: ctx.now,
 	});
 	if (!result.ok) {
-		return renderAgentsList(ctx, {
-			status: errorStatus(result.code),
-			flash: { kind: "error", message: result.message },
-		});
+		return redirectAgents(ctx, "error", result.message);
 	}
 
 	const ruleNote =
 		result.data.deletedAllowRuleCount > 0
 			? `（許可ルール ${result.data.deletedAllowRuleCount}件も削除しました）`
 			: "";
-	return renderAgentsList(ctx, {
-		flash: {
-			kind: "success",
-			message: `エージェント「${result.data.agent.name}」を削除しました${ruleNote}`,
-		},
-	});
+	return redirectAgents(
+		ctx,
+		"success",
+		`エージェント「${result.data.agent.name}」を削除しました${ruleNote}`,
+	);
 }
 
 async function handleIssueParticipantToken(
@@ -298,32 +268,32 @@ async function handleIssueParticipantToken(
 		now: ctx.now,
 	});
 	if (!result.ok) {
-		return renderAgentsList(ctx, {
-			status: errorStatus(result.code),
-			flash: { kind: "error", message: result.message },
-		});
+		return redirectAgents(ctx, "error", result.message);
 	}
 
 	const agents = await listAgentsWithStatus(ctx.env.DB, ctx.now);
 	const agentName =
 		agents.find((item) => item.agent.id === agentId)?.agent.name ?? agentId;
 
-	return adminPageResponse({
-		title: "参加者トークン発行",
-		currentPath: AGENTS_PATH,
-		user: ctx.user,
-		devMode: ctx.devMode,
-		flash: {
-			kind: "success",
-			message: `「${agentName}」の参加者トークンを発行しました`,
-		},
-		body: renderIssuedTokenBody({
-			agentName,
-			token: result.data.token,
-			revokedPrevious: result.data.revokedPrevious,
-			mcpUrl: `${ctx.url.origin}/mcp`,
+	return rotateCsrfCookie(
+		adminPageResponse({
+			title: "参加者トークン発行",
+			currentPath: AGENTS_PATH,
+			user: ctx.user,
+			devMode: ctx.devMode,
+			flash: {
+				kind: "success",
+				message: `「${agentName}」の参加者トークンを発行しました`,
+			},
+			body: renderIssuedTokenBody({
+				agentName,
+				token: result.data.token,
+				revokedPrevious: result.data.revokedPrevious,
+				mcpUrl: `${ctx.url.origin}/mcp`,
+			}),
 		}),
-	});
+		ctx.url,
+	);
 }
 
 async function handleRevokeParticipantToken(
@@ -336,24 +306,12 @@ async function handleRevokeParticipantToken(
 		now: ctx.now,
 	});
 	if (!result.ok) {
-		return renderAgentsList(ctx, {
-			status: errorStatus(result.code),
-			flash: { kind: "error", message: result.message },
-		});
+		return redirectAgents(ctx, "error", result.message);
 	}
 
-	return renderAgentsList(ctx, {
-		flash:
-			result.data.revokedCount > 0
-				? {
-						kind: "success",
-						message: "参加者トークンを失効させました",
-					}
-				: {
-						kind: "info",
-						message: "有効な参加者トークンはありませんでした",
-					},
-	});
+	return result.data.revokedCount > 0
+		? redirectAgents(ctx, "success", "参加者トークンを失効させました")
+		: redirectAgents(ctx, "info", "有効な参加者トークンはありませんでした");
 }
 
 async function handleIssueUnreadToken(
@@ -367,32 +325,32 @@ async function handleIssueUnreadToken(
 		now: ctx.now,
 	});
 	if (!result.ok) {
-		return renderAgentsList(ctx, {
-			status: errorStatus(result.code),
-			flash: { kind: "error", message: result.message },
-		});
+		return redirectAgents(ctx, "error", result.message);
 	}
 
 	const agents = await listAgentsWithStatus(ctx.env.DB, ctx.now);
 	const agentName =
 		agents.find((item) => item.agent.id === agentId)?.agent.name ?? agentId;
 
-	return adminPageResponse({
-		title: "件数確認トークン発行",
-		currentPath: AGENTS_PATH,
-		user: ctx.user,
-		devMode: ctx.devMode,
-		flash: {
-			kind: "success",
-			message: `「${agentName}」の件数確認トークンを発行しました`,
-		},
-		body: renderIssuedUnreadTokenBody({
-			agentName,
-			token: result.data.token,
-			revokedPrevious: result.data.revokedPrevious,
-			unreadUrl: `${ctx.url.origin}/unread`,
+	return rotateCsrfCookie(
+		adminPageResponse({
+			title: "件数確認トークン発行",
+			currentPath: AGENTS_PATH,
+			user: ctx.user,
+			devMode: ctx.devMode,
+			flash: {
+				kind: "success",
+				message: `「${agentName}」の件数確認トークンを発行しました`,
+			},
+			body: renderIssuedUnreadTokenBody({
+				agentName,
+				token: result.data.token,
+				revokedPrevious: result.data.revokedPrevious,
+				unreadUrl: `${ctx.url.origin}/unread`,
+			}),
 		}),
-	});
+		ctx.url,
+	);
 }
 
 async function handleRevokeUnreadToken(
@@ -405,24 +363,12 @@ async function handleRevokeUnreadToken(
 		now: ctx.now,
 	});
 	if (!result.ok) {
-		return renderAgentsList(ctx, {
-			status: errorStatus(result.code),
-			flash: { kind: "error", message: result.message },
-		});
+		return redirectAgents(ctx, "error", result.message);
 	}
 
-	return renderAgentsList(ctx, {
-		flash:
-			result.data.revokedCount > 0
-				? {
-						kind: "success",
-						message: "件数確認トークンを失効させました",
-					}
-				: {
-						kind: "info",
-						message: "有効な件数確認トークンはありませんでした",
-					},
-	});
+	return result.data.revokedCount > 0
+		? redirectAgents(ctx, "success", "件数確認トークンを失効させました")
+		: redirectAgents(ctx, "info", "有効な件数確認トークンはありませんでした");
 }
 
 async function resolveAgentName(
@@ -447,10 +393,7 @@ async function handleConfigureWebhook(
 	const url = ctx.form.get("url") ?? "";
 	const rawAuthMode = ctx.form.get("auth_mode") ?? "";
 	if (!isWebhookAuthMode(rawAuthMode)) {
-		return renderAgentsList(ctx, {
-			status: 400,
-			flash: { kind: "error", message: "認証方式が不正です" },
-		});
+		return redirectAgents(ctx, "error", "認証方式が不正です");
 	}
 	const authMode = rawAuthMode;
 	const headerName = ctx.form.get("header_name");
@@ -467,38 +410,37 @@ async function handleConfigureWebhook(
 		allowInsecureLocalhost: allowInsecureLocalhostWebhook(ctx.env),
 	});
 	if (!result.ok) {
-		return renderAgentsList(ctx, {
-			status: errorStatus(result.code),
-			flash: { kind: "error", message: result.message },
-		});
+		return redirectAgents(ctx, "error", result.message);
 	}
 
 	if (result.data.revealedSecret !== null) {
 		const agentName = await resolveAgentName(ctx.env.DB, agentId);
-		return adminPageResponse({
-			title: "Webhook 署名鍵発行",
-			currentPath: AGENTS_PATH,
-			user: ctx.user,
-			devMode: ctx.devMode,
-			flash: {
-				kind: "success",
-				message: `「${agentName}」の Webhook を設定しました`,
-			},
-			body: renderRevealedWebhookSecretBody({
-				agentName,
-				url: result.data.webhook.url,
-				secret: result.data.revealedSecret,
-				rotated: false,
+		return rotateCsrfCookie(
+			adminPageResponse({
+				title: "Webhook 署名鍵発行",
+				currentPath: AGENTS_PATH,
+				user: ctx.user,
+				devMode: ctx.devMode,
+				flash: {
+					kind: "success",
+					message: `「${agentName}」の Webhook を設定しました`,
+				},
+				body: renderRevealedWebhookSecretBody({
+					agentName,
+					url: result.data.webhook.url,
+					secret: result.data.revealedSecret,
+					rotated: false,
+				}),
 			}),
-		});
+			ctx.url,
+		);
 	}
 
-	return renderAgentsList(ctx, {
-		flash: {
-			kind: "success",
-			message: `Webhook を保存しました（方式: ${result.data.webhook.authMode}）`,
-		},
-	});
+	return redirectAgents(
+		ctx,
+		"success",
+		`Webhook を保存しました（方式: ${result.data.webhook.authMode}）`,
+	);
 }
 
 async function handleRotateWebhookSecret(
@@ -511,29 +453,29 @@ async function handleRotateWebhookSecret(
 		now: ctx.now,
 	});
 	if (!result.ok) {
-		return renderAgentsList(ctx, {
-			status: errorStatus(result.code),
-			flash: { kind: "error", message: result.message },
-		});
+		return redirectAgents(ctx, "error", result.message);
 	}
 
 	const agentName = await resolveAgentName(ctx.env.DB, agentId);
-	return adminPageResponse({
-		title: "Webhook 署名鍵ローテーション",
-		currentPath: AGENTS_PATH,
-		user: ctx.user,
-		devMode: ctx.devMode,
-		flash: {
-			kind: "success",
-			message: `「${agentName}」の Webhook 署名鍵をローテーションしました`,
-		},
-		body: renderRevealedWebhookSecretBody({
-			agentName,
-			url: result.data.webhook.url,
-			secret: result.data.revealedSecret,
-			rotated: true,
+	return rotateCsrfCookie(
+		adminPageResponse({
+			title: "Webhook 署名鍵ローテーション",
+			currentPath: AGENTS_PATH,
+			user: ctx.user,
+			devMode: ctx.devMode,
+			flash: {
+				kind: "success",
+				message: `「${agentName}」の Webhook 署名鍵をローテーションしました`,
+			},
+			body: renderRevealedWebhookSecretBody({
+				agentName,
+				url: result.data.webhook.url,
+				secret: result.data.revealedSecret,
+				rotated: true,
+			}),
 		}),
-	});
+		ctx.url,
+	);
 }
 
 async function handleDeleteWebhook(ctx: AdminPostContext): Promise<Response> {
@@ -543,18 +485,10 @@ async function handleDeleteWebhook(ctx: AdminPostContext): Promise<Response> {
 		now: ctx.now,
 	});
 	if (!result.ok) {
-		return renderAgentsList(ctx, {
-			status: errorStatus(result.code),
-			flash: { kind: "error", message: result.message },
-		});
+		return redirectAgents(ctx, "error", result.message);
 	}
 
-	return renderAgentsList(ctx, {
-		flash: {
-			kind: "success",
-			message: "Webhook 設定を削除しました",
-		},
-	});
+	return redirectAgents(ctx, "success", "Webhook 設定を削除しました");
 }
 
 export function agentRoutes(): AdminRoute[] {
@@ -563,51 +497,63 @@ export function agentRoutes(): AdminRoute[] {
 			pattern: "/admin/agents",
 			get: handleGetAgents,
 			post: handleRegisterAgent,
+			fallbackPath: AGENTS_PATH,
 		},
 		{
 			pattern: "/admin/agents/:id/update",
 			post: handleUpdateAgent,
+			fallbackPath: AGENTS_PATH,
 		},
 		{
 			pattern: "/admin/agents/:id/suspend",
 			post: (ctx) => handleStatusChange(ctx, "suspended"),
+			fallbackPath: AGENTS_PATH,
 		},
 		{
 			pattern: "/admin/agents/:id/resume",
 			post: (ctx) => handleStatusChange(ctx, "active"),
+			fallbackPath: AGENTS_PATH,
 		},
 		{
 			pattern: "/admin/agents/:id/delete",
 			get: handleGetDeleteConfirm,
 			post: handleDeleteAgent,
+			fallbackPath: AGENTS_PATH,
 		},
 		{
 			pattern: "/admin/agents/:id/token",
 			post: handleIssueParticipantToken,
+			fallbackPath: AGENTS_PATH,
 		},
 		{
 			pattern: "/admin/agents/:id/token/revoke",
 			post: handleRevokeParticipantToken,
+			fallbackPath: AGENTS_PATH,
 		},
 		{
 			pattern: "/admin/agents/:id/unread-token",
 			post: handleIssueUnreadToken,
+			fallbackPath: AGENTS_PATH,
 		},
 		{
 			pattern: "/admin/agents/:id/unread-token/revoke",
 			post: handleRevokeUnreadToken,
+			fallbackPath: AGENTS_PATH,
 		},
 		{
 			pattern: "/admin/agents/:id/webhook",
 			post: handleConfigureWebhook,
+			fallbackPath: AGENTS_PATH,
 		},
 		{
 			pattern: "/admin/agents/:id/webhook/rotate",
 			post: handleRotateWebhookSecret,
+			fallbackPath: AGENTS_PATH,
 		},
 		{
 			pattern: "/admin/agents/:id/webhook/delete",
 			post: handleDeleteWebhook,
+			fallbackPath: AGENTS_PATH,
 		},
 	];
 }

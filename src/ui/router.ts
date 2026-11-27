@@ -10,10 +10,18 @@ import { agentRoutes } from "./agents";
 import { auditRoutes } from "./audit";
 import { prepareCsrfGet, verifyCsrfPost } from "./csrf";
 import { descriptionRoutes } from "./descriptions";
+import {
+	adminRedirectResponse,
+	clearFlashSetCookie,
+	readFlashCookie,
+} from "./flash";
 import { html } from "./html";
-import { ADMIN_NAV_TABS, adminPageResponse } from "./layout";
+import { ADMIN_NAV_TABS, adminPageResponse, type FlashMessage } from "./layout";
 import { proposalRoutes } from "./proposals";
 import { ruleRoutes } from "./rules";
+
+const STALE_FORM_FLASH_MESSAGE =
+	"このフォームはすでに送信済みか有効期限が切れているため、操作は実行されませんでした。発行済みのトークンや署名鍵がある場合はそのまま有効です。";
 
 export interface AdminGetContext {
 	request: Request;
@@ -24,6 +32,7 @@ export interface AdminGetContext {
 	devMode: boolean;
 	csrfToken: string;
 	params: Record<string, string>;
+	flash?: FlashMessage;
 }
 
 export interface AdminPostContext extends AdminGetContext {
@@ -42,6 +51,7 @@ export interface AdminRoute {
 	pattern: string;
 	get?: AdminGetHandler;
 	post?: AdminPostHandler;
+	fallbackPath?: string;
 }
 
 export interface AdminHandlerOptions {
@@ -75,6 +85,7 @@ function renderOverviewPage(ctx: AdminGetContext): Response {
 		currentPath: ctx.url.pathname,
 		user: ctx.user,
 		devMode: ctx.devMode,
+		flash: ctx.flash,
 		body,
 	});
 }
@@ -155,13 +166,26 @@ function plainErrorResponse(
 	return new Response(message, { status, headers });
 }
 
-function withCookieHeader(response: Response, setCookie: string): Response {
+function withCookieHeaders(
+	response: Response,
+	setCookies: readonly string[],
+): Response {
 	const headers = new Headers(response.headers);
-	headers.append("Set-Cookie", setCookie);
+	for (const cookie of setCookies) {
+		headers.append("Set-Cookie", cookie);
+	}
 	return new Response(response.body, {
 		status: response.status,
 		statusText: response.statusText,
 		headers,
+	});
+}
+
+function stripResponseBody(response: Response): Response {
+	return new Response(null, {
+		status: response.status,
+		statusText: response.statusText,
+		headers: response.headers,
 	});
 }
 
@@ -192,10 +216,23 @@ export async function handleAdminRequest(
 	const url = new URL(request.url);
 	const pathname = normalizeAdminPath(url.pathname);
 	const routes = options.routes ?? DEFAULT_ADMIN_ROUTES;
+	const matched = findMatchingRoute(routes, pathname);
 
 	if (method === "GET" || method === "HEAD") {
+		if (matched !== null && matched.route.get === undefined) {
+			const response =
+				matched.route.fallbackPath !== undefined
+					? adminRedirectResponse(matched.route.fallbackPath, url)
+					: plainErrorResponse(405, "Method Not Allowed", { Allow: "POST" });
+			return method === "HEAD" ? stripResponseBody(response) : response;
+		}
+
 		const { token, setCookie } = prepareCsrfGet(request, url);
-		const matched = findMatchingRoute(routes, pathname);
+		const flashState =
+			method === "GET" && matched !== null
+				? readFlashCookie(request)
+				: { flash: null, hasCookie: false };
+
 		const response =
 			matched !== null && matched.route.get !== undefined
 				? await matched.route.get({
@@ -207,43 +244,54 @@ export async function handleAdminRequest(
 						devMode: access.devMode,
 						csrfToken: token,
 						params: matched.params,
+						flash: flashState.flash ?? undefined,
 					})
-				: matched !== null
-					? plainErrorResponse(405, "Method Not Allowed", { Allow: "POST" })
-					: adminPageResponse(
-							{
-								title: "見つかりません",
-								currentPath: pathname,
-								user: access.user,
-								devMode: access.devMode,
-								body: html`
-									<section class="card">
-										<h1>ページが見つかりません</h1>
-										<p><a href="/admin">概要へ戻る</a></p>
-									</section>
-								`,
-							},
-							404,
-						);
+				: adminPageResponse(
+						{
+							title: "見つかりません",
+							currentPath: pathname,
+							user: access.user,
+							devMode: access.devMode,
+							body: html`
+								<section class="card">
+									<h1>ページが見つかりません</h1>
+									<p><a href="/admin">概要へ戻る</a></p>
+								</section>
+							`,
+						},
+						404,
+					);
 
-		const finalized =
-			setCookie !== null ? withCookieHeader(response, setCookie) : response;
-		if (method === "HEAD") {
-			return new Response(null, {
-				status: finalized.status,
-				statusText: finalized.statusText,
-				headers: finalized.headers,
-			});
+		const setCookies: string[] = [];
+		if (setCookie !== null) {
+			setCookies.push(setCookie);
 		}
-		return finalized;
+		if (flashState.hasCookie) {
+			setCookies.push(clearFlashSetCookie(url));
+		}
+		const finalized =
+			setCookies.length > 0
+				? withCookieHeaders(response, setCookies)
+				: response;
+		return method === "HEAD" ? stripResponseBody(finalized) : finalized;
 	}
 
 	const csrf = await verifyCsrfPost(request, url);
 	if (!csrf.ok) {
+		if (
+			csrf.reason === "token_mismatch" &&
+			matched !== null &&
+			matched.route.post !== undefined &&
+			matched.route.fallbackPath !== undefined
+		) {
+			return adminRedirectResponse(matched.route.fallbackPath, url, {
+				kind: "warning",
+				message: STALE_FORM_FLASH_MESSAGE,
+			});
+		}
 		return plainErrorResponse(csrf.status, csrf.message);
 	}
 
-	const matched = findMatchingRoute(routes, pathname);
 	if (matched === null) {
 		return adminPageResponse(
 			{

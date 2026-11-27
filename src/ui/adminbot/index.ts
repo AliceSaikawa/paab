@@ -4,10 +4,8 @@ import {
 	listAgentsWithStatus,
 	listCategoriesWithUsage,
 	revertAdminBotChange,
-	type UndoErrorCode,
 } from "../../admin";
 import {
-	type AdminBotErrorCode,
 	clearAdminBot,
 	designateAdminBot,
 	getAdminBotConfig,
@@ -21,7 +19,9 @@ import {
 } from "../../adminbot";
 import { isBodyRecordingEnabled } from "../../audit";
 import { auditBodyConfig } from "../../mcp/config";
-import { adminPageResponse, type FlashMessage } from "../layout";
+import { rotateCsrfCookie } from "../csrf";
+import { adminRedirectResponse, type FlashKind } from "../flash";
+import { adminPageResponse } from "../layout";
 import type { AdminGetContext, AdminPostContext, AdminRoute } from "../router";
 import { CHANGE_ACTION_LABELS } from "../rules/render";
 import {
@@ -37,50 +37,15 @@ function ownerActor(ctx: AdminPostContext): ChangeActor {
 	return { actorType: "owner", actorId: ctx.user.email };
 }
 
-function statusForError(code: AdminBotErrorCode): 400 | 404 | 409 {
-	switch (code) {
-		case "not_found":
-			return 404;
-		case "not_admin_bot":
-			return 409;
-		case "invalid_name":
-		case "invalid_description":
-		case "invalid_limit":
-		case "invalid_input":
-		case "duplicate_name":
-		case "already_suspended":
-		case "already_active":
-		case "self_addressed":
-		case "duplicate_rule":
-			return 400;
-	}
+function redirectAdminBot(
+	ctx: AdminPostContext,
+	kind: FlashKind,
+	message: string,
+): Response {
+	return adminRedirectResponse(ADMIN_BOT_PATH, ctx.url, { kind, message });
 }
 
-function statusForUndoError(code: UndoErrorCode): 400 | 404 | 409 {
-	switch (code) {
-		case "not_found":
-			return 404;
-		case "already_reverted":
-		case "conflict_newer_change":
-		case "duplicate_name":
-		case "duplicate_rule":
-			return 409;
-		case "invalid_name":
-		case "invalid_description":
-		case "invalid_limit":
-		case "invalid_input":
-		case "already_suspended":
-		case "already_active":
-		case "self_addressed":
-		case "not_undoable":
-			return 400;
-	}
-}
-
-async function renderAdminBotScreen(
-	ctx: AdminGetContext,
-	options: { status?: number; flash?: FlashMessage } = {},
-): Promise<Response> {
+async function handleGetAdminBot(ctx: AdminGetContext): Promise<Response> {
 	const [config, agents, categories, changes] = await Promise.all([
 		getAdminBotConfig(ctx.env.DB),
 		listAgentsWithStatus(ctx.env.DB, ctx.now),
@@ -93,31 +58,24 @@ async function renderAdminBotScreen(
 			: null;
 	const bodyRecordingEnabled = isBodyRecordingEnabled(auditBodyConfig(ctx.env));
 
-	return adminPageResponse(
-		{
-			title: ADMIN_BOT_TITLE,
-			currentPath: ADMIN_BOT_PATH,
-			user: ctx.user,
-			devMode: ctx.devMode,
-			flash: options.flash,
-			body: renderAdminBotPageBody({
-				config,
-				designated,
-				agents,
-				categories,
-				changes,
-				bodyRecordingEnabled,
-				now: ctx.now,
-				csrfToken: ctx.csrfToken,
-				adminMcpUrl: `${ctx.url.origin}/mcp/admin`,
-			}),
-		},
-		options.status ?? 200,
-	);
-}
-
-async function handleGetAdminBot(ctx: AdminGetContext): Promise<Response> {
-	return renderAdminBotScreen(ctx);
+	return adminPageResponse({
+		title: ADMIN_BOT_TITLE,
+		currentPath: ADMIN_BOT_PATH,
+		user: ctx.user,
+		devMode: ctx.devMode,
+		flash: ctx.flash,
+		body: renderAdminBotPageBody({
+			config,
+			designated,
+			agents,
+			categories,
+			changes,
+			bodyRecordingEnabled,
+			now: ctx.now,
+			csrfToken: ctx.csrfToken,
+			adminMcpUrl: `${ctx.url.origin}/mcp/admin`,
+		}),
+	});
 }
 
 async function handleDesignateAdminBot(
@@ -125,13 +83,11 @@ async function handleDesignateAdminBot(
 ): Promise<Response> {
 	const agentId = (ctx.form.get("agent_id") ?? "").trim();
 	if (agentId.length === 0) {
-		return renderAdminBotScreen(ctx, {
-			status: 400,
-			flash: {
-				kind: "error",
-				message: "指名するエージェントを選択してください",
-			},
-		});
+		return redirectAdminBot(
+			ctx,
+			"error",
+			"指名するエージェントを選択してください",
+		);
 	}
 
 	const result = await designateAdminBot(ctx.env.DB, {
@@ -140,31 +96,26 @@ async function handleDesignateAdminBot(
 		now: ctx.now,
 	});
 	if (!result.ok) {
-		return renderAdminBotScreen(ctx, {
-			status: statusForError(result.code),
-			flash: { kind: "error", message: result.message },
-		});
+		return redirectAdminBot(ctx, "error", result.message);
 	}
 
 	if (!result.data.changed) {
-		return renderAdminBotScreen(ctx, {
-			flash: {
-				kind: "info",
-				message: `「${result.data.agent.name}」はすでに管理者ボットに指名されています`,
-			},
-		});
+		return redirectAdminBot(
+			ctx,
+			"info",
+			`「${result.data.agent.name}」はすでに管理者ボットに指名されています`,
+		);
 	}
 
 	const note =
 		result.data.previousAgentId !== null
 			? "（前の管理者ボットの管理者トークンを失効させ、権限スイッチをリセットしました）"
 			: "";
-	return renderAdminBotScreen(ctx, {
-		flash: {
-			kind: "success",
-			message: `「${result.data.agent.name}」を管理者ボットに指名しました${note}`,
-		},
-	});
+	return redirectAdminBot(
+		ctx,
+		"success",
+		`「${result.data.agent.name}」を管理者ボットに指名しました${note}`,
+	);
 }
 
 async function handleClearAdminBot(ctx: AdminPostContext): Promise<Response> {
@@ -173,28 +124,18 @@ async function handleClearAdminBot(ctx: AdminPostContext): Promise<Response> {
 		now: ctx.now,
 	});
 	if (!result.ok) {
-		return renderAdminBotScreen(ctx, {
-			status: statusForError(result.code),
-			flash: { kind: "error", message: result.message },
-		});
+		return redirectAdminBot(ctx, "error", result.message);
 	}
 
 	if (!result.data.changed) {
-		return renderAdminBotScreen(ctx, {
-			flash: {
-				kind: "info",
-				message: "管理者ボットはすでに未指名です",
-			},
-		});
+		return redirectAdminBot(ctx, "info", "管理者ボットはすでに未指名です");
 	}
 
-	return renderAdminBotScreen(ctx, {
-		flash: {
-			kind: "success",
-			message:
-				"管理者ボットの指名を解除しました（管理者トークンを失効させ、権限スイッチをリセットしました）",
-		},
-	});
+	return redirectAdminBot(
+		ctx,
+		"success",
+		"管理者ボットの指名を解除しました（管理者トークンを失効させ、権限スイッチをリセットしました）",
+	);
 }
 
 async function resolveTargetAdminAgentId(
@@ -206,10 +147,11 @@ async function resolveTargetAdminAgentId(
 		if (trimmed.length === 0) {
 			return {
 				ok: false,
-				response: await renderAdminBotScreen(ctx, {
-					status: 400,
-					flash: { kind: "error", message: "エージェントIDを指定してください" },
-				}),
+				response: redirectAdminBot(
+					ctx,
+					"error",
+					"エージェントIDを指定してください",
+				),
 			};
 		}
 		return { ok: true, agentId: trimmed };
@@ -219,13 +161,11 @@ async function resolveTargetAdminAgentId(
 	if (config.agentId === null) {
 		return {
 			ok: false,
-			response: await renderAdminBotScreen(ctx, {
-				status: 400,
-				flash: {
-					kind: "error",
-					message: "管理者ボットが指名されていません",
-				},
-			}),
+			response: redirectAdminBot(
+				ctx,
+				"error",
+				"管理者ボットが指名されていません",
+			),
 		};
 	}
 	return { ok: true, agentId: config.agentId };
@@ -243,10 +183,7 @@ async function handleIssueAdminBotToken(
 		now: ctx.now,
 	});
 	if (!result.ok) {
-		return renderAdminBotScreen(ctx, {
-			status: statusForError(result.code),
-			flash: { kind: "error", message: result.message },
-		});
+		return redirectAdminBot(ctx, "error", result.message);
 	}
 
 	const row = await ctx.env.DB.prepare("SELECT name FROM agents WHERE id = ?")
@@ -254,22 +191,25 @@ async function handleIssueAdminBotToken(
 		.first<{ name: string }>();
 	const agentName = row?.name ?? target.agentId;
 
-	return adminPageResponse({
-		title: "管理者トークン発行",
-		currentPath: ADMIN_BOT_PATH,
-		user: ctx.user,
-		devMode: ctx.devMode,
-		flash: {
-			kind: "success",
-			message: `「${agentName}」の管理者トークンを発行しました`,
-		},
-		body: renderIssuedAdminTokenBody({
-			agentName,
-			token: result.data.token,
-			revokedPrevious: result.data.revokedPrevious,
-			adminMcpUrl: `${ctx.url.origin}/mcp/admin`,
+	return rotateCsrfCookie(
+		adminPageResponse({
+			title: "管理者トークン発行",
+			currentPath: ADMIN_BOT_PATH,
+			user: ctx.user,
+			devMode: ctx.devMode,
+			flash: {
+				kind: "success",
+				message: `「${agentName}」の管理者トークンを発行しました`,
+			},
+			body: renderIssuedAdminTokenBody({
+				agentName,
+				token: result.data.token,
+				revokedPrevious: result.data.revokedPrevious,
+				adminMcpUrl: `${ctx.url.origin}/mcp/admin`,
+			}),
 		}),
-	});
+		ctx.url,
+	);
 }
 
 async function handleRevokeAdminBotToken(
@@ -284,24 +224,12 @@ async function handleRevokeAdminBotToken(
 		now: ctx.now,
 	});
 	if (!result.ok) {
-		return renderAdminBotScreen(ctx, {
-			status: statusForError(result.code),
-			flash: { kind: "error", message: result.message },
-		});
+		return redirectAdminBot(ctx, "error", result.message);
 	}
 
-	return renderAdminBotScreen(ctx, {
-		flash:
-			result.data.revokedCount > 0
-				? {
-						kind: "success",
-						message: "管理者トークンを失効させました",
-					}
-				: {
-						kind: "info",
-						message: "有効な管理者トークンはありませんでした",
-					},
-	});
+	return result.data.revokedCount > 0
+		? redirectAdminBot(ctx, "success", "管理者トークンを失効させました")
+		: redirectAdminBot(ctx, "info", "有効な管理者トークンはありませんでした");
 }
 
 async function resolveAgentDisplayName(
@@ -350,13 +278,7 @@ async function handleToggleReadBodies(
 ): Promise<Response> {
 	const enabled = parseEnabledField(ctx.form.get("enabled"));
 	if (enabled === null) {
-		return renderAdminBotScreen(ctx, {
-			status: 400,
-			flash: {
-				kind: "error",
-				message: "本文閲覧スイッチの指定が不正です",
-			},
-		});
+		return redirectAdminBot(ctx, "error", "本文閲覧スイッチの指定が不正です");
 	}
 
 	if (enabled) {
@@ -402,21 +324,15 @@ async function handleToggleReadBodies(
 		now: ctx.now,
 	});
 	if (!result.ok) {
-		return renderAdminBotScreen(ctx, {
-			status: statusForError(result.code),
-			flash: { kind: "error", message: result.message },
-		});
+		return redirectAdminBot(ctx, "error", result.message);
 	}
 
 	if (!result.data.changed) {
-		return renderAdminBotScreen(ctx, {
-			flash: {
-				kind: "info",
-				message: enabled
-					? "本文閲覧はすでにオンです"
-					: "本文閲覧はすでにオフです",
-			},
-		});
+		return redirectAdminBot(
+			ctx,
+			"info",
+			enabled ? "本文閲覧はすでにオンです" : "本文閲覧はすでにオフです",
+		);
 	}
 
 	const bodyRecordingEnabled = isBodyRecordingEnabled(auditBodyConfig(ctx.env));
@@ -426,21 +342,17 @@ async function handleToggleReadBodies(
 			: "本文閲覧をオンにしました（監査ログへの本文記録が無効のため、現在読める本文はありません）"
 		: "本文閲覧をオフにしました";
 
-	return renderAdminBotScreen(ctx, {
-		flash: { kind: "success", message },
-	});
+	return redirectAdminBot(ctx, "success", message);
 }
 
 async function handleSetSuperadmin(ctx: AdminPostContext): Promise<Response> {
 	const parsed = parseSuperadminDuration(ctx.form.get("duration"));
 	if (parsed === null) {
-		return renderAdminBotScreen(ctx, {
-			status: 400,
-			flash: {
-				kind: "error",
-				message: "最高管理者権限の有効期間の指定が不正です",
-			},
-		});
+		return redirectAdminBot(
+			ctx,
+			"error",
+			"最高管理者権限の有効期間の指定が不正です",
+		);
 	}
 
 	if (parsed.mode !== "off") {
@@ -493,10 +405,7 @@ async function handleSetSuperadmin(ctx: AdminPostContext): Promise<Response> {
 					},
 	);
 	if (!result.ok) {
-		return renderAdminBotScreen(ctx, {
-			status: statusForError(result.code),
-			flash: { kind: "error", message: result.message },
-		});
+		return redirectAdminBot(ctx, "error", result.message);
 	}
 
 	if (!result.data.changed) {
@@ -506,9 +415,7 @@ async function handleSetSuperadmin(ctx: AdminPostContext): Promise<Response> {
 				: parsed.mode === "permanent"
 					? "最高管理者権限はすでに無期限で有効です"
 					: "最高管理者権限の有効期限は変更されませんでした";
-		return renderAdminBotScreen(ctx, {
-			flash: { kind: "info", message: infoMessage },
-		});
+		return redirectAdminBot(ctx, "info", infoMessage);
 	}
 
 	const successMessage =
@@ -518,9 +425,7 @@ async function handleSetSuperadmin(ctx: AdminPostContext): Promise<Response> {
 				? "最高管理者権限を無期限でオンにしました"
 				: `最高管理者権限を ${parsed.days} 日間オンにしました`;
 
-	return renderAdminBotScreen(ctx, {
-		flash: { kind: "success", message: successMessage },
-	});
+	return redirectAdminBot(ctx, "success", successMessage);
 }
 
 async function handleRevertAdminBotChange(
@@ -528,17 +433,11 @@ async function handleRevertAdminBotChange(
 ): Promise<Response> {
 	const rawId = ctx.params.id ?? "";
 	if (!/^\d+$/.test(rawId)) {
-		return renderAdminBotScreen(ctx, {
-			status: 400,
-			flash: { kind: "error", message: "変更IDが不正です" },
-		});
+		return redirectAdminBot(ctx, "error", "変更IDが不正です");
 	}
 	const changeId = Number(rawId);
 	if (!Number.isSafeInteger(changeId) || changeId <= 0) {
-		return renderAdminBotScreen(ctx, {
-			status: 400,
-			flash: { kind: "error", message: "変更IDが不正です" },
-		});
+		return redirectAdminBot(ctx, "error", "変更IDが不正です");
 	}
 
 	const result = await revertAdminBotChange(ctx.env.DB, {
@@ -547,42 +446,54 @@ async function handleRevertAdminBotChange(
 		now: ctx.now,
 	});
 	if (!result.ok) {
-		return renderAdminBotScreen(ctx, {
-			status: statusForUndoError(result.code),
-			flash: { kind: "error", message: result.message },
-		});
+		return redirectAdminBot(ctx, "error", result.message);
 	}
 
-	return renderAdminBotScreen(ctx, {
-		flash: {
-			kind: "success",
-			message: `変更 #${result.data.revertedChangeId}（${CHANGE_ACTION_LABELS[result.data.action]}）を元に戻しました`,
-		},
-	});
+	return redirectAdminBot(
+		ctx,
+		"success",
+		`変更 #${result.data.revertedChangeId}（${CHANGE_ACTION_LABELS[result.data.action]}）を元に戻しました`,
+	);
 }
 
 /** Admin UI routes for designating the admin bot and managing its `/mcp/admin` token. */
 export function adminBotRoutes(): AdminRoute[] {
 	return [
 		{ pattern: ADMIN_BOT_PATH, get: handleGetAdminBot },
-		{ pattern: "/admin/adminbot/designate", post: handleDesignateAdminBot },
-		{ pattern: "/admin/adminbot/clear", post: handleClearAdminBot },
-		{ pattern: "/admin/adminbot/token", post: handleIssueAdminBotToken },
+		{
+			pattern: "/admin/adminbot/designate",
+			post: handleDesignateAdminBot,
+			fallbackPath: ADMIN_BOT_PATH,
+		},
+		{
+			pattern: "/admin/adminbot/clear",
+			post: handleClearAdminBot,
+			fallbackPath: ADMIN_BOT_PATH,
+		},
+		{
+			pattern: "/admin/adminbot/token",
+			post: handleIssueAdminBotToken,
+			fallbackPath: ADMIN_BOT_PATH,
+		},
 		{
 			pattern: "/admin/adminbot/token/revoke",
 			post: handleRevokeAdminBotToken,
+			fallbackPath: ADMIN_BOT_PATH,
 		},
 		{
 			pattern: "/admin/adminbot/permissions/read-bodies",
 			post: handleToggleReadBodies,
+			fallbackPath: ADMIN_BOT_PATH,
 		},
 		{
 			pattern: "/admin/adminbot/permissions/superadmin",
 			post: handleSetSuperadmin,
+			fallbackPath: ADMIN_BOT_PATH,
 		},
 		{
 			pattern: "/admin/adminbot/changes/:id/revert",
 			post: handleRevertAdminBotChange,
+			fallbackPath: ADMIN_BOT_PATH,
 		},
 	];
 }

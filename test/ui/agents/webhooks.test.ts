@@ -33,7 +33,10 @@ import {
 } from "../../../src/ui";
 import { createTestDb } from "../../helpers/db";
 import { seedAgent, T0 } from "../../helpers/fixtures";
+import { TestCookieJar } from "../../helpers/ui-cookies";
 import { MCP_URL } from "../../mcp/support";
+
+const ADMIN_ORIGIN = new URL("https://paab.test");
 
 const TEAM_DOMAIN = "paab-team.cloudflareaccess.com";
 const TEST_AUD = "agents-webhooks-ui-aud";
@@ -47,10 +50,19 @@ interface SigningKeyPair {
 }
 
 interface AdminSession {
+	jar: TestCookieJar;
 	cookie: string;
 	csrfToken: string;
 	jwt: string;
 	fetcher: JwksFetcher;
+}
+
+function syncSession(session: AdminSession): void {
+	session.cookie = session.jar.header();
+	const token = session.jar.csrfToken(ADMIN_ORIGIN);
+	if (token !== undefined) {
+		session.csrfToken = token;
+	}
 }
 
 let signingKey: SigningKeyPair;
@@ -148,18 +160,6 @@ function extractCsrfToken(html: string): string {
 	return match[1];
 }
 
-function extractCookiePair(response: Response): string {
-	const setCookie = response.headers.get("Set-Cookie");
-	if (setCookie === null) {
-		throw new Error("Missing Set-Cookie header");
-	}
-	const pair = setCookie.split(";")[0];
-	if (!pair) {
-		throw new Error("Invalid Set-Cookie header");
-	}
-	return pair;
-}
-
 function extractTokenBox(html: string): string {
 	const match = /<div class="token-box">([^<]+)<\/div>/.exec(html);
 	if (match?.[1] === undefined) {
@@ -181,9 +181,12 @@ async function openSession(now = T0): Promise<AdminSession> {
 		{ fetchJwks: fetcher },
 	);
 	expect(res.status).toBe(200);
+	const jar = new TestCookieJar();
+	jar.applyResponse(res);
 	const html = await res.text();
 	return {
-		cookie: extractCookiePair(res),
+		jar,
+		cookie: jar.header(),
 		csrfToken: extractCsrfToken(html),
 		jwt,
 		fetcher,
@@ -200,13 +203,15 @@ async function adminGet(
 			method: "GET",
 			headers: {
 				"Cf-Access-Jwt-Assertion": session.jwt,
-				Cookie: session.cookie,
+				Cookie: session.jar.header(),
 			},
 		}),
 		accessEnv(),
 		now,
 		{ fetchJwks: session.fetcher },
 	);
+	session.jar.applyResponse(res);
+	syncSession(session);
 	return { status: res.status, headers: res.headers, html: await res.text() };
 }
 
@@ -216,7 +221,14 @@ async function adminPost(
 	fields: Record<string, string>,
 	now = T0,
 	envOverrides: Partial<UiEnv> = {},
-): Promise<{ status: number; headers: Headers; html: string }> {
+): Promise<{
+	status: number;
+	postStatus: number;
+	location: string | null;
+	headers: Headers;
+	postHeaders: Headers;
+	html: string;
+}> {
 	const body = new URLSearchParams({
 		csrf_token: session.csrfToken,
 		...fields,
@@ -226,7 +238,7 @@ async function adminPost(
 			method: "POST",
 			headers: {
 				"Cf-Access-Jwt-Assertion": session.jwt,
-				Cookie: session.cookie,
+				Cookie: session.jar.header(),
 				Origin: "https://paab.test",
 				"Content-Type": "application/x-www-form-urlencoded",
 			},
@@ -236,7 +248,31 @@ async function adminPost(
 		now,
 		{ fetchJwks: session.fetcher },
 	);
-	return { status: res.status, headers: res.headers, html: await res.text() };
+	session.jar.applyResponse(res);
+	syncSession(session);
+	if (res.status === 303) {
+		const location = res.headers.get("Location");
+		if (location === null) {
+			throw new Error("Expected Location header on 303 response");
+		}
+		const followed = await adminGet(session, location, now);
+		return {
+			status: followed.status,
+			postStatus: res.status,
+			location,
+			headers: followed.headers,
+			postHeaders: res.headers,
+			html: followed.html,
+		};
+	}
+	return {
+		status: res.status,
+		postStatus: res.status,
+		location: null,
+		headers: res.headers,
+		postHeaders: res.headers,
+		html: await res.text(),
+	};
 }
 
 beforeAll(async () => {
@@ -321,14 +357,16 @@ describe("/admin/agents webhook UI and admin operations", () => {
 		expect(customRes.html).toContain("X-Cue-Key");
 		expect(customRes.html).not.toContain(customSecret);
 
-		// Rotating on non-paab_hmac is rejected.
+		// Rotating on non-paab_hmac is rejected via 303 + error flash.
 		const badRotate = await adminPost(
 			session,
 			`/admin/agents/${agent.id}/webhook/rotate`,
 			{},
 			T0 + 5,
 		);
-		expect(badRotate.status).toBe(400);
+		expect(badRotate.postStatus).toBe(303);
+		expect(badRotate.location).toBe("/admin/agents");
+		expect(badRotate.html).toContain('class="banner banner-error"');
 
 		// 4. Switch to paab_hmac -> auto-generates and reveals secret ONCE with Cache-Control: no-store.
 		const hmacRes = await adminPost(
@@ -454,7 +492,7 @@ describe("/admin/agents webhook UI and admin operations", () => {
 		const agent = await seedAgent(db, { name: "muse" });
 		const session = await openSession(T0);
 
-		// SSRF private IP rejected via UI.
+		// SSRF private IP rejected via UI (303 + error flash).
 		const ssrfRes = await adminPost(
 			session,
 			`/admin/agents/${agent.id}/webhook`,
@@ -464,7 +502,8 @@ describe("/admin/agents webhook UI and admin operations", () => {
 			},
 			T0 + 1,
 		);
-		expect(ssrfRes.status).toBe(400);
+		expect(ssrfRes.postStatus).toBe(303);
+		expect(ssrfRes.html).toContain('class="banner banner-error"');
 
 		// Forbidden custom header rejected.
 		const badHeaderRes = await adminPost(
@@ -478,7 +517,8 @@ describe("/admin/agents webhook UI and admin operations", () => {
 			},
 			T0 + 2,
 		);
-		expect(badHeaderRes.status).toBe(400);
+		expect(badHeaderRes.postStatus).toBe(303);
+		expect(badHeaderRes.html).toContain('class="banner banner-error"');
 
 		// Short whsec_ secret rejected.
 		const badWhsecRes = await adminPost(
@@ -491,7 +531,8 @@ describe("/admin/agents webhook UI and admin operations", () => {
 			},
 			T0 + 3,
 		);
-		expect(badWhsecRes.status).toBe(400);
+		expect(badWhsecRes.postStatus).toBe(303);
+		expect(badWhsecRes.html).toContain('class="banner banner-error"');
 
 		// admin_bot actor is rejected by all 3 webhook write operations.
 		const botActor = { actorType: "admin_bot" as const, actorId: agent.id };

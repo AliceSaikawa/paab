@@ -5,15 +5,8 @@ import type {
 } from "../../admin";
 import type { Category, ChangeAction, ChangeLogEntry } from "../../types";
 import { csrfInput } from "../csrf";
-import { html, rawHtml, type SafeHtml } from "../html";
+import { html, type SafeHtml } from "../html";
 import { formatTimestamp } from "../layout";
-
-export interface RulesPageFormValues {
-	fromAgentId?: string;
-	toAgentId?: string;
-	categoryId?: string;
-	categoryName?: string;
-}
 
 export interface RulesPageData {
 	csrfToken: string;
@@ -21,7 +14,6 @@ export interface RulesPageData {
 	agents: readonly AgentWithStatus[];
 	categories: readonly CategoryWithUsage[];
 	changeLog: readonly ChangeLogEntry[];
-	formValues?: RulesPageFormValues;
 }
 
 export interface DeleteCategoryConfirmData {
@@ -453,10 +445,6 @@ function renderRuleGroupsSection(
 }
 
 function renderGrantRuleSection(data: RulesPageData): SafeHtml {
-	const selectedFrom = data.formValues?.fromAgentId ?? "";
-	const selectedTo = data.formValues?.toAgentId ?? "";
-	const selectedCategory = data.formValues?.categoryId ?? "";
-
 	return html`
 		<section class="card">
 			<h2>許可ルールを追加</h2>
@@ -481,9 +469,7 @@ function renderGrantRuleSection(data: RulesPageData): SafeHtml {
 							<option value="">選択してください</option>
 							${data.agents.map(
 								(item) => html`
-									<option
-										value="${item.agent.id}"${selectedFrom === item.agent.id ? rawHtml(" selected") : false}
-									>
+									<option value="${item.agent.id}">
 										${item.agent.name}${item.agent.status === "suspended" ? "（停止中）" : ""}
 									</option>
 								`,
@@ -496,9 +482,7 @@ function renderGrantRuleSection(data: RulesPageData): SafeHtml {
 							<option value="">選択してください</option>
 							${data.agents.map(
 								(item) => html`
-									<option
-										value="${item.agent.id}"${selectedTo === item.agent.id ? rawHtml(" selected") : false}
-									>
+									<option value="${item.agent.id}">
 										${item.agent.name}${item.agent.status === "suspended" ? "（停止中）" : ""}
 									</option>
 								`,
@@ -511,9 +495,7 @@ function renderGrantRuleSection(data: RulesPageData): SafeHtml {
 							<option value="">選択してください</option>
 							${data.categories.map(
 								(item) => html`
-									<option
-										value="${item.category.id}"${selectedCategory === item.category.id ? rawHtml(" selected") : false}
-									>
+									<option value="${item.category.id}">
 										${item.category.name}
 									</option>
 								`,
@@ -539,7 +521,7 @@ function renderCategoriesSection(data: RulesPageData): SafeHtml {
 						id="category-name"
 						type="text"
 						name="name"
-						value="${data.formValues?.categoryName ?? ""}"
+						value=""
 						maxlength="64"
 						required
 					>
