@@ -1,4 +1,5 @@
 import {
+	type AdminBotConfig,
 	AGENT_STATUSES,
 	type Agent,
 	type AllowRule,
@@ -99,6 +100,14 @@ export interface ChangeLogRow {
 	before_json: string | null;
 	after_json: string | null;
 	reverted_at: number | null;
+}
+
+export interface AdminBotConfigRow {
+	id: number;
+	agent_id: string | null;
+	read_bodies: number;
+	superadmin_until: number | null;
+	updated_at: number;
 }
 
 /** Narrows a stored string to one of the known values, or throws. */
@@ -205,5 +214,27 @@ export function changeLogEntryFromRow(row: ChangeLogRow): ChangeLogEntry {
 		beforeJson: row.before_json,
 		afterJson: row.after_json,
 		revertedAt: row.reverted_at,
+	};
+}
+
+export function adminBotConfigFromRow(row: AdminBotConfigRow): AdminBotConfig {
+	if (row.read_bodies !== 0 && row.read_bodies !== 1) {
+		throw new Error(
+			`Invalid value in admin_bot_config.read_bodies: ${row.read_bodies}`,
+		);
+	}
+	if (row.agent_id === null) {
+		return {
+			agentId: null,
+			readBodies: false,
+			superadminUntil: null,
+			updatedAt: row.updated_at,
+		};
+	}
+	return {
+		agentId: row.agent_id,
+		readBodies: row.read_bodies === 1,
+		superadminUntil: row.superadmin_until,
+		updatedAt: row.updated_at,
 	};
 }

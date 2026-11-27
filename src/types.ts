@@ -74,6 +74,8 @@ export const AUDIT_EVENT_TYPES = [
 	"question_declined",
 	"question_expired",
 	"auth_failed",
+	"admin_tool_called",
+	"admin_tool_denied",
 ] as const;
 export type AuditEventType = (typeof AUDIT_EVENT_TYPES)[number];
 
@@ -95,6 +97,8 @@ export const REASON_CODES = [
 	"token_missing",
 	"token_unknown",
 	"token_revoked",
+	"not_admin_bot",
+	"permission_denied",
 ] as const;
 export type ReasonCode = (typeof REASON_CODES)[number];
 
@@ -195,8 +199,18 @@ export const CHANGE_ACTIONS = [
 	"category_deleted",
 	"allow_rule_granted",
 	"allow_rule_revoked",
+	"admin_bot_designated",
+	"admin_bot_cleared",
+	"admin_bot_switches_updated",
 ] as const;
 export type ChangeAction = (typeof CHANGE_ACTIONS)[number];
+
+export interface AdminBotConfig {
+	agentId: string | null;
+	readBodies: boolean;
+	superadminUntil: UnixMillis | null;
+	updatedAt: UnixMillis;
+}
 
 export interface ChangeLogEntry {
 	id: number;

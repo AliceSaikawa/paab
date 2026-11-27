@@ -47,6 +47,9 @@ const CHANGE_ACTION_LABELS: Record<ChangeAction, string> = {
 	category_deleted: "カテゴリ削除",
 	allow_rule_granted: "許可ルール追加",
 	allow_rule_revoked: "許可ルール取消",
+	admin_bot_designated: "管理者ボット指名",
+	admin_bot_cleared: "管理者ボット解除",
+	admin_bot_switches_updated: "管理者ボット権限変更",
 };
 
 function parseJsonRecord(raw: string | null): Record<string, unknown> | null {
@@ -182,6 +185,7 @@ function describeTarget(entry: ChangeLogEntry, names: NameMaps): string {
 			return entry.targetId;
 		}
 		case "admin_bot":
+			return names.agents.get(entry.targetId) ?? entry.targetId;
 		case "description":
 			return entry.targetId;
 	}
@@ -240,6 +244,23 @@ function describeSnapshot(
 		case "token_revoked": {
 			const count = readArrayLength(record, "tokens");
 			return count !== null ? `有効トークン ${count} 件` : raw;
+		}
+		case "admin_bot_designated":
+		case "admin_bot_cleared":
+		case "admin_bot_switches_updated": {
+			const agentId = readString(record, "agentId");
+			if (agentId === null) {
+				return "未指名";
+			}
+			const name = names.agents.get(agentId) ?? agentId;
+			const extras: string[] = [];
+			if (record.readBodies === true) {
+				extras.push("本文閲覧=ON");
+			}
+			if (typeof record.superadminUntil === "number") {
+				extras.push("最高管理者=有効");
+			}
+			return extras.length > 0 ? `${name}（${extras.join("・")}）` : name;
 		}
 	}
 }
