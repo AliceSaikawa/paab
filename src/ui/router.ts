@@ -9,6 +9,7 @@ import { agentRoutes } from "./agents";
 import { prepareCsrfGet, verifyCsrfPost } from "./csrf";
 import { html } from "./html";
 import { ADMIN_NAV_TABS, adminPageResponse } from "./layout";
+import { ruleRoutes } from "./rules";
 
 export interface AdminGetContext {
 	request: Request;
@@ -97,11 +98,19 @@ function placeholderRoute(pattern: string, title: string): AdminRoute {
 	};
 }
 
-export const DEFAULT_ADMIN_ROUTES: readonly AdminRoute[] = [
+const IMPLEMENTED_ROUTES: readonly AdminRoute[] = [
 	{ pattern: "/admin", get: renderOverviewPage },
 	...agentRoutes(),
-	...ADMIN_NAV_TABS.filter((tab) => tab.href !== "/admin/agents").map((tab) =>
-		placeholderRoute(tab.href, tab.label),
+	...ruleRoutes(),
+];
+const IMPLEMENTED_PATTERNS = new Set(
+	IMPLEMENTED_ROUTES.map((route) => route.pattern),
+);
+
+export const DEFAULT_ADMIN_ROUTES: readonly AdminRoute[] = [
+	...IMPLEMENTED_ROUTES,
+	...ADMIN_NAV_TABS.filter((tab) => !IMPLEMENTED_PATTERNS.has(tab.href)).map(
+		(tab) => placeholderRoute(tab.href, tab.label),
 	),
 ];
 
