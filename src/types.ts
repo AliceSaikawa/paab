@@ -76,6 +76,7 @@ export const AUDIT_EVENT_TYPES = [
 	"auth_failed",
 	"admin_tool_called",
 	"admin_tool_denied",
+	"description_submitted",
 ] as const;
 export type AuditEventType = (typeof AUDIT_EVENT_TYPES)[number];
 
@@ -202,6 +203,8 @@ export const CHANGE_ACTIONS = [
 	"admin_bot_designated",
 	"admin_bot_cleared",
 	"admin_bot_switches_updated",
+	"description_approved",
+	"description_rejected",
 	"change_reverted",
 ] as const;
 export type ChangeAction = (typeof CHANGE_ACTIONS)[number];
@@ -279,4 +282,10 @@ export interface Proposal {
 	resolvedAt: UnixMillis | null;
 	resolvedBy: string | null;
 	changeLogId: number | null;
+}
+
+export interface PendingDescription {
+	agentId: string;
+	description: string;
+	submittedAt: UnixMillis;
 }

@@ -31,6 +31,7 @@ export const UNDOABLE_CHANGE_ACTIONS = [
 	"allow_rule_revoked",
 	"allow_rule_granted",
 	"category_created",
+	"description_approved",
 ] as const satisfies readonly ChangeAction[];
 
 export type UndoableChangeAction = (typeof UNDOABLE_CHANGE_ACTIONS)[number];
@@ -190,6 +191,8 @@ export function changedAgentFields(
 			}
 			return changed;
 		}
+		case "description_approved":
+			return new Set<AgentField>(["description"]);
 		case "agent_registered":
 		case "token_issued":
 		case "token_revoked":
@@ -200,6 +203,7 @@ export function changedAgentFields(
 		case "admin_bot_designated":
 		case "admin_bot_cleared":
 		case "admin_bot_switches_updated":
+		case "description_rejected":
 		case "change_reverted":
 			return EMPTY_AGENT_FIELDS;
 	}
@@ -561,6 +565,7 @@ export async function revertAdminBotChange(
 		case "agent_suspended":
 		case "agent_resumed":
 		case "agent_updated":
+		case "description_approved":
 			prepared = await prepareAgentRestore(db, entry);
 			break;
 		case "allow_rule_revoked":

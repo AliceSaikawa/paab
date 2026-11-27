@@ -9,6 +9,7 @@ import { adminBotRoutes } from "./adminbot";
 import { agentRoutes } from "./agents";
 import { auditRoutes } from "./audit";
 import { prepareCsrfGet, verifyCsrfPost } from "./csrf";
+import { descriptionRoutes } from "./descriptions";
 import { html } from "./html";
 import { ADMIN_NAV_TABS, adminPageResponse } from "./layout";
 import { proposalRoutes } from "./proposals";
@@ -107,6 +108,7 @@ const IMPLEMENTED_ROUTES: readonly AdminRoute[] = [
 	...ruleRoutes(),
 	...auditRoutes(),
 	...proposalRoutes(),
+	...descriptionRoutes(),
 	...adminBotRoutes(),
 ];
 const IMPLEMENTED_PATTERNS = new Set(

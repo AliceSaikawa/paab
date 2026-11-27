@@ -15,6 +15,26 @@ export {
 	type RevokeAdminBotTokenResult,
 	revokeAdminBotToken,
 } from "./config";
+export {
+	DESCRIPTION_TOOLS,
+	listPendingDescriptionsTool,
+	reviewDescriptionTool,
+} from "./description-tools";
+export {
+	type ApprovedDescriptionData,
+	approvePendingDescription,
+	type DescriptionErrorCode,
+	type DescriptionFailure,
+	type DescriptionResult,
+	listPendingDescriptions,
+	type PendingDescriptionView,
+	type RejectedDescriptionData,
+	type ReviewPendingDescriptionInput,
+	rejectPendingDescription,
+	type SubmitPendingDescriptionInput,
+	type SubmitPendingDescriptionResult,
+	submitPendingDescription,
+} from "./descriptions";
 export { handleAdminMcpRequest } from "./handler";
 export { ADMIN_SERVER_INSTRUCTIONS } from "./instructions";
 export {

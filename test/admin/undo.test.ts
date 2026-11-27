@@ -14,6 +14,11 @@ import {
 	suspendAgent,
 	updateAgent,
 } from "../../src/admin";
+import {
+	approvePendingDescription,
+	rejectPendingDescription,
+	submitPendingDescription,
+} from "../../src/adminbot";
 import { type AgentRow, agentFromRow } from "../../src/db";
 import { checkQuestion } from "../../src/policy";
 import { createTestDb } from "../helpers/db";
@@ -506,5 +511,137 @@ describe("revertAdminBotChange", () => {
 				now: T0 + 7,
 			}),
 		).toMatchObject({ ok: false, code: "invalid_input" });
+	});
+
+	it("reverts description_approved without clobbering unrelated agent fields, detects newer description conflicts, and treats description_rejected as non-undoable", async () => {
+		const grok = await seedAgent(db, {
+			name: "grok",
+			description: "original bio",
+			dailyQuestionLimit: 20,
+			status: "active",
+		});
+
+		await submitPendingDescription(db, {
+			agentId: grok.id,
+			description: "approved bio v1",
+			now: T0 + 1,
+		});
+		const approved1 = await approvePendingDescription(db, {
+			agentId: grok.id,
+			actor: BOT,
+			now: T0 + 2,
+		});
+		if (!approved1.ok) throw new Error("approve 1 failed");
+		expect((await loadAgent(grok.id))?.description).toBe("approved bio v1");
+
+		// Unrelated mutations (suspend + daily limit change + rejected draft) must not block reverting description_approved.
+		await suspendAgent(db, { agentId: grok.id, actor: OWNER, now: T0 + 3 });
+		await updateAgent(db, {
+			agentId: grok.id,
+			dailyQuestionLimit: 7,
+			actor: OWNER,
+			now: T0 + 4,
+		});
+		await submitPendingDescription(db, {
+			agentId: grok.id,
+			description: "rejected draft",
+			now: T0 + 5,
+		});
+		const rejected = await rejectPendingDescription(db, {
+			agentId: grok.id,
+			actor: BOT,
+			now: T0 + 6,
+		});
+		if (!rejected.ok) throw new Error("reject failed");
+
+		// description_rejected is not undoable.
+		expect(
+			await revertAdminBotChange(db, {
+				changeId: rejected.changeId,
+				actor: OWNER,
+				now: T0 + 7,
+			}),
+		).toMatchObject({ ok: false, code: "not_undoable" });
+
+		// Reverting description_approved restores ONLY description and preserves status + dailyQuestionLimit.
+		const reverted1 = await revertAdminBotChange(db, {
+			changeId: approved1.changeId,
+			actor: OWNER,
+			now: T0 + 8,
+		});
+		expect(reverted1).toEqual({
+			ok: true,
+			data: {
+				revertedChangeId: approved1.changeId,
+				action: "description_approved",
+				targetType: "description",
+				targetId: grok.id,
+			},
+			changeId: expect.any(Number),
+		});
+		const afterRevert1 = await loadAgent(grok.id);
+		expect(afterRevert1).toMatchObject({
+			description: "original bio",
+			status: "suspended",
+			dailyQuestionLimit: 7,
+		});
+
+		// Double-undo is rejected.
+		expect(
+			await revertAdminBotChange(db, {
+				changeId: approved1.changeId,
+				actor: OWNER,
+				now: T0 + 9,
+			}),
+		).toMatchObject({ ok: false, code: "already_reverted" });
+
+		// A newer description_approved blocks reverting an earlier description_approved until undone newest-first.
+		await submitPendingDescription(db, {
+			agentId: grok.id,
+			description: "approved bio v2",
+			now: T0 + 10,
+		});
+		const approved2 = await approvePendingDescription(db, {
+			agentId: grok.id,
+			actor: BOT,
+			now: T0 + 11,
+		});
+		await submitPendingDescription(db, {
+			agentId: grok.id,
+			description: "approved bio v3",
+			now: T0 + 12,
+		});
+		const approved3 = await approvePendingDescription(db, {
+			agentId: grok.id,
+			actor: BOT,
+			now: T0 + 13,
+		});
+		if (!approved2.ok || !approved3.ok) throw new Error("approves failed");
+
+		expect(
+			await revertAdminBotChange(db, {
+				changeId: approved2.changeId,
+				actor: OWNER,
+				now: T0 + 14,
+			}),
+		).toMatchObject({ ok: false, code: "conflict_newer_change" });
+
+		expect(
+			await revertAdminBotChange(db, {
+				changeId: approved3.changeId,
+				actor: OWNER,
+				now: T0 + 15,
+			}),
+		).toMatchObject({ ok: true });
+		expect((await loadAgent(grok.id))?.description).toBe("approved bio v2");
+
+		expect(
+			await revertAdminBotChange(db, {
+				changeId: approved2.changeId,
+				actor: OWNER,
+				now: T0 + 16,
+			}),
+		).toMatchObject({ ok: true });
+		expect((await loadAgent(grok.id))?.description).toBe("original bio");
 	});
 });

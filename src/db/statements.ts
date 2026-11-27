@@ -5,6 +5,7 @@ import type {
 	Message,
 	NewAuditLogEntry,
 	NewChangeLogEntry,
+	PendingDescription,
 	Proposal,
 	Token,
 } from "../types";
@@ -174,4 +175,20 @@ export function insertProposal(
 			proposal.resolvedBy,
 			proposal.changeLogId,
 		);
+}
+
+export function upsertPendingDescription(
+	db: D1Database,
+	pending: PendingDescription,
+): D1PreparedStatement {
+	return db
+		.prepare(
+			`INSERT INTO pending_descriptions
+				(agent_id, description, submitted_at)
+			VALUES (?, ?, ?)
+			ON CONFLICT (agent_id) DO UPDATE SET
+				description = excluded.description,
+				submitted_at = excluded.submitted_at`,
+		)
+		.bind(pending.agentId, pending.description, pending.submittedAt);
 }

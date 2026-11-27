@@ -25,11 +25,14 @@ import {
 	type MessageRow,
 	messageFromRow,
 	newId,
+	type PendingDescriptionRow,
 	type ProposalRow,
 	parseProposalPayload,
+	pendingDescriptionFromRow,
 	proposalFromRow,
 	type TokenRow,
 	tokenFromRow,
+	upsertPendingDescription,
 } from "../../src/db";
 import type {
 	Agent,
@@ -37,6 +40,7 @@ import type {
 	Message,
 	NewAuditLogEntry,
 	NewChangeLogEntry,
+	PendingDescription,
 	Proposal,
 	Token,
 } from "../../src/types";
@@ -114,6 +118,7 @@ describe("test database helper", () => {
 			"categories",
 			"change_log",
 			"messages",
+			"pending_descriptions",
 			"proposals",
 			"tokens",
 		]);
@@ -679,6 +684,7 @@ describe("migrations", () => {
 
 	it("preserves all existing tables when migrating a populated database from 0002 to 0003 and enforces change_log constraints", async () => {
 		await db.batch([
+			db.prepare("DROP TABLE IF EXISTS pending_descriptions"),
 			db.prepare("DROP TABLE IF EXISTS proposals"),
 			db.prepare("DROP TABLE IF EXISTS admin_bot_config"),
 			db.prepare("DROP TABLE IF EXISTS change_log"),
@@ -833,6 +839,7 @@ describe("migrations", () => {
 
 	it("preserves all existing tables when migrating a populated database from 0003 to 0004 and enforces admin_bot_config constraints", async () => {
 		await db.batch([
+			db.prepare("DROP TABLE IF EXISTS pending_descriptions"),
 			db.prepare("DROP TABLE IF EXISTS proposals"),
 			db.prepare("DROP TABLE IF EXISTS admin_bot_config"),
 			db.prepare("DROP TABLE IF EXISTS change_log"),
@@ -1004,6 +1011,7 @@ describe("migrations", () => {
 
 	it("preserves all existing tables when migrating a populated database from 0004 to 0005 and enforces proposals constraints", async () => {
 		await db.batch([
+			db.prepare("DROP TABLE IF EXISTS pending_descriptions"),
 			db.prepare("DROP TABLE IF EXISTS proposals"),
 			db.prepare("DROP TABLE IF EXISTS admin_bot_config"),
 			db.prepare("DROP TABLE IF EXISTS change_log"),
@@ -1145,6 +1153,148 @@ describe("migrations", () => {
 			.prepare("SELECT COUNT(*) AS n FROM proposals")
 			.first<{ n: number }>();
 		expect(remaining?.n).toBe(0);
+	});
+
+	it("preserves all existing tables when migrating a populated database from 0005 to 0006 and enforces pending_descriptions constraints", async () => {
+		await db.batch([
+			db.prepare("DROP TABLE IF EXISTS pending_descriptions"),
+			db.prepare("DROP TABLE IF EXISTS proposals"),
+			db.prepare("DROP TABLE IF EXISTS admin_bot_config"),
+			db.prepare("DROP TABLE IF EXISTS change_log"),
+			db.prepare("DROP TABLE IF EXISTS audit_log"),
+			db.prepare("DROP TABLE IF EXISTS messages"),
+			db.prepare("DROP TABLE IF EXISTS allow_rules"),
+			db.prepare("DROP TABLE IF EXISTS tokens"),
+			db.prepare("DROP TABLE IF EXISTS categories"),
+			db.prepare("DROP TABLE IF EXISTS agents"),
+			db.prepare("DROP TABLE IF EXISTS d1_migrations"),
+		]);
+
+		const m1 = migration("0001_initial_schema.sql");
+		const m2 = migration("0002_cascade_message_references.sql");
+		const m3 = migration("0003_change_log.sql");
+		const m4 = migration("0004_admin_bot.sql");
+		const m5 = migration("0005_proposals.sql");
+		const m6 = migration("0006_pending_descriptions.sql");
+		await applyD1Migrations(db, [m1, m2, m3, m4, m5]);
+
+		const a = await seedAgent(db, { name: "a", description: "original" });
+		const b = await seedAgent(db, { name: "b" });
+		await insertProposal(db, {
+			id: newId(),
+			kind: "create_category",
+			proposerAgentId: a.id,
+			payload: { kind: "create_category", name: "travel" },
+			reason: "Need travel",
+			status: "pending",
+			createdAt: T0,
+			expiresAt: T0 + 14 * DAY_MS,
+			resolvedAt: null,
+			resolvedBy: null,
+			changeLogId: null,
+		}).run();
+
+		await applyD1Migrations(db, [m1, m2, m3, m4, m5, m6]);
+
+		const fkViolations = await db.prepare("PRAGMA foreign_key_check").all();
+		expect(fkViolations.results).toEqual([]);
+
+		expect(
+			(
+				await db.prepare("SELECT * FROM agents ORDER BY name").all<AgentRow>()
+			).results.map(agentFromRow),
+		).toEqual([a, b]);
+
+		const draft: PendingDescription = {
+			agentId: a.id,
+			description: "Updated agent description",
+			submittedAt: T0 + 10,
+		};
+		await upsertPendingDescription(db, draft).run();
+
+		const loaded = await db
+			.prepare("SELECT * FROM pending_descriptions WHERE agent_id = ?")
+			.bind(a.id)
+			.first<PendingDescriptionRow>();
+		expect(loaded && pendingDescriptionFromRow(loaded)).toEqual(draft);
+
+		// Upsert replaces the previous draft for the same agent.
+		const revised: PendingDescription = {
+			agentId: a.id,
+			description: "Revised agent description",
+			submittedAt: T0 + 20,
+		};
+		await upsertPendingDescription(db, revised).run();
+		const reloaded = await db
+			.prepare("SELECT * FROM pending_descriptions WHERE agent_id = ?")
+			.bind(a.id)
+			.first<PendingDescriptionRow>();
+		expect(reloaded && pendingDescriptionFromRow(reloaded)).toEqual(revised);
+
+		// STRICT type check on submitted_at.
+		await expect(
+			db
+				.prepare(
+					`INSERT INTO pending_descriptions (agent_id, description, submitted_at)
+					VALUES (?, 'desc', 'not-int')`,
+				)
+				.bind(b.id)
+				.run(),
+		).rejects.toThrow(/STRICT|datatype/i);
+
+		// NOT NULL check on description.
+		await expect(
+			db
+				.prepare(
+					`INSERT INTO pending_descriptions (agent_id, description, submitted_at)
+					VALUES (?, NULL, ?)`,
+				)
+				.bind(b.id, T0)
+				.run(),
+		).rejects.toThrow(/NOT NULL/);
+
+		// Foreign key on agent_id and ON DELETE CASCADE.
+		await expect(
+			upsertPendingDescription(db, {
+				agentId: newId(),
+				description: "ghost",
+				submittedAt: T0,
+			}).run(),
+		).rejects.toThrow(/FOREIGN KEY/);
+
+		await db.prepare("DELETE FROM agents WHERE id = ?").bind(a.id).run();
+		const remaining = await db
+			.prepare("SELECT COUNT(*) AS n FROM pending_descriptions")
+			.first<{ n: number }>();
+		expect(remaining?.n).toBe(0);
+	});
+});
+
+describe("pending_descriptions", () => {
+	it("orders by submitted_at ASC using pending_descriptions_submitted_idx", async () => {
+		const a = await seedAgent(db, { name: "a" });
+		const b = await seedAgent(db, { name: "b" });
+		const second: PendingDescription = {
+			agentId: b.id,
+			description: "second",
+			submittedAt: T0 + 20,
+		};
+		const first: PendingDescription = {
+			agentId: a.id,
+			description: "first",
+			submittedAt: T0 + 10,
+		};
+		await db.batch([
+			upsertPendingDescription(db, second),
+			upsertPendingDescription(db, first),
+		]);
+
+		const sql = "SELECT * FROM pending_descriptions ORDER BY submitted_at ASC";
+		const { results } = await db.prepare(sql).all<PendingDescriptionRow>();
+		expect(results.map(pendingDescriptionFromRow)).toEqual([first, second]);
+		expect(await queryPlan(sql)).toContain(
+			"pending_descriptions_submitted_idx",
+		);
 	});
 });
 
@@ -1358,6 +1508,7 @@ describe("migration 0002 on populated data", () => {
 		const m0002 = migrationByName("0002_cascade_message_references.sql");
 
 		for (const table of [
+			"pending_descriptions",
 			"proposals",
 			"admin_bot_config",
 			"change_log",

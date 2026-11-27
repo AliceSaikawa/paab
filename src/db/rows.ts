@@ -14,6 +14,7 @@ import {
 	MESSAGE_KINDS,
 	MESSAGE_STATUSES,
 	type Message,
+	type PendingDescription,
 	PROPOSAL_KINDS,
 	PROPOSAL_STATUSES,
 	type Proposal,
@@ -127,6 +128,12 @@ export interface ProposalRow {
 	resolved_at: number | null;
 	resolved_by: string | null;
 	change_log_id: number | null;
+}
+
+export interface PendingDescriptionRow {
+	agent_id: string;
+	description: string;
+	submitted_at: number;
 }
 
 /** Narrows a stored string to one of the known values, or throws. */
@@ -339,5 +346,15 @@ export function proposalFromRow(row: ProposalRow): Proposal {
 		resolvedAt: row.resolved_at,
 		resolvedBy: row.resolved_by,
 		changeLogId: row.change_log_id,
+	};
+}
+
+export function pendingDescriptionFromRow(
+	row: PendingDescriptionRow,
+): PendingDescription {
+	return {
+		agentId: row.agent_id,
+		description: row.description,
+		submittedAt: row.submitted_at,
 	};
 }

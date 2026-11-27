@@ -50,6 +50,8 @@ export const CHANGE_ACTION_LABELS: Record<ChangeAction, string> = {
 	admin_bot_designated: "管理者ボット指名",
 	admin_bot_cleared: "管理者ボット解除",
 	admin_bot_switches_updated: "管理者ボット権限変更",
+	description_approved: "説明文承認",
+	description_rejected: "説明文却下",
 	change_reverted: "変更取消",
 };
 
@@ -124,6 +126,12 @@ export function collectEntityNames(
 				if (id !== null && name !== null && !agentMap.has(id)) {
 					agentMap.set(id, name);
 				}
+			} else if (entry.targetType === "description") {
+				const id = readString(record, "agentId");
+				const name = readString(record, "name");
+				if (id !== null && name !== null && !agentMap.has(id)) {
+					agentMap.set(id, name);
+				}
 			}
 		}
 	}
@@ -191,7 +199,7 @@ export function describeChangeTarget(
 		case "admin_bot":
 			return names.agents.get(entry.targetId) ?? entry.targetId;
 		case "description":
-			return entry.targetId;
+			return names.agents.get(entry.targetId) ?? entry.targetId;
 	}
 }
 
@@ -220,6 +228,30 @@ function describeAgentSnapshot(
 	if (status !== null) parts.push(`状態=${status}`);
 	if (typeof limit === "number") parts.push(`上限=${limit}/日`);
 	return parts.join(" ");
+}
+
+const DESCRIPTION_SNAPSHOT_PREVIEW_MAX = 80;
+
+function describeDescriptionSnapshot(
+	targetId: string,
+	record: Record<string, unknown>,
+	names: ChangeLogNameMaps,
+): string {
+	const agentId = readString(record, "agentId") ?? targetId;
+	const name =
+		names.agents.get(agentId) ?? readString(record, "name") ?? agentId;
+	const description = record.description;
+	if (typeof description !== "string") {
+		return name;
+	}
+	if (description.length === 0) {
+		return `${name}（説明文なし）`;
+	}
+	const preview =
+		description.length > DESCRIPTION_SNAPSHOT_PREVIEW_MAX
+			? `${description.slice(0, DESCRIPTION_SNAPSHOT_PREVIEW_MAX)}…`
+			: description;
+	return `${name}「${preview}」`;
 }
 
 function describeSnapshot(
@@ -279,6 +311,9 @@ function describeSnapshot(
 			}
 			return extras.length > 0 ? `${name}（${extras.join("・")}）` : name;
 		}
+		case "description_approved":
+		case "description_rejected":
+			return describeDescriptionSnapshot(entry.targetId, record, names);
 		case "change_reverted": {
 			switch (entry.targetType) {
 				case "allow_rule":
@@ -287,9 +322,10 @@ function describeSnapshot(
 					return readString(record, "name") ?? raw;
 				case "agent":
 					return describeAgentSnapshot(entry.targetId, record);
+				case "description":
+					return describeDescriptionSnapshot(entry.targetId, record, names);
 				case "token":
 				case "admin_bot":
-				case "description":
 					return raw;
 			}
 		}
@@ -303,7 +339,9 @@ export function describeChangeBeforeAfter(
 	const before = describeSnapshot(entry, entry.beforeJson, names);
 	const after =
 		entry.afterJson === null && entry.beforeJson !== null
-			? "削除"
+			? entry.action === "description_rejected"
+				? "却下"
+				: "削除"
 			: describeSnapshot(entry, entry.afterJson, names);
 	return `変更前: ${before} / 変更後: ${after}`;
 }

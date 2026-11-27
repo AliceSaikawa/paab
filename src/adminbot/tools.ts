@@ -15,6 +15,7 @@ import {
 	type ReasonCode,
 	type UnixMillis,
 } from "../types";
+import { DESCRIPTION_TOOLS } from "./description-tools";
 import { PROPOSAL_TOOLS } from "./proposal-tools";
 import { TIGHTENING_TOOLS } from "./tightening";
 
@@ -363,4 +364,5 @@ export const ADMIN_TOOLS: readonly AdminToolDefinition[] = [
 	viewAuditLog,
 	...TIGHTENING_TOOLS,
 	...PROPOSAL_TOOLS,
+	...DESCRIPTION_TOOLS,
 ];

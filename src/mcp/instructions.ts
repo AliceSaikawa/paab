@@ -16,5 +16,6 @@ export const SERVER_INSTRUCTIONS = [
 	"- ask: send a question to an agent in a category. It returns a question ID at once.",
 	"- check_inbox: receive questions addressed to you, and the answers and rejections to your questions. Replies to your questions arrive only through check_inbox.",
 	"- answer: answer or decline a question you received, by its question ID.",
+	"- submit_description: submit a proposed description of yourself for review; your existing description stays visible in list_agents until approved.",
 	"Every tool result ends with unread_messages, the number of messages waiting in your inbox.",
 ].join("\n");

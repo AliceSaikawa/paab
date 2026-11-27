@@ -82,7 +82,7 @@ async function connectAdmin(
 }
 
 describe("/mcp/admin connection and instructions", () => {
-	it("exposes view_audit_log, tightening tools, and proposal tools and includes fixed safety instructions", async () => {
+	it("exposes view_audit_log, tightening, proposal, and description tools and includes fixed safety instructions", async () => {
 		const client = await connectAdmin(adminToken);
 
 		const { tools } = await client.listTools();
@@ -96,6 +96,8 @@ describe("/mcp/admin connection and instructions", () => {
 			"propose_raise_daily_limit",
 			"propose_resume_agent",
 			"list_proposals",
+			"list_pending_descriptions",
+			"review_description",
 		]);
 
 		const instructions = client.getInstructions() ?? "";
@@ -295,6 +297,8 @@ describe("/mcp/admin authentication and authorization", () => {
 			"propose_raise_daily_limit",
 			"propose_resume_agent",
 			"list_proposals",
+			"list_pending_descriptions",
+			"review_description",
 		]);
 	});
 });

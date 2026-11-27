@@ -43,6 +43,7 @@ export function migrationByName(name: string): D1Migration {
 
 // Children before parents, so that foreign keys hold while emptying.
 const TABLES = [
+	"pending_descriptions",
 	"proposals",
 	"admin_bot_config",
 	"change_log",
