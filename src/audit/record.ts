@@ -62,6 +62,7 @@ const OUTCOMES: Record<AuditEventType, AuditOutcome> = {
 	auth_failed: "denied",
 	admin_tool_called: "ok",
 	admin_tool_denied: "denied",
+	admin_body_read: "ok",
 	description_submitted: "ok",
 };
 

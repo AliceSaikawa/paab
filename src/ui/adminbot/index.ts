@@ -13,7 +13,10 @@ import {
 	getAdminBotConfig,
 	issueAdminBotToken,
 	revokeAdminBotToken,
+	setAdminBotReadBodies,
 } from "../../adminbot";
+import { isBodyRecordingEnabled } from "../../audit";
+import { auditBodyConfig } from "../../mcp/config";
 import { adminPageResponse, type FlashMessage } from "../layout";
 import type { AdminGetContext, AdminPostContext, AdminRoute } from "../router";
 import { CHANGE_ACTION_LABELS } from "../rules/render";
@@ -80,6 +83,7 @@ async function renderAdminBotScreen(
 		config.agentId !== null
 			? (agents.find((item) => item.agent.id === config.agentId) ?? null)
 			: null;
+	const bodyRecordingEnabled = isBodyRecordingEnabled(auditBodyConfig(ctx.env));
 
 	return adminPageResponse(
 		{
@@ -94,6 +98,7 @@ async function renderAdminBotScreen(
 				agents,
 				categories,
 				changes,
+				bodyRecordingEnabled,
 				csrfToken: ctx.csrfToken,
 				adminMcpUrl: `${ctx.url.origin}/mcp/admin`,
 			}),
@@ -290,6 +295,63 @@ async function handleRevokeAdminBotToken(
 	});
 }
 
+function parseEnabledField(raw: string | null): boolean | null {
+	if (raw === null) return null;
+	const value = raw.trim();
+	if (value === "1") return true;
+	if (value === "0") return false;
+	return null;
+}
+
+async function handleToggleReadBodies(
+	ctx: AdminPostContext,
+): Promise<Response> {
+	const enabled = parseEnabledField(ctx.form.get("enabled"));
+	if (enabled === null) {
+		return renderAdminBotScreen(ctx, {
+			status: 400,
+			flash: {
+				kind: "error",
+				message: "本文閲覧スイッチの指定が不正です",
+			},
+		});
+	}
+
+	const result = await setAdminBotReadBodies(ctx.env.DB, {
+		enabled,
+		actor: ownerActor(ctx),
+		now: ctx.now,
+	});
+	if (!result.ok) {
+		return renderAdminBotScreen(ctx, {
+			status: statusForError(result.code),
+			flash: { kind: "error", message: result.message },
+		});
+	}
+
+	if (!result.data.changed) {
+		return renderAdminBotScreen(ctx, {
+			flash: {
+				kind: "info",
+				message: enabled
+					? "本文閲覧はすでにオンです"
+					: "本文閲覧はすでにオフです",
+			},
+		});
+	}
+
+	const bodyRecordingEnabled = isBodyRecordingEnabled(auditBodyConfig(ctx.env));
+	const message = enabled
+		? bodyRecordingEnabled
+			? "本文閲覧をオンにしました"
+			: "本文閲覧をオンにしました（監査ログへの本文記録が無効のため、現在読める本文はありません）"
+		: "本文閲覧をオフにしました";
+
+	return renderAdminBotScreen(ctx, {
+		flash: { kind: "success", message },
+	});
+}
+
 async function handleRevertAdminBotChange(
 	ctx: AdminPostContext,
 ): Promise<Response> {
@@ -338,6 +400,10 @@ export function adminBotRoutes(): AdminRoute[] {
 		{
 			pattern: "/admin/adminbot/token/revoke",
 			post: handleRevokeAdminBotToken,
+		},
+		{
+			pattern: "/admin/adminbot/permissions/read-bodies",
+			post: handleToggleReadBodies,
 		},
 		{
 			pattern: "/admin/adminbot/changes/:id/revert",

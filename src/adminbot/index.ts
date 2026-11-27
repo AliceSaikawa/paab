@@ -14,6 +14,9 @@ export {
 	issueAdminBotToken,
 	type RevokeAdminBotTokenResult,
 	revokeAdminBotToken,
+	type SetAdminBotReadBodiesInput,
+	type SetAdminBotSwitchesResult,
+	setAdminBotReadBodies,
 } from "./config";
 export {
 	DESCRIPTION_TOOLS,

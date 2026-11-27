@@ -21,6 +21,7 @@ export interface AdminBotPageView {
 	agents: readonly AgentWithStatus[];
 	categories: readonly CategoryWithUsage[];
 	changes: readonly ChangeLogEntry[];
+	bodyRecordingEnabled: boolean;
 	csrfToken: string;
 	adminMcpUrl: string;
 }
@@ -147,6 +148,70 @@ function renderCurrentSection(view: AdminBotPageView): SafeHtml {
 					${csrfInput(csrfToken)}
 					<button type="submit" class="btn btn-danger">指名を解除する</button>
 				</form>
+			</div>
+		</section>
+	`;
+}
+
+function renderReadBodiesPermission(view: AdminBotPageView): SafeHtml {
+	const { config, bodyRecordingEnabled, csrfToken } = view;
+	const enabled = config.readBodies;
+	const nextValue = enabled ? "0" : "1";
+	const buttonLabel = enabled ? "本文閲覧をオフにする" : "本文閲覧をオンにする";
+	const buttonClass = enabled ? "btn" : "btn btn-primary";
+	const statusBadge = enabled
+		? html`<span class="badge badge-dev">オン</span>`
+		: html`<span class="badge">オフ</span>`;
+
+	return html`
+		<div class="card stack">
+			<div class="actions">
+				<h3 style="margin: 0;">本文閲覧</h3>
+				${statusBadge}
+			</div>
+			<p class="muted">
+				<code>view_audit_log</code> で監査ログに記録された質問文・回答文を読めるようにします。本文は外部データ枠（<code>&lt;untrusted_external_data&gt;</code>）に入れて渡し、読んだ記録を監査ログ（<code>admin_body_read</code>）に残します。
+			</p>
+			<div class="actions">
+				<form class="inline-form" method="POST" action="/admin/adminbot/permissions/read-bodies">
+					${csrfInput(csrfToken)}
+					<input type="hidden" name="enabled" value="${nextValue}">
+					<button type="submit" class="${buttonClass}">${buttonLabel}</button>
+				</form>
+				<span class="muted">
+					注意: 本文閲覧をオンにすると、質問文・回答文に含まれる外部テキストを管理者ボットが読むため、プロンプトインジェクションの影響を受けるおそれがあります。
+				</span>
+			</div>
+			${
+				!bodyRecordingEnabled
+					? html`
+						<div class="banner banner-info" role="status">
+							監査ログへの本文記録（<code>AUDIT_RECORD_BODIES</code>）が無効のため、このスイッチをオンにしても読める本文はありません。
+						</div>
+					`
+					: false
+			}
+		</div>
+	`;
+}
+
+function renderOptionalPermissionsSection(
+	view: AdminBotPageView,
+): SafeHtml | false {
+	if (view.designated === null) {
+		return false;
+	}
+
+	return html`
+		<section class="card stack">
+			<div>
+				<h2>任意の権限</h2>
+				<p class="muted">
+					管理者ボットに追加できる任意の権限です（既定はオフ）。この画面から所有者のみが切り替えられます。
+				</p>
+			</div>
+			<div class="stack">
+				${renderReadBodiesPermission(view)}
 			</div>
 		</section>
 	`;
@@ -294,6 +359,7 @@ export function renderAdminBotPageBody(view: AdminBotPageView): SafeHtml {
 				</p>
 			</div>
 			${renderCurrentSection(view)}
+			${renderOptionalPermissionsSection(view)}
 			${renderDesignateSection(view)}
 			${renderAdminBotChangesSection(view)}
 		</div>

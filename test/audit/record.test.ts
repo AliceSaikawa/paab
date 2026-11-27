@@ -134,6 +134,18 @@ describe("recordAuditEvent", () => {
 				outcome: "ok",
 				reason: null,
 			},
+			{
+				event: {
+					occurredAt: T0 + 10,
+					eventType: "admin_body_read",
+					fromAgentId: "admin-bot",
+					toAgentId: "agent-b",
+					categoryId: "category-schedule",
+					messageId: "question-1",
+				},
+				outcome: "ok",
+				reason: null,
+			},
 		];
 
 	it("has a case for every event type", () => {

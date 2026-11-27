@@ -95,6 +95,31 @@ export interface AdminBotTokenInput {
 	now: UnixMillis;
 }
 
+export interface SetAdminBotReadBodiesInput {
+	enabled: boolean;
+	actor: ChangeActor;
+	now: UnixMillis;
+}
+
+export type SetAdminBotSwitchesResult =
+	| {
+			ok: true;
+			data: {
+				config: AdminBotConfig;
+				changed: true;
+			};
+			changeId: number;
+	  }
+	| {
+			ok: true;
+			data: {
+				config: AdminBotConfig;
+				changed: false;
+			};
+			changeId: null;
+	  }
+	| AdminBotFailure;
+
 export type RevokeAdminBotTokenResult =
 	| RevokeAgentTokensResult
 	| AdminBotFailure;
@@ -361,4 +386,79 @@ export async function revokeAdminBotToken(
 		actor: input.actor,
 		now: input.now,
 	});
+}
+
+/**
+ * Toggles the optional `read_bodies` permission switch for the currently
+ * designated administrator bot (design section 5.2, 5.3). Owner-only.
+ */
+export async function setAdminBotReadBodies(
+	db: D1Database,
+	input: SetAdminBotReadBodiesInput,
+): Promise<SetAdminBotSwitchesResult> {
+	const ctx = validateContext(input.actor, input.now);
+	if (!ctx.ok) return ctx;
+
+	if (ctx.value.actorType !== "owner") {
+		return adminFail(
+			"invalid_input",
+			"本文閲覧スイッチの変更は所有者のみが実行できます",
+		);
+	}
+	if (typeof input.enabled !== "boolean") {
+		return adminFail("invalid_input", "本文閲覧スイッチの指定が不正です");
+	}
+
+	const current = await getAdminBotConfig(db);
+	if (current.agentId === null) {
+		return fail(
+			"not_admin_bot",
+			"管理者ボットが指名されていないため権限スイッチを変更できません",
+		);
+	}
+
+	if (current.readBodies === input.enabled) {
+		return {
+			ok: true,
+			data: { config: current, changed: false },
+			changeId: null,
+		};
+	}
+
+	const next: AdminBotConfig = {
+		...current,
+		readBodies: input.enabled,
+		updatedAt: ctx.value.now,
+	};
+
+	const changeId = await runWithChangeLog(
+		db,
+		[
+			db
+				.prepare(
+					`UPDATE admin_bot_config
+					SET read_bodies = ?, updated_at = ?
+					WHERE id = 1`,
+				)
+				.bind(input.enabled ? 1 : 0, ctx.value.now),
+		],
+		{
+			occurredAt: ctx.value.now,
+			actorType: ctx.value.actorType,
+			actorId: ctx.value.actorId,
+			approverId: ctx.value.approverId,
+			action: "admin_bot_switches_updated",
+			targetType: "admin_bot",
+			targetId: current.agentId,
+			beforeJson: JSON.stringify(current),
+			afterJson: JSON.stringify(next),
+			revertedAt: null,
+		},
+	);
+
+	return {
+		ok: true,
+		data: { config: next, changed: true },
+		changeId,
+	};
 }
