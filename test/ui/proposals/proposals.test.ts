@@ -10,7 +10,11 @@ import {
 	resumeAgent,
 	updateAgent,
 } from "../../../src/admin";
-import { createProposal, designateAdminBot } from "../../../src/adminbot";
+import {
+	clearAdminBot,
+	createProposal,
+	designateAdminBot,
+} from "../../../src/adminbot";
 import { type AgentRow, agentFromRow } from "../../../src/db";
 import type { Agent, Category } from "../../../src/types";
 import { handleAdminRequest, type UiEnv } from "../../../src/ui";
@@ -478,5 +482,118 @@ describe("POST /admin/proposals/:id/approve and /reject", () => {
 			);
 			expect(noCsrf.status).toBe(403);
 		}
+	});
+
+	it("auto-rejects pending proposals when admin bot is cleared or switched and refuses stale UI approvals with 409", async () => {
+		const pClear = await createProposal(db, {
+			proposerAgentId: muse.id,
+			payload: { kind: "create_category", name: "cleared-bot-cat" },
+			reason: "Submitted before clear",
+			now: T0,
+		});
+		expect(pClear.ok).toBe(true);
+		if (!pClear.ok) return;
+
+		// Owner opens /admin/proposals while the proposal is still pending.
+		const { session, html: beforeHtml } = await openProposalsSession(T0 + 5);
+		expect(beforeHtml).toContain("承認待ちの提案（1 / 20 件）");
+
+		// Admin bot designation is cleared via /admin/adminbot/clear.
+		const clearRes = await adminPost(
+			"/admin/adminbot/clear",
+			session,
+			{},
+			T0 + 10,
+		);
+		expect(clearRes.status).toBe(200);
+		expect(await clearRes.text()).toContain("保留中の提案を却下しました");
+
+		// Stale approval click from the open proposals tab fails with 409 without mutating live state.
+		const staleApprove = await adminPost(
+			`/admin/proposals/${encodeURIComponent(pClear.data.proposal.id)}/approve`,
+			session,
+			{},
+			T0 + 11,
+		);
+		expect(staleApprove.status).toBe(409);
+		const staleHtml = await staleApprove.text();
+		expect(staleHtml).toContain("banner-error");
+		expect(staleHtml).toContain("承認待ちの提案（0 / 20 件）");
+		expect(staleHtml).toContain("却下済み");
+		expect(staleHtml).toContain(`処理者: ${OWNER_EMAIL}`);
+		expect(
+			(await listCategoriesWithUsage(db)).map((c) => c.category.name),
+		).not.toContain("cleared-bot-cat");
+		expect(await queryChangeLog(db, { actorType: "admin_bot" })).toEqual([]);
+
+		// Switching from muse to grok also auto-rejects muse's pending proposals.
+		await designateAdminBot(db, {
+			agentId: muse.id,
+			actor: OWNER,
+			now: T0 + 20,
+		});
+		const pSwitch = await createProposal(db, {
+			proposerAgentId: muse.id,
+			payload: { kind: "resume_agent", agentId: carol.id },
+			reason: "Submitted before switch",
+			now: T0 + 21,
+		});
+		expect(pSwitch.ok).toBe(true);
+		if (!pSwitch.ok) return;
+
+		const switchRes = await adminPost(
+			"/admin/adminbot/designate",
+			session,
+			{ agent_id: grok.id },
+			T0 + 25,
+		);
+		expect(switchRes.status).toBe(200);
+		expect(await switchRes.text()).toContain("保留中の提案を却下しました");
+
+		const afterSwitch = await adminGet("/admin/proposals", session, T0 + 26);
+		const afterSwitchHtml = await afterSwitch.text();
+		expect(afterSwitchHtml).toContain("承認待ちの提案（0 / 20 件）");
+		expect((await loadAgent(carol.id)).status).toBe("suspended");
+	});
+
+	it("returns 409 with a clear error banner when approving a pending proposal whose proposer is no longer the designated admin bot", async () => {
+		// Simulate a race where an in-flight proposal landed after clearAdminBot.
+		await clearAdminBot(db, { actor: OWNER, now: T0 + 5 });
+		const racedProposal = await createProposal(db, {
+			proposerAgentId: muse.id,
+			payload: { kind: "create_category", name: "raced-removed-bot-cat" },
+			reason: "Arrived after clear",
+			now: T0 + 6,
+		});
+		expect(racedProposal.ok).toBe(true);
+		if (!racedProposal.ok) return;
+
+		const { session } = await openProposalsSession(T0 + 10);
+		const approveRes = await adminPost(
+			`/admin/proposals/${encodeURIComponent(racedProposal.data.proposal.id)}/approve`,
+			session,
+			{},
+			T0 + 11,
+		);
+		expect(approveRes.status).toBe(409);
+		const approveHtml = await approveRes.text();
+		expect(approveHtml).toContain("banner-error");
+		expect(approveHtml).toContain(
+			"提案元のボットは現在管理者ボットに指名されていないため承認できません",
+		);
+		expect(
+			(await listCategoriesWithUsage(db)).map((c) => c.category.name),
+		).not.toContain("raced-removed-bot-cat");
+		expect(await queryChangeLog(db, { actorType: "admin_bot" })).toEqual([]);
+
+		// Owner can still dismiss the leftover proposal cleanly via reject.
+		const rejectRes = await adminPost(
+			`/admin/proposals/${encodeURIComponent(racedProposal.data.proposal.id)}/reject`,
+			session,
+			{},
+			T0 + 12,
+		);
+		expect(rejectRes.status).toBe(200);
+		expect(await rejectRes.text()).toContain("提案を却下しました");
 	});
 });

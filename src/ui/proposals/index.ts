@@ -24,6 +24,7 @@ function statusForProposalError(code: ProposalErrorCode): 400 | 404 | 409 {
 		case "already_resolved":
 		case "expired":
 		case "premise_changed":
+		case "not_admin_bot":
 		case "pending_limit_reached":
 		case "duplicate_name":
 		case "duplicate_rule":

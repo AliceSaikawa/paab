@@ -176,8 +176,9 @@ export async function getAdminBotConfig(
 
 /**
  * Designates an existing agent as the single administrator bot, atomically
- * revoking active `admin` tokens of previous/other agents, resetting optional
- * permission switches, and logging `admin_bot_designated` to `change_log`.
+ * revoking active `admin` tokens of previous/other agents, rejecting pending
+ * proposals from other agents, resetting optional permission switches, and
+ * logging `admin_bot_designated` to `change_log`.
  */
 export async function designateAdminBot(
 	db: D1Database,
@@ -236,6 +237,13 @@ export async function designateAdminBot(
 				.bind(ctx.value.now, agent.id),
 			db
 				.prepare(
+					`UPDATE proposals
+					SET status = 'rejected', resolved_at = ?1, resolved_by = ?2
+					WHERE status = 'pending' AND expires_at > ?1 AND proposer_agent_id <> ?3`,
+				)
+				.bind(ctx.value.now, ctx.value.actorId, agent.id),
+			db
+				.prepare(
 					`INSERT INTO admin_bot_config (id, agent_id, read_bodies, superadmin_until, updated_at)
 					VALUES (1, ?, 0, NULL, ?)
 					ON CONFLICT (id) DO UPDATE SET
@@ -274,7 +282,8 @@ export async function designateAdminBot(
 
 /**
  * Clears the current administrator bot designation, revoking active `admin`
- * tokens and resetting optional permission switches. No-op if already `null`.
+ * tokens, rejecting active pending proposals, and resetting optional permission
+ * switches. No-op if already `null`.
  */
 export async function clearAdminBot(
 	db: D1Database,
@@ -309,6 +318,13 @@ export async function clearAdminBot(
 					WHERE purpose = 'admin' AND revoked_at IS NULL`,
 				)
 				.bind(ctx.value.now),
+			db
+				.prepare(
+					`UPDATE proposals
+					SET status = 'rejected', resolved_at = ?1, resolved_by = ?2
+					WHERE status = 'pending' AND expires_at > ?1`,
+				)
+				.bind(ctx.value.now, ctx.value.actorId),
 			db
 				.prepare(
 					`UPDATE admin_bot_config

@@ -157,7 +157,7 @@ async function handleDesignateAdminBot(
 
 	const note =
 		result.data.previousAgentId !== null
-			? "（前の管理者ボットの管理者トークンを失効させ、権限スイッチをリセットしました）"
+			? "（前の管理者ボットの管理者トークンを失効させ、権限スイッチをリセットし、保留中の提案を却下しました）"
 			: "";
 	return renderAdminBotScreen(ctx, {
 		flash: {
@@ -192,7 +192,7 @@ async function handleClearAdminBot(ctx: AdminPostContext): Promise<Response> {
 		flash: {
 			kind: "success",
 			message:
-				"管理者ボットの指名を解除しました（管理者トークンを失効させ、権限スイッチをリセットしました）",
+				"管理者ボットの指名を解除しました（管理者トークンを失効させ、権限スイッチをリセットし、保留中の提案を却下しました）",
 		},
 	});
 }

@@ -47,7 +47,16 @@ export type ProposalErrorCode =
 	| "pending_limit_reached"
 	| "already_resolved"
 	| "expired"
-	| "premise_changed";
+	| "premise_changed"
+	| "not_admin_bot";
+
+const PROPOSER_NOT_ADMIN_BOT_MESSAGE =
+	"提案元のボットは現在管理者ボットに指名されていないため承認できません";
+
+const PROPOSER_IS_ADMIN_BOT_CLAUSE = `EXISTS (
+	SELECT 1 FROM admin_bot_config
+	WHERE id = 1 AND agent_id = proposals.proposer_agent_id
+)`;
 
 export interface ProposalFailure {
 	ok: false;
@@ -472,6 +481,7 @@ function prepareApprovalBatch(
 					`UPDATE proposals
 					SET status = 'approved', resolved_at = ?1, resolved_by = ?2
 					WHERE id = ?3 AND status = 'pending' AND expires_at > ?1
+						AND ${PROPOSER_IS_ADMIN_BOT_CLAUSE}
 						AND ?4 <> ?5
 						AND EXISTS (SELECT 1 FROM agents WHERE id = ?4)
 						AND EXISTS (SELECT 1 FROM agents WHERE id = ?5)
@@ -551,6 +561,7 @@ function prepareApprovalBatch(
 					`UPDATE proposals
 					SET status = 'approved', resolved_at = ?1, resolved_by = ?2
 					WHERE id = ?3 AND status = 'pending' AND expires_at > ?1
+						AND ${PROPOSER_IS_ADMIN_BOT_CLAUSE}
 						AND NOT EXISTS (SELECT 1 FROM categories WHERE name = ?4)`,
 				)
 				.bind(now, approverId, proposal.id, categoryName);
@@ -606,6 +617,7 @@ function prepareApprovalBatch(
 					`UPDATE proposals
 					SET status = 'approved', resolved_at = ?1, resolved_by = ?2
 					WHERE id = ?3 AND status = 'pending' AND expires_at > ?1
+						AND ${PROPOSER_IS_ADMIN_BOT_CLAUSE}
 						AND EXISTS (
 							SELECT 1 FROM agents
 							WHERE id = ?4 AND daily_question_limit < ?5
@@ -687,6 +699,7 @@ function prepareApprovalBatch(
 					`UPDATE proposals
 					SET status = 'approved', resolved_at = ?1, resolved_by = ?2
 					WHERE id = ?3 AND status = 'pending' AND expires_at > ?1
+						AND ${PROPOSER_IS_ADMIN_BOT_CLAUSE}
 						AND EXISTS (
 							SELECT 1 FROM agents
 							WHERE id = ?4 AND status = 'suspended'
@@ -757,19 +770,42 @@ function prepareApprovalBatch(
 	}
 }
 
+interface ProposalWithAdminBotRow extends ProposalRow {
+	designated_agent_id: string | null;
+}
+
+async function loadProposalWithAdminBot(
+	db: D1Database,
+	proposalId: string,
+): Promise<{ proposal: Proposal; designatedAgentId: string | null } | null> {
+	const row = await db
+		.prepare(
+			`SELECT p.*, c.agent_id AS designated_agent_id
+			FROM proposals AS p
+			LEFT JOIN admin_bot_config AS c ON c.id = 1
+			WHERE p.id = ?`,
+		)
+		.bind(proposalId)
+		.first<ProposalWithAdminBotRow>();
+	if (row === null) {
+		return null;
+	}
+	return {
+		proposal: proposalFromRow(row),
+		designatedAgentId: row.designated_agent_id,
+	};
+}
+
 async function diagnoseApproveFailure(
 	db: D1Database,
 	proposalId: string,
 	now: UnixMillis,
 ): Promise<ProposalFailure> {
-	const latestRow = await db
-		.prepare("SELECT * FROM proposals WHERE id = ?")
-		.bind(proposalId)
-		.first<ProposalRow>();
-	if (latestRow === null) {
+	const loaded = await loadProposalWithAdminBot(db, proposalId);
+	if (loaded === null) {
 		return fail("not_found", "指定された提案が見つかりません");
 	}
-	const latest = proposalFromRow(latestRow);
+	const latest = loaded.proposal;
 	if (latest.status === "expired") {
 		return fail(
 			"expired",
@@ -785,6 +821,9 @@ async function diagnoseApproveFailure(
 			"expired",
 			"この提案は有効期限（14日）を過ぎたため承認できません",
 		);
+	}
+	if (loaded.designatedAgentId !== latest.proposerAgentId) {
+		return fail("not_admin_bot", PROPOSER_NOT_ADMIN_BOT_MESSAGE);
 	}
 
 	const { payload } = latest;
@@ -917,15 +956,12 @@ export async function approveProposal(
 	}
 
 	const approverId = input.approverId.trim();
-	const row = await db
-		.prepare("SELECT * FROM proposals WHERE id = ?")
-		.bind(input.proposalId)
-		.first<ProposalRow>();
-	if (row === null) {
+	const loaded = await loadProposalWithAdminBot(db, input.proposalId);
+	if (loaded === null) {
 		return fail("not_found", "指定された提案が見つかりません");
 	}
 
-	const proposal = proposalFromRow(row);
+	const { proposal, designatedAgentId } = loaded;
 	if (proposal.status === "expired") {
 		return fail(
 			"expired",
@@ -941,6 +977,9 @@ export async function approveProposal(
 			"expired",
 			"この提案は有効期限（14日）を過ぎたため承認できません",
 		);
+	}
+	if (designatedAgentId !== proposal.proposerAgentId) {
+		return fail("not_admin_bot", PROPOSER_NOT_ADMIN_BOT_MESSAGE);
 	}
 
 	const prepared = prepareApprovalBatch(db, proposal, approverId, input.now);

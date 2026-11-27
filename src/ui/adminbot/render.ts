@@ -207,7 +207,7 @@ function renderCurrentSection(view: AdminBotPageView): SafeHtml {
 
 			<div class="stack">
 				<p class="muted">
-					指名を解除すると、現在の管理者トークンは直ちに失効し、権限スイッチもオフにリセットされます。
+					指名を解除すると、現在の管理者トークンは直ちに失効し、権限スイッチはオフにリセットされ、保留中の提案も自動で却下されます。
 				</p>
 				<form class="inline-form" method="POST" action="/admin/adminbot/clear">
 					${csrfInput(csrfToken)}
@@ -364,7 +364,7 @@ function renderDesignateSection(view: AdminBotPageView): SafeHtml {
 		<section class="card stack">
 			<h2>${heading}</h2>
 			<div class="banner banner-warning" role="note">
-				注意: 管理者ボットを変更または指名解除すると、前の管理者ボットの管理者トークンは直ちに失効し、本文閲覧・最高管理者権限スイッチはオフにリセットされます。
+				注意: 管理者ボットを変更または指名解除すると、前の管理者ボットの管理者トークンは直ちに失効し、本文閲覧・最高管理者権限スイッチはオフにリセットされ、保留中の提案も自動で却下されます。
 			</div>
 			${
 				agents.length === 0
