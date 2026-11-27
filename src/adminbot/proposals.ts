@@ -1,14 +1,6 @@
 import {
-	type ChangeActor,
-	createCategory,
-	grantAllowRule,
-	resumeAgent,
-	updateAgent,
-} from "../admin";
-import {
 	type AgentRow,
 	agentFromRow,
-	insertProposal,
 	newId,
 	type ProposalRow,
 	proposalFromRow,
@@ -20,6 +12,8 @@ import {
 	normalizeName,
 } from "../policy";
 import {
+	type ChangeAction,
+	type ChangeTargetType,
 	PROPOSAL_STATUSES,
 	type Proposal,
 	type ProposalPayload,
@@ -116,22 +110,6 @@ function validateReason(
 	return { ok: true, value: normalized };
 }
 
-function activePendingCountQuery(
-	db: D1Database,
-	now: UnixMillis,
-): D1PreparedStatement {
-	return db
-		.prepare(
-			"SELECT COUNT(*) AS n FROM proposals WHERE status = 'pending' AND expires_at > ?",
-		)
-		.bind(now);
-}
-
-function countFromResult(result: D1Result | undefined): number {
-	const row = (result?.results[0] ?? null) as { n?: unknown } | null;
-	return typeof row?.n === "number" ? row.n : Number(row?.n ?? 0);
-}
-
 /**
  * Records a pending loosening proposal from the admin bot.
  * Never mutates live rules, categories, or agents.
@@ -157,7 +135,6 @@ export async function createProposal(
 
 	const proposerId = input.proposerAgentId;
 	let normalizedPayload: ProposalPayload;
-	let pendingCount: number;
 
 	switch (input.payload.kind) {
 		case "grant_allow_rule": {
@@ -182,26 +159,19 @@ export async function createProposal(
 				);
 			}
 
-			const [
-				proposerRes,
-				fromRes,
-				toRes,
-				catRes,
-				existingRuleRes,
-				pendingCountRes,
-			] = await db.batch([
-				db.prepare("SELECT id FROM agents WHERE id = ?").bind(proposerId),
-				db.prepare("SELECT id FROM agents WHERE id = ?").bind(fromAgentId),
-				db.prepare("SELECT id FROM agents WHERE id = ?").bind(toAgentId),
-				db.prepare("SELECT id FROM categories WHERE id = ?").bind(categoryId),
-				db
-					.prepare(
-						`SELECT 1 AS found FROM allow_rules
+			const [proposerRes, fromRes, toRes, catRes, existingRuleRes] =
+				await db.batch([
+					db.prepare("SELECT id FROM agents WHERE id = ?").bind(proposerId),
+					db.prepare("SELECT id FROM agents WHERE id = ?").bind(fromAgentId),
+					db.prepare("SELECT id FROM agents WHERE id = ?").bind(toAgentId),
+					db.prepare("SELECT id FROM categories WHERE id = ?").bind(categoryId),
+					db
+						.prepare(
+							`SELECT 1 AS found FROM allow_rules
 						WHERE from_agent_id = ? AND to_agent_id = ? AND category_id = ?`,
-					)
-					.bind(fromAgentId, toAgentId, categoryId),
-				activePendingCountQuery(db, input.now),
-			]);
+						)
+						.bind(fromAgentId, toAgentId, categoryId),
+				]);
 
 			if ((proposerRes?.results.length ?? 0) === 0) {
 				return fail("not_found", "提案元エージェントが見つかりません");
@@ -218,7 +188,6 @@ export async function createProposal(
 			if ((existingRuleRes?.results.length ?? 0) > 0) {
 				return fail("duplicate_rule", "同じ許可ルールがすでに存在します");
 			}
-			pendingCount = countFromResult(pendingCountRes);
 			normalizedPayload = {
 				kind: "grant_allow_rule",
 				fromAgentId,
@@ -237,10 +206,9 @@ export async function createProposal(
 			}
 			const name = normalizeName(input.payload.name);
 
-			const [proposerRes, existingCatRes, pendingCountRes] = await db.batch([
+			const [proposerRes, existingCatRes] = await db.batch([
 				db.prepare("SELECT id FROM agents WHERE id = ?").bind(proposerId),
 				db.prepare("SELECT id FROM categories WHERE name = ?").bind(name),
-				activePendingCountQuery(db, input.now),
 			]);
 
 			if ((proposerRes?.results.length ?? 0) === 0) {
@@ -249,7 +217,6 @@ export async function createProposal(
 			if ((existingCatRes?.results.length ?? 0) > 0) {
 				return fail("duplicate_name", `カテゴリ「${name}」はすでに存在します`);
 			}
-			pendingCount = countFromResult(pendingCountRes);
 			normalizedPayload = { kind: "create_category", name };
 			break;
 		}
@@ -265,10 +232,9 @@ export async function createProposal(
 				);
 			}
 
-			const [proposerRes, targetRes, pendingCountRes] = await db.batch([
+			const [proposerRes, targetRes] = await db.batch([
 				db.prepare("SELECT id FROM agents WHERE id = ?").bind(proposerId),
 				db.prepare("SELECT * FROM agents WHERE id = ?").bind(agentId),
-				activePendingCountQuery(db, input.now),
 			]);
 
 			if ((proposerRes?.results.length ?? 0) === 0) {
@@ -285,7 +251,6 @@ export async function createProposal(
 					`新しい上限（${newLimit}）は現在の上限（${target.dailyQuestionLimit}）より大きくする必要があります`,
 				);
 			}
-			pendingCount = countFromResult(pendingCountRes);
 			normalizedPayload = { kind: "raise_daily_limit", agentId, newLimit };
 			break;
 		}
@@ -295,10 +260,9 @@ export async function createProposal(
 				return fail("invalid_input", "エージェントIDを指定してください");
 			}
 
-			const [proposerRes, targetRes, pendingCountRes] = await db.batch([
+			const [proposerRes, targetRes] = await db.batch([
 				db.prepare("SELECT id FROM agents WHERE id = ?").bind(proposerId),
 				db.prepare("SELECT * FROM agents WHERE id = ?").bind(agentId),
-				activePendingCountQuery(db, input.now),
 			]);
 
 			if ((proposerRes?.results.length ?? 0) === 0) {
@@ -312,17 +276,9 @@ export async function createProposal(
 			if (target.status !== "suspended") {
 				return fail("already_active", "このエージェントはすでに有効です");
 			}
-			pendingCount = countFromResult(pendingCountRes);
 			normalizedPayload = { kind: "resume_agent", agentId };
 			break;
 		}
-	}
-
-	if (pendingCount >= MAX_PENDING_PROPOSALS) {
-		return fail(
-			"pending_limit_reached",
-			`保留中の提案数が上限（${MAX_PENDING_PROPOSALS} 件）に達しているため、新しい提案を作成できません`,
-		);
 	}
 
 	const proposal: Proposal = {
@@ -339,7 +295,36 @@ export async function createProposal(
 		changeLogId: null,
 	};
 
-	await insertProposal(db, proposal).run();
+	const insertResult = await db
+		.prepare(
+			`INSERT INTO proposals
+				(id, kind, proposer_agent_id, payload_json, reason, status,
+				created_at, expires_at, resolved_at, resolved_by, change_log_id)
+			SELECT ?, ?, ?, ?, ?, 'pending', ?, ?, NULL, NULL, NULL
+			WHERE (
+				SELECT COUNT(*) FROM proposals
+				WHERE status = 'pending' AND expires_at > ?
+			) < ?`,
+		)
+		.bind(
+			proposal.id,
+			proposal.kind,
+			proposal.proposerAgentId,
+			JSON.stringify(proposal.payload),
+			proposal.reason,
+			proposal.createdAt,
+			proposal.expiresAt,
+			input.now,
+			MAX_PENDING_PROPOSALS,
+		)
+		.run();
+	if ((insertResult.meta.changes ?? 0) === 0) {
+		return fail(
+			"pending_limit_reached",
+			`保留中の提案数が上限（${MAX_PENDING_PROPOSALS} 件）に達しているため、新しい提案を作成できません`,
+		);
+	}
+
 	return { ok: true, data: { proposal } };
 }
 
@@ -414,17 +399,502 @@ async function markProposalExpired(
 ): Promise<void> {
 	await db
 		.prepare(
-			"UPDATE proposals SET status = 'expired', resolved_at = ? WHERE id = ? AND status = 'pending'",
+			"UPDATE proposals SET status = 'expired', resolved_at = ?1 WHERE id = ?2 AND status = 'pending' AND expires_at <= ?1",
 		)
 		.bind(now, proposalId)
 		.run();
 }
 
+interface PreparedApprovalBatch {
+	claimStmt: D1PreparedStatement;
+	changeLogStmt: D1PreparedStatement;
+	mutateStmt: D1PreparedStatement;
+	linkChangeIdStmt: D1PreparedStatement;
+}
+
+function buildLinkChangeIdStatement(
+	db: D1Database,
+	params: {
+		proposalId: string;
+		proposerAgentId: string;
+		approverId: string;
+		action: ChangeAction;
+		targetType: ChangeTargetType;
+		targetId: string;
+		now: UnixMillis;
+	},
+): D1PreparedStatement {
+	return db
+		.prepare(
+			`UPDATE proposals
+			SET change_log_id = (
+				SELECT MAX(id) FROM change_log
+				WHERE actor_type = 'admin_bot'
+					AND actor_id = ?1
+					AND approver_id = ?2
+					AND action = ?3
+					AND target_type = ?4
+					AND target_id = ?5
+					AND occurred_at = ?6
+			)
+			WHERE id = ?7 AND status = 'approved' AND change_log_id IS NULL`,
+		)
+		.bind(
+			params.proposerAgentId,
+			params.approverId,
+			params.action,
+			params.targetType,
+			params.targetId,
+			params.now,
+			params.proposalId,
+		);
+}
+
+function prepareApprovalBatch(
+	db: D1Database,
+	proposal: Proposal,
+	approverId: string,
+	now: UnixMillis,
+): { ok: true; batch: PreparedApprovalBatch } | ProposalFailure {
+	const { payload } = proposal;
+	switch (payload.kind) {
+		case "grant_allow_rule": {
+			const { fromAgentId, toAgentId, categoryId } = payload;
+			const targetId = `${fromAgentId}:${toAgentId}:${categoryId}`;
+			const afterJson = JSON.stringify({
+				fromAgentId,
+				toAgentId,
+				categoryId,
+				createdAt: now,
+			});
+			const claimStmt = db
+				.prepare(
+					`UPDATE proposals
+					SET status = 'approved', resolved_at = ?1, resolved_by = ?2
+					WHERE id = ?3 AND status = 'pending' AND expires_at > ?1
+						AND ?4 <> ?5
+						AND EXISTS (SELECT 1 FROM agents WHERE id = ?4)
+						AND EXISTS (SELECT 1 FROM agents WHERE id = ?5)
+						AND EXISTS (SELECT 1 FROM categories WHERE id = ?6)
+						AND NOT EXISTS (
+							SELECT 1 FROM allow_rules
+							WHERE from_agent_id = ?4 AND to_agent_id = ?5 AND category_id = ?6
+						)`,
+				)
+				.bind(now, approverId, proposal.id, fromAgentId, toAgentId, categoryId);
+			const changeLogStmt = db
+				.prepare(
+					`INSERT INTO change_log
+						(occurred_at, actor_type, actor_id, approver_id, action,
+						target_type, target_id, before_json, after_json, reverted_at)
+					SELECT ?1, 'admin_bot', ?2, ?3, 'allow_rule_granted',
+						'allow_rule', ?4, NULL, ?5, NULL
+					WHERE EXISTS (
+						SELECT 1 FROM proposals
+						WHERE id = ?6 AND status = 'approved' AND change_log_id IS NULL
+					)`,
+				)
+				.bind(
+					now,
+					proposal.proposerAgentId,
+					approverId,
+					targetId,
+					afterJson,
+					proposal.id,
+				);
+			const mutateStmt = db
+				.prepare(
+					`INSERT INTO allow_rules
+						(from_agent_id, to_agent_id, category_id, created_at)
+					SELECT ?1, ?2, ?3, ?4
+					WHERE EXISTS (
+						SELECT 1 FROM proposals
+						WHERE id = ?5 AND status = 'approved' AND change_log_id IS NULL
+					)
+						AND ?1 <> ?2
+						AND EXISTS (SELECT 1 FROM agents WHERE id = ?1)
+						AND EXISTS (SELECT 1 FROM agents WHERE id = ?2)
+						AND EXISTS (SELECT 1 FROM categories WHERE id = ?3)
+						AND NOT EXISTS (
+							SELECT 1 FROM allow_rules
+							WHERE from_agent_id = ?1 AND to_agent_id = ?2 AND category_id = ?3
+						)`,
+				)
+				.bind(fromAgentId, toAgentId, categoryId, now, proposal.id);
+			const linkChangeIdStmt = buildLinkChangeIdStatement(db, {
+				proposalId: proposal.id,
+				proposerAgentId: proposal.proposerAgentId,
+				approverId,
+				action: "allow_rule_granted",
+				targetType: "allow_rule",
+				targetId,
+				now,
+			});
+			return {
+				ok: true,
+				batch: { claimStmt, changeLogStmt, mutateStmt, linkChangeIdStmt },
+			};
+		}
+		case "create_category": {
+			const problem = nameProblem(payload.name);
+			if (problem !== null) {
+				return fail("premise_changed", problem);
+			}
+			const categoryName = normalizeName(payload.name);
+			const categoryId = newId();
+			const afterJson = JSON.stringify({
+				id: categoryId,
+				name: categoryName,
+			});
+			const claimStmt = db
+				.prepare(
+					`UPDATE proposals
+					SET status = 'approved', resolved_at = ?1, resolved_by = ?2
+					WHERE id = ?3 AND status = 'pending' AND expires_at > ?1
+						AND NOT EXISTS (SELECT 1 FROM categories WHERE name = ?4)`,
+				)
+				.bind(now, approverId, proposal.id, categoryName);
+			const changeLogStmt = db
+				.prepare(
+					`INSERT INTO change_log
+						(occurred_at, actor_type, actor_id, approver_id, action,
+						target_type, target_id, before_json, after_json, reverted_at)
+					SELECT ?1, 'admin_bot', ?2, ?3, 'category_created',
+						'category', ?4, NULL, ?5, NULL
+					WHERE EXISTS (
+						SELECT 1 FROM proposals
+						WHERE id = ?6 AND status = 'approved' AND change_log_id IS NULL
+					)`,
+				)
+				.bind(
+					now,
+					proposal.proposerAgentId,
+					approverId,
+					categoryId,
+					afterJson,
+					proposal.id,
+				);
+			const mutateStmt = db
+				.prepare(
+					`INSERT INTO categories (id, name)
+					SELECT ?1, ?2
+					WHERE EXISTS (
+						SELECT 1 FROM proposals
+						WHERE id = ?3 AND status = 'approved' AND change_log_id IS NULL
+					)
+						AND NOT EXISTS (SELECT 1 FROM categories WHERE name = ?2)`,
+				)
+				.bind(categoryId, categoryName, proposal.id);
+			const linkChangeIdStmt = buildLinkChangeIdStatement(db, {
+				proposalId: proposal.id,
+				proposerAgentId: proposal.proposerAgentId,
+				approverId,
+				action: "category_created",
+				targetType: "category",
+				targetId: categoryId,
+				now,
+			});
+			return {
+				ok: true,
+				batch: { claimStmt, changeLogStmt, mutateStmt, linkChangeIdStmt },
+			};
+		}
+		case "raise_daily_limit": {
+			const { agentId, newLimit } = payload;
+			const claimStmt = db
+				.prepare(
+					`UPDATE proposals
+					SET status = 'approved', resolved_at = ?1, resolved_by = ?2
+					WHERE id = ?3 AND status = 'pending' AND expires_at > ?1
+						AND EXISTS (
+							SELECT 1 FROM agents
+							WHERE id = ?4 AND daily_question_limit < ?5
+						)`,
+				)
+				.bind(now, approverId, proposal.id, agentId, newLimit);
+			const changeLogStmt = db
+				.prepare(
+					`INSERT INTO change_log
+						(occurred_at, actor_type, actor_id, approver_id, action,
+						target_type, target_id, before_json, after_json, reverted_at)
+					SELECT ?1, 'admin_bot', ?2, ?3, 'agent_updated',
+						'agent', a.id,
+						json_object(
+							'id', a.id,
+							'ownerId', a.owner_id,
+							'name', a.name,
+							'description', a.description,
+							'status', a.status,
+							'dailyQuestionLimit', a.daily_question_limit,
+							'createdAt', a.created_at
+						),
+						json_object(
+							'id', a.id,
+							'ownerId', a.owner_id,
+							'name', a.name,
+							'description', a.description,
+							'status', a.status,
+							'dailyQuestionLimit', CAST(?4 AS INTEGER),
+							'createdAt', a.created_at
+						),
+						NULL
+					FROM agents AS a
+					WHERE a.id = ?5
+						AND a.daily_question_limit < ?4
+						AND EXISTS (
+							SELECT 1 FROM proposals
+							WHERE id = ?6 AND status = 'approved' AND change_log_id IS NULL
+						)`,
+				)
+				.bind(
+					now,
+					proposal.proposerAgentId,
+					approverId,
+					newLimit,
+					agentId,
+					proposal.id,
+				);
+			const mutateStmt = db
+				.prepare(
+					`UPDATE agents
+					SET daily_question_limit = ?1
+					WHERE id = ?2
+						AND daily_question_limit < ?1
+						AND EXISTS (
+							SELECT 1 FROM proposals
+							WHERE id = ?3 AND status = 'approved' AND change_log_id IS NULL
+						)`,
+				)
+				.bind(newLimit, agentId, proposal.id);
+			const linkChangeIdStmt = buildLinkChangeIdStatement(db, {
+				proposalId: proposal.id,
+				proposerAgentId: proposal.proposerAgentId,
+				approverId,
+				action: "agent_updated",
+				targetType: "agent",
+				targetId: agentId,
+				now,
+			});
+			return {
+				ok: true,
+				batch: { claimStmt, changeLogStmt, mutateStmt, linkChangeIdStmt },
+			};
+		}
+		case "resume_agent": {
+			const { agentId } = payload;
+			const claimStmt = db
+				.prepare(
+					`UPDATE proposals
+					SET status = 'approved', resolved_at = ?1, resolved_by = ?2
+					WHERE id = ?3 AND status = 'pending' AND expires_at > ?1
+						AND EXISTS (
+							SELECT 1 FROM agents
+							WHERE id = ?4 AND status = 'suspended'
+						)`,
+				)
+				.bind(now, approverId, proposal.id, agentId);
+			const changeLogStmt = db
+				.prepare(
+					`INSERT INTO change_log
+						(occurred_at, actor_type, actor_id, approver_id, action,
+						target_type, target_id, before_json, after_json, reverted_at)
+					SELECT ?1, 'admin_bot', ?2, ?3, 'agent_resumed',
+						'agent', a.id,
+						json_object(
+							'id', a.id,
+							'ownerId', a.owner_id,
+							'name', a.name,
+							'description', a.description,
+							'status', a.status,
+							'dailyQuestionLimit', a.daily_question_limit,
+							'createdAt', a.created_at
+						),
+						json_object(
+							'id', a.id,
+							'ownerId', a.owner_id,
+							'name', a.name,
+							'description', a.description,
+							'status', 'active',
+							'dailyQuestionLimit', a.daily_question_limit,
+							'createdAt', a.created_at
+						),
+						NULL
+					FROM agents AS a
+					WHERE a.id = ?4
+						AND a.status = 'suspended'
+						AND EXISTS (
+							SELECT 1 FROM proposals
+							WHERE id = ?5 AND status = 'approved' AND change_log_id IS NULL
+						)`,
+				)
+				.bind(now, proposal.proposerAgentId, approverId, agentId, proposal.id);
+			const mutateStmt = db
+				.prepare(
+					`UPDATE agents
+					SET status = 'active'
+					WHERE id = ?1
+						AND status = 'suspended'
+						AND EXISTS (
+							SELECT 1 FROM proposals
+							WHERE id = ?2 AND status = 'approved' AND change_log_id IS NULL
+						)`,
+				)
+				.bind(agentId, proposal.id);
+			const linkChangeIdStmt = buildLinkChangeIdStatement(db, {
+				proposalId: proposal.id,
+				proposerAgentId: proposal.proposerAgentId,
+				approverId,
+				action: "agent_resumed",
+				targetType: "agent",
+				targetId: agentId,
+				now,
+			});
+			return {
+				ok: true,
+				batch: { claimStmt, changeLogStmt, mutateStmt, linkChangeIdStmt },
+			};
+		}
+	}
+}
+
+async function diagnoseApproveFailure(
+	db: D1Database,
+	proposalId: string,
+	now: UnixMillis,
+): Promise<ProposalFailure> {
+	const latestRow = await db
+		.prepare("SELECT * FROM proposals WHERE id = ?")
+		.bind(proposalId)
+		.first<ProposalRow>();
+	if (latestRow === null) {
+		return fail("not_found", "指定された提案が見つかりません");
+	}
+	const latest = proposalFromRow(latestRow);
+	if (latest.status === "expired") {
+		return fail(
+			"expired",
+			"この提案は有効期限（14日）を過ぎたため承認できません",
+		);
+	}
+	if (latest.status !== "pending") {
+		return fail("already_resolved", "この提案はすでに処理されています");
+	}
+	if (latest.expiresAt <= now) {
+		await markProposalExpired(db, latest.id, now);
+		return fail(
+			"expired",
+			"この提案は有効期限（14日）を過ぎたため承認できません",
+		);
+	}
+
+	const { payload } = latest;
+	switch (payload.kind) {
+		case "grant_allow_rule": {
+			const { fromAgentId, toAgentId, categoryId } = payload;
+			if (fromAgentId === toAgentId) {
+				return fail(
+					"premise_changed",
+					"自分自身への質問を許可するルールは作成できません",
+				);
+			}
+			const [fromRes, toRes, catRes, ruleRes] = await db.batch([
+				db.prepare("SELECT id FROM agents WHERE id = ?").bind(fromAgentId),
+				db.prepare("SELECT id FROM agents WHERE id = ?").bind(toAgentId),
+				db.prepare("SELECT id FROM categories WHERE id = ?").bind(categoryId),
+				db
+					.prepare(
+						`SELECT 1 AS found FROM allow_rules
+						WHERE from_agent_id = ? AND to_agent_id = ? AND category_id = ?`,
+					)
+					.bind(fromAgentId, toAgentId, categoryId),
+			]);
+			if ((fromRes?.results.length ?? 0) === 0) {
+				return fail("premise_changed", "送信元エージェントが見つかりません");
+			}
+			if ((toRes?.results.length ?? 0) === 0) {
+				return fail("premise_changed", "宛先エージェントが見つかりません");
+			}
+			if ((catRes?.results.length ?? 0) === 0) {
+				return fail("premise_changed", "カテゴリが見つかりません");
+			}
+			if ((ruleRes?.results.length ?? 0) > 0) {
+				return fail("premise_changed", "同じ許可ルールがすでに存在します");
+			}
+			return fail(
+				"premise_changed",
+				"提案の前提条件が変更されたため承認できませんでした",
+			);
+		}
+		case "create_category": {
+			const categoryName = normalizeName(payload.name);
+			const existingCat = await db
+				.prepare("SELECT id FROM categories WHERE name = ?")
+				.bind(categoryName)
+				.first<{ id: string }>();
+			if (existingCat !== null) {
+				return fail(
+					"premise_changed",
+					`カテゴリ「${categoryName}」はすでに存在します`,
+				);
+			}
+			return fail(
+				"premise_changed",
+				"提案の前提条件が変更されたため承認できませんでした",
+			);
+		}
+		case "raise_daily_limit": {
+			const agentRow = await db
+				.prepare("SELECT * FROM agents WHERE id = ?")
+				.bind(payload.agentId)
+				.first<AgentRow>();
+			if (agentRow === null) {
+				return fail(
+					"premise_changed",
+					"指定されたエージェントが見つかりません",
+				);
+			}
+			const target = agentFromRow(agentRow);
+			if (target.dailyQuestionLimit >= payload.newLimit) {
+				return fail(
+					"premise_changed",
+					`対象エージェント「${target.name}」の現在の上限（${target.dailyQuestionLimit} 件/日）はすでに提案値（${payload.newLimit} 件/日）以上です`,
+				);
+			}
+			return fail(
+				"premise_changed",
+				"対象エージェントの上限値はすでに変更されています",
+			);
+		}
+		case "resume_agent": {
+			const agentRow = await db
+				.prepare("SELECT * FROM agents WHERE id = ?")
+				.bind(payload.agentId)
+				.first<AgentRow>();
+			if (agentRow === null) {
+				return fail(
+					"premise_changed",
+					"指定されたエージェントが見つかりません",
+				);
+			}
+			const target = agentFromRow(agentRow);
+			if (target.status !== "suspended") {
+				return fail("premise_changed", "このエージェントはすでに有効です");
+			}
+			return fail(
+				"premise_changed",
+				"提案の前提条件が変更されたため承認できませんでした",
+			);
+		}
+	}
+}
+
 /**
- * Approves a pending proposal by applying its payload through `#29` admin
- * operations with `actorType = "admin_bot"`, `actorId = proposerAgentId`, and
- * `approverId`. Leaves the proposal pending on `premise_changed` so the owner
- * can inspect or reject it.
+ * Approves a pending proposal atomically in a single D1 `db.batch` transaction:
+ * claims the proposal with live preconditions, records the `#29`-compatible
+ * `change_log` entry (`actorType = "admin_bot"`, `actorId = proposerAgentId`,
+ * `approverId`), applies the live mutation, and links `proposals.change_log_id`.
+ * Leaves the proposal pending on `premise_changed` so the owner can inspect or
+ * reject it.
  */
 export async function approveProposal(
 	db: D1Database,
@@ -473,101 +943,31 @@ export async function approveProposal(
 		);
 	}
 
-	const actor: ChangeActor = {
-		actorType: "admin_bot",
-		actorId: proposal.proposerAgentId,
-		approverId,
-	};
-
-	let changeId: number;
-	const { payload } = proposal;
-	switch (payload.kind) {
-		case "grant_allow_rule": {
-			const result = await grantAllowRule(db, {
-				fromAgentId: payload.fromAgentId,
-				toAgentId: payload.toAgentId,
-				categoryId: payload.categoryId,
-				actor,
-				now: input.now,
-			});
-			if (!result.ok) {
-				return fail("premise_changed", result.message);
-			}
-			changeId = result.changeId;
-			break;
-		}
-		case "create_category": {
-			const result = await createCategory(db, {
-				name: payload.name,
-				actor,
-				now: input.now,
-			});
-			if (!result.ok) {
-				return fail("premise_changed", result.message);
-			}
-			changeId = result.changeId;
-			break;
-		}
-		case "raise_daily_limit": {
-			const agentRow = await db
-				.prepare("SELECT * FROM agents WHERE id = ?")
-				.bind(payload.agentId)
-				.first<AgentRow>();
-			if (agentRow === null) {
-				return fail(
-					"premise_changed",
-					"指定されたエージェントが見つかりません",
-				);
-			}
-			const target = agentFromRow(agentRow);
-			if (target.dailyQuestionLimit >= payload.newLimit) {
-				return fail(
-					"premise_changed",
-					`対象エージェント「${target.name}」の現在の上限（${target.dailyQuestionLimit} 件/日）はすでに提案値（${payload.newLimit} 件/日）以上です`,
-				);
-			}
-			const result = await updateAgent(db, {
-				agentId: payload.agentId,
-				dailyQuestionLimit: payload.newLimit,
-				actor,
-				now: input.now,
-			});
-			if (!result.ok) {
-				return fail("premise_changed", result.message);
-			}
-			if (!result.data.changed || result.changeId === null) {
-				return fail(
-					"premise_changed",
-					"対象エージェントの上限値はすでに変更されています",
-				);
-			}
-			changeId = result.changeId;
-			break;
-		}
-		case "resume_agent": {
-			const result = await resumeAgent(db, {
-				agentId: payload.agentId,
-				actor,
-				now: input.now,
-			});
-			if (!result.ok) {
-				return fail("premise_changed", result.message);
-			}
-			changeId = result.changeId;
-			break;
-		}
+	const prepared = prepareApprovalBatch(db, proposal, approverId, input.now);
+	if (!prepared.ok) {
+		return prepared;
 	}
 
-	const updateResult = await db
-		.prepare(
-			`UPDATE proposals
-			SET status = 'approved', resolved_at = ?, resolved_by = ?, change_log_id = ?
-			WHERE id = ? AND status = 'pending'`,
-		)
-		.bind(input.now, approverId, changeId, proposal.id)
-		.run();
-	if ((updateResult.meta.changes ?? 0) === 0) {
-		return fail("already_resolved", "この提案はすでに処理されています");
+	const [claimRes, changeLogRes, mutateRes, linkRes] = await db.batch([
+		prepared.batch.claimStmt,
+		prepared.batch.changeLogStmt,
+		prepared.batch.mutateStmt,
+		prepared.batch.linkChangeIdStmt,
+	]);
+
+	if ((claimRes?.meta.changes ?? 0) === 0) {
+		return diagnoseApproveFailure(db, proposal.id, input.now);
+	}
+
+	const changeId = Number(changeLogRes?.meta.last_row_id);
+	if (
+		(changeLogRes?.meta.changes ?? 0) !== 1 ||
+		(mutateRes?.meta.changes ?? 0) !== 1 ||
+		(linkRes?.meta.changes ?? 0) !== 1 ||
+		!Number.isSafeInteger(changeId) ||
+		changeId <= 0
+	) {
+		throw new Error("approveProposal batch did not complete atomically");
 	}
 
 	const updated: Proposal = {

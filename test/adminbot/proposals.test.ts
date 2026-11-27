@@ -32,10 +32,15 @@ import {
 	rejectProposal,
 } from "../../src/adminbot";
 import { queryAuditLog } from "../../src/audit";
-import { type AgentRow, agentFromRow } from "../../src/db";
+import {
+	type AgentRow,
+	agentFromRow,
+	type ProposalRow,
+	proposalFromRow,
+} from "../../src/db";
 import { runScheduledMaintenance } from "../../src/mcp";
 import type { McpEnv } from "../../src/mcp/config";
-import type { Agent, Category } from "../../src/types";
+import type { Agent, Category, Proposal } from "../../src/types";
 import { createTestDb } from "../helpers/db";
 import {
 	DAY_MS,
@@ -916,5 +921,505 @@ describe("/mcp/admin proposal tools", () => {
 			reason: "Safe to resume",
 		});
 		expect(okResume.isError).toBe(false);
+	});
+});
+
+async function loadProposal(id: string): Promise<Proposal> {
+	const row = await db
+		.prepare("SELECT * FROM proposals WHERE id = ?")
+		.bind(id)
+		.first<ProposalRow>();
+	if (row === null) throw new Error(`Proposal not found: ${id}`);
+	return proposalFromRow(row);
+}
+
+function withBeforeBatch(
+	base: D1Database,
+	onBeforeBatch: () => Promise<void>,
+): D1Database {
+	let fired = false;
+	return {
+		prepare: (query: string) => base.prepare(query),
+		dump: () => base.dump(),
+		exec: (query: string) => base.exec(query),
+		withSession: (constraintOrBookmark?: string) =>
+			base.withSession(constraintOrBookmark),
+		batch: async <T = unknown>(
+			statements: D1PreparedStatement[],
+		): Promise<D1Result<T>[]> => {
+			if (!fired) {
+				fired = true;
+				await onBeforeBatch();
+			}
+			return base.batch<T>(statements);
+		},
+	} as D1Database;
+}
+
+describe("proposal concurrency, atomicity, and 1-click undo", () => {
+	it("serializes parallel double-approve across all 4 kinds with 1 change_log row and clean 1-click undo", async () => {
+		const pRule = await createProposal(db, {
+			proposerAgentId: muse.id,
+			payload: {
+				kind: "grant_allow_rule",
+				fromAgentId: muse.id,
+				toAgentId: grok.id,
+				categoryId: schedule.id,
+			},
+			reason: "Allow rule race",
+			now: T0,
+		});
+		const pCat = await createProposal(db, {
+			proposerAgentId: muse.id,
+			payload: { kind: "create_category", name: "race-cat" },
+			reason: "Create category race",
+			now: T0 + 1,
+		});
+		const pLimit = await createProposal(db, {
+			proposerAgentId: muse.id,
+			payload: { kind: "raise_daily_limit", agentId: grok.id, newLimit: 35 },
+			reason: "Raise limit race",
+			now: T0 + 2,
+		});
+		const pResume = await createProposal(db, {
+			proposerAgentId: muse.id,
+			payload: { kind: "resume_agent", agentId: carol.id },
+			reason: "Resume carol race",
+			now: T0 + 3,
+		});
+		if (!pRule.ok || !pCat.ok || !pLimit.ok || !pResume.ok) {
+			throw new Error("Expected all 4 proposals to be created");
+		}
+
+		const cases = [
+			{ id: pRule.data.proposal.id, now: T0 + 100 },
+			{ id: pCat.data.proposal.id, now: T0 + 101 },
+			{ id: pLimit.data.proposal.id, now: T0 + 102 },
+			{ id: pResume.data.proposal.id, now: T0 + 103 },
+		];
+
+		const winningChangeIds: number[] = [];
+		for (const [idx, item] of cases.entries()) {
+			const results = await Promise.all([
+				approveProposal(db, {
+					proposalId: item.id,
+					approverId: OWNER.actorId,
+					now: item.now,
+				}),
+				approveProposal(db, {
+					proposalId: item.id,
+					approverId: OWNER.actorId,
+					now: item.now,
+				}),
+			]);
+
+			const succeeded = results.filter((r) => r.ok);
+			const failed = results.filter((r) => !r.ok);
+			expect(succeeded).toHaveLength(1);
+			expect(failed).toHaveLength(1);
+			expect(failed[0]).toMatchObject({ ok: false, code: "already_resolved" });
+
+			const winner = succeeded[0];
+			if (!winner?.ok) throw new Error("Expected 1 winner");
+			winningChangeIds.push(winner.data.changeId);
+
+			const persisted = await loadProposal(item.id);
+			expect(persisted.status).toBe("approved");
+			expect(persisted.changeLogId).toBe(winner.data.changeId);
+
+			// Total admin_bot change_log count increases by strictly 1 per proposal (never 2).
+			const botLogs = await queryChangeLog(db, { actorType: "admin_bot" });
+			expect(botLogs).toHaveLength(idx + 1);
+		}
+
+		// Every single approved change can be undone in 1 click without conflict_newer_change.
+		for (const [idx, changeId] of winningChangeIds.entries()) {
+			const undone = await revertAdminBotChange(db, {
+				changeId,
+				actor: OWNER,
+				now: T0 + 500 + idx,
+			});
+			expect(undone.ok).toBe(true);
+		}
+
+		expect(await listAllowRulesGrouped(db)).toEqual([]);
+		expect(
+			(await listCategoriesWithUsage(db)).map((c) => c.category.name),
+		).not.toContain("race-cat");
+		expect((await loadAgent(grok.id)).dailyQuestionLimit).toBe(10);
+		expect((await loadAgent(carol.id)).status).toBe("suspended");
+	});
+
+	it("prevents split state in approve vs reject races in both Promise.all and interleaved orderings", async () => {
+		// 1. Concurrent Promise.all race on resume_agent
+		const p1 = await createProposal(db, {
+			proposerAgentId: muse.id,
+			payload: { kind: "resume_agent", agentId: carol.id },
+			reason: "Approve vs reject race 1",
+			now: T0,
+		});
+		if (!p1.ok) throw new Error("Expected p1");
+
+		const [approveRes, rejectRes] = await Promise.all([
+			approveProposal(db, {
+				proposalId: p1.data.proposal.id,
+				approverId: OWNER.actorId,
+				now: T0 + 10,
+			}),
+			rejectProposal(db, {
+				proposalId: p1.data.proposal.id,
+				approverId: OWNER.actorId,
+				now: T0 + 10,
+			}),
+		]);
+
+		expect(Number(approveRes.ok) + Number(rejectRes.ok)).toBe(1);
+		const p1After = await loadProposal(p1.data.proposal.id);
+		const carolAfter1 = await loadAgent(carol.id);
+		const logsAfter1 = await queryChangeLog(db, { actorType: "admin_bot" });
+
+		if (approveRes.ok) {
+			expect(rejectRes).toMatchObject({ ok: false, code: "already_resolved" });
+			expect(p1After.status).toBe("approved");
+			expect(p1After.changeLogId).toBe(approveRes.data.changeId);
+			expect(carolAfter1.status).toBe("active");
+			expect(logsAfter1).toHaveLength(1);
+		} else {
+			expect(approveRes).toMatchObject({ ok: false, code: "already_resolved" });
+			expect(rejectRes.ok).toBe(true);
+			expect(p1After.status).toBe("rejected");
+			expect(p1After.changeLogId).toBeNull();
+			expect(carolAfter1.status).toBe("suspended");
+			expect(logsAfter1).toHaveLength(0);
+		}
+
+		// 2. Deterministic interleaving: reject commits right between approve's pre-check and db.batch.
+		const p2 = await createProposal(db, {
+			proposerAgentId: muse.id,
+			payload: { kind: "raise_daily_limit", agentId: grok.id, newLimit: 40 },
+			reason: "Reject wins right before approve batch",
+			now: T0 + 20,
+		});
+		if (!p2.ok) throw new Error("Expected p2");
+
+		const wrappedDb = withBeforeBatch(db, async () => {
+			const r = await rejectProposal(db, {
+				proposalId: p2.data.proposal.id,
+				approverId: OWNER.actorId,
+				now: T0 + 25,
+			});
+			expect(r.ok).toBe(true);
+		});
+
+		const approveLost = await approveProposal(wrappedDb, {
+			proposalId: p2.data.proposal.id,
+			approverId: OWNER.actorId,
+			now: T0 + 26,
+		});
+		expect(approveLost).toMatchObject({ ok: false, code: "already_resolved" });
+		const p2After = await loadProposal(p2.data.proposal.id);
+		expect(p2After.status).toBe("rejected");
+		expect(p2After.changeLogId).toBeNull();
+		expect((await loadAgent(grok.id)).dailyQuestionLimit).toBe(10);
+		expect(await queryChangeLog(db, { actorType: "admin_bot" })).toHaveLength(
+			logsAfter1.length,
+		);
+	});
+
+	it("prevents live mutations when approveProposal races with expireProposals", async () => {
+		const p1 = await createProposal(db, {
+			proposerAgentId: muse.id,
+			payload: { kind: "create_category", name: "never-created-at-expiry" },
+			reason: "Expiring race 1",
+			now: T0,
+		});
+		const p2 = await createProposal(db, {
+			proposerAgentId: muse.id,
+			payload: { kind: "resume_agent", agentId: carol.id },
+			reason: "Expiring race 2",
+			now: T0,
+		});
+		if (!p1.ok || !p2.ok) throw new Error("Expected p1 and p2");
+
+		const expiresAt = T0 + PROPOSAL_TTL_MS;
+
+		// 1. Concurrent Promise.all at exact expiry boundary
+		const [approveAtExpiry] = await Promise.all([
+			approveProposal(db, {
+				proposalId: p1.data.proposal.id,
+				approverId: OWNER.actorId,
+				now: expiresAt,
+			}),
+			expireProposals(db, expiresAt),
+		]);
+		expect(approveAtExpiry).toMatchObject({ ok: false, code: "expired" });
+		expect((await loadProposal(p1.data.proposal.id)).status).toBe("expired");
+		expect(
+			(await listCategoriesWithUsage(db)).map((c) => c.category.name),
+		).not.toContain("never-created-at-expiry");
+
+		// 2. Interleaved race: approve starts before expiresAt, expireProposals runs before db.batch
+		const wrappedDb = withBeforeBatch(db, async () => {
+			const expiredCount = await expireProposals(db, expiresAt);
+			expect(expiredCount).toBe(1);
+		});
+		const approveAfterSweep = await approveProposal(wrappedDb, {
+			proposalId: p2.data.proposal.id,
+			approverId: OWNER.actorId,
+			now: expiresAt - 1,
+		});
+		expect(approveAfterSweep).toMatchObject({ ok: false, code: "expired" });
+		expect((await loadProposal(p2.data.proposal.id)).status).toBe("expired");
+		expect((await loadAgent(carol.id)).status).toBe("suspended");
+		expect(await queryChangeLog(db, { actorType: "admin_bot" })).toEqual([]);
+	});
+
+	it("never lowers daily_question_limit when owner raises it concurrently before approveProposal batch", async () => {
+		const pRaise = await createProposal(db, {
+			proposerAgentId: muse.id,
+			payload: { kind: "raise_daily_limit", agentId: grok.id, newLimit: 30 },
+			reason: "Raise grok to 30",
+			now: T0,
+		});
+		if (!pRaise.ok) throw new Error("Expected pRaise");
+
+		// Owner raises grok's limit to 40 right between pre-check and approveProposal's db.batch.
+		const wrappedDb = withBeforeBatch(db, async () => {
+			const raised = await updateAgent(db, {
+				agentId: grok.id,
+				dailyQuestionLimit: 40,
+				actor: OWNER,
+				now: T0 + 10,
+			});
+			expect(raised.ok).toBe(true);
+		});
+
+		const approveRes = await approveProposal(wrappedDb, {
+			proposalId: pRaise.data.proposal.id,
+			approverId: OWNER.actorId,
+			now: T0 + 11,
+		});
+		expect(approveRes).toMatchObject({ ok: false, code: "premise_changed" });
+		// Limit MUST stay 40 — never lowered back to 30.
+		expect((await loadAgent(grok.id)).dailyQuestionLimit).toBe(40);
+		// Proposal stays pending without change_log_id, and no admin_bot change_log row was written.
+		const stillPending = await loadProposal(pRaise.data.proposal.id);
+		expect(stillPending.status).toBe("pending");
+		expect(stillPending.changeLogId).toBeNull();
+		expect(await queryChangeLog(db, { actorType: "admin_bot" })).toEqual([]);
+
+		// If owner raises to 50 (still < 60), approve succeeds and captures LIVE 50 in before_json.
+		const pRaiseHigher = await createProposal(db, {
+			proposerAgentId: muse.id,
+			payload: { kind: "raise_daily_limit", agentId: grok.id, newLimit: 60 },
+			reason: "Raise grok to 60",
+			now: T0 + 15,
+		});
+		if (!pRaiseHigher.ok) throw new Error("Expected pRaiseHigher");
+
+		const wrappedRaise = withBeforeBatch(db, async () => {
+			const raised = await updateAgent(db, {
+				agentId: grok.id,
+				dailyQuestionLimit: 50,
+				actor: OWNER,
+				now: T0 + 20,
+			});
+			expect(raised.ok).toBe(true);
+		});
+
+		const approvedHigher = await approveProposal(wrappedRaise, {
+			proposalId: pRaiseHigher.data.proposal.id,
+			approverId: OWNER.actorId,
+			now: T0 + 21,
+		});
+		expect(approvedHigher.ok).toBe(true);
+		if (!approvedHigher.ok) return;
+		expect((await loadAgent(grok.id)).dailyQuestionLimit).toBe(60);
+
+		const reverted = await revertAdminBotChange(db, {
+			changeId: approvedHigher.data.changeId,
+			actor: OWNER,
+			now: T0 + 30,
+		});
+		expect(reverted.ok).toBe(true);
+		// Restores the live pre-approval value (50), not the stale proposal-time value (40).
+		expect((await loadAgent(grok.id)).dailyQuestionLimit).toBe(50);
+	});
+
+	it("enforces MAX_PENDING_PROPOSALS atomically under parallel createProposal calls", async () => {
+		for (let i = 0; i < MAX_PENDING_PROPOSALS - 1; i += 1) {
+			const created = await createProposal(db, {
+				proposerAgentId: muse.id,
+				payload: { kind: "create_category", name: `cap-seed-${i}` },
+				reason: `Seed ${i}`,
+				now: T0 + i,
+			});
+			expect(created.ok).toBe(true);
+		}
+
+		// Fire 5 concurrent createProposal calls when 19 pending proposals already exist.
+		const results = await Promise.all(
+			Array.from({ length: 5 }, (_, idx) =>
+				createProposal(db, {
+					proposerAgentId: muse.id,
+					payload: { kind: "create_category", name: `cap-race-${idx}` },
+					reason: `Concurrent ${idx}`,
+					now: T0 + 100,
+				}),
+			),
+		);
+
+		const succeeded = results.filter((r) => r.ok);
+		const failed = results.filter((r) => !r.ok);
+		expect(succeeded).toHaveLength(1);
+		expect(failed).toHaveLength(4);
+		for (const failure of failed) {
+			expect(failure).toMatchObject({
+				ok: false,
+				code: "pending_limit_reached",
+			});
+		}
+
+		const pending = await listProposals(db, {
+			status: "pending",
+			now: T0 + 100,
+		});
+		expect(pending).toHaveLength(MAX_PENDING_PROPOSALS);
+	});
+
+	it("writes #29 byte-for-byte compatible change_log snapshots and supports 1-click revertAdminBotChange for all 4 kinds", async () => {
+		const beforeGrok = await loadAgent(grok.id);
+		const beforeCarol = await loadAgent(carol.id);
+
+		const pRule = await createProposal(db, {
+			proposerAgentId: muse.id,
+			payload: {
+				kind: "grant_allow_rule",
+				fromAgentId: muse.id,
+				toAgentId: grok.id,
+				categoryId: schedule.id,
+			},
+			reason: "Undo rule",
+			now: T0,
+		});
+		const pCat = await createProposal(db, {
+			proposerAgentId: muse.id,
+			payload: { kind: "create_category", name: "undo-cat" },
+			reason: "Undo category",
+			now: T0 + 1,
+		});
+		const pLimit = await createProposal(db, {
+			proposerAgentId: muse.id,
+			payload: { kind: "raise_daily_limit", agentId: grok.id, newLimit: 25 },
+			reason: "Undo limit",
+			now: T0 + 2,
+		});
+		const pResume = await createProposal(db, {
+			proposerAgentId: muse.id,
+			payload: { kind: "resume_agent", agentId: carol.id },
+			reason: "Undo resume",
+			now: T0 + 3,
+		});
+		if (!pRule.ok || !pCat.ok || !pLimit.ok || !pResume.ok) {
+			throw new Error("Expected all 4 proposals");
+		}
+
+		const aRule = await approveProposal(db, {
+			proposalId: pRule.data.proposal.id,
+			approverId: OWNER.actorId,
+			now: T0 + 100,
+		});
+		const aCat = await approveProposal(db, {
+			proposalId: pCat.data.proposal.id,
+			approverId: OWNER.actorId,
+			now: T0 + 101,
+		});
+		const aLimit = await approveProposal(db, {
+			proposalId: pLimit.data.proposal.id,
+			approverId: OWNER.actorId,
+			now: T0 + 102,
+		});
+		const aResume = await approveProposal(db, {
+			proposalId: pResume.data.proposal.id,
+			approverId: OWNER.actorId,
+			now: T0 + 103,
+		});
+		if (!aRule.ok || !aCat.ok || !aLimit.ok || !aResume.ok) {
+			throw new Error("Expected all 4 approvals to succeed");
+		}
+
+		// Verify proposals.change_log_id is linked in DB for all 4 proposals.
+		expect((await loadProposal(pRule.data.proposal.id)).changeLogId).toBe(
+			aRule.data.changeId,
+		);
+		expect((await loadProposal(pCat.data.proposal.id)).changeLogId).toBe(
+			aCat.data.changeId,
+		);
+		expect((await loadProposal(pLimit.data.proposal.id)).changeLogId).toBe(
+			aLimit.data.changeId,
+		);
+		expect((await loadProposal(pResume.data.proposal.id)).changeLogId).toBe(
+			aResume.data.changeId,
+		);
+
+		const botLogs = await queryChangeLog(db, { actorType: "admin_bot" });
+		const byId = new Map(botLogs.map((entry) => [entry.id, entry]));
+
+		// Verify byte-for-byte JSON snapshot compatibility with #29 admin operations.
+		const ruleLog = byId.get(aRule.data.changeId);
+		expect(ruleLog?.beforeJson).toBeNull();
+		expect(ruleLog?.afterJson).toBe(
+			JSON.stringify({
+				fromAgentId: muse.id,
+				toAgentId: grok.id,
+				categoryId: schedule.id,
+				createdAt: T0 + 100,
+			}),
+		);
+
+		const catLog = byId.get(aCat.data.changeId);
+		const createdCat = (await listCategoriesWithUsage(db)).find(
+			(c) => c.category.name === "undo-cat",
+		)?.category;
+		expect(createdCat).toBeDefined();
+		expect(catLog?.targetId).toBe(createdCat?.id);
+		expect(catLog?.beforeJson).toBeNull();
+		expect(catLog?.afterJson).toBe(
+			JSON.stringify({ id: createdCat?.id, name: "undo-cat" }),
+		);
+
+		const limitLog = byId.get(aLimit.data.changeId);
+		expect(limitLog?.beforeJson).toBe(JSON.stringify(beforeGrok));
+		expect(limitLog?.afterJson).toBe(
+			JSON.stringify({ ...beforeGrok, dailyQuestionLimit: 25 }),
+		);
+
+		const resumeLog = byId.get(aResume.data.changeId);
+		expect(resumeLog?.beforeJson).toBe(JSON.stringify(beforeCarol));
+		expect(resumeLog?.afterJson).toBe(
+			JSON.stringify({ ...beforeCarol, status: "active" }),
+		);
+
+		// Revert all 4 approved admin_bot changes cleanly via revertAdminBotChange.
+		for (const [idx, changeId] of [
+			aRule.data.changeId,
+			aCat.data.changeId,
+			aLimit.data.changeId,
+			aResume.data.changeId,
+		].entries()) {
+			const res = await revertAdminBotChange(db, {
+				changeId,
+				actor: OWNER,
+				now: T0 + 200 + idx,
+			});
+			expect(res.ok).toBe(true);
+		}
+
+		expect(await listAllowRulesGrouped(db)).toEqual([]);
+		expect(
+			(await listCategoriesWithUsage(db)).map((c) => c.category.name),
+		).not.toContain("undo-cat");
+		expect((await loadAgent(grok.id)).dailyQuestionLimit).toBe(10);
+		expect((await loadAgent(carol.id)).status).toBe("suspended");
 	});
 });
