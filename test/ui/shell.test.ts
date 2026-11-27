@@ -13,6 +13,8 @@ import {
 	type HtmlValue,
 	handleAdminRequest,
 	html,
+	JWKS_CACHE_TTL_MS,
+	JWKS_UNKNOWN_KID_REFETCH_COOLDOWN_MS,
 	type JwkKey,
 	type JwksFetcher,
 	normalizeTeamDomain,
@@ -298,7 +300,416 @@ describe("Cloudflare Access JWT verification", () => {
 		if (!third.ok) {
 			expect(third.status).toBe(403);
 		}
+		expect(fetchJwks).toHaveBeenCalledTimes(2);
+	});
+
+	it("throttles unknown-kid refetches per team domain within cooldown and allows refetch after cooldown", async () => {
+		const keysByUrl = new Map<string, JwkKey[]>([
+			[`https://${TEAM_DOMAIN}/cdn-cgi/access/certs`, [primaryKey.jwk]],
+			[
+				"https://other-team.cloudflareaccess.com/cdn-cgi/access/certs",
+				[primaryKey.jwk],
+			],
+		]);
+		const fetchJwks = vi.fn(async (url: string) => ({
+			keys: keysByUrl.get(url) ?? [],
+		}));
+
+		const tokenPrimary = await signJwt(primaryKey, {
+			aud: TEST_AUD,
+			exp: NOW_SEC + 900,
+			email: "owner@example.com",
+			sub: "u1",
+		});
+		const tokenSecondary = await signJwt(secondaryKey, {
+			aud: TEST_AUD,
+			exp: NOW_SEC + 900,
+			email: "owner@example.com",
+			sub: "u1",
+		});
+		const makeUnknownToken = (kid: string) =>
+			signJwt(
+				{ ...primaryKey, kid },
+				{
+					aud: TEST_AUD,
+					exp: NOW_SEC + 900,
+					email: "owner@example.com",
+					sub: "u1",
+				},
+			);
+
+		const primed = await verifyAccessRequest(
+			adminGet("https://paab.test/admin", {
+				"Cf-Access-Jwt-Assertion": tokenPrimary,
+			}),
+			prodEnv(),
+			NOW_MS,
+			{ fetchJwks },
+		);
+		expect(primed.ok).toBe(true);
+		expect(fetchJwks).toHaveBeenCalledTimes(1);
+
+		const missAt = NOW_MS + 1_000;
+		const firstUnknown = await verifyAccessRequest(
+			adminGet("https://paab.test/admin", {
+				"Cf-Access-Jwt-Assertion": await makeUnknownToken("unknown-1"),
+			}),
+			prodEnv(),
+			missAt,
+			{ fetchJwks },
+		);
+		expect(firstUnknown).toMatchObject({ ok: false, status: 403 });
+		expect(fetchJwks).toHaveBeenCalledTimes(2);
+
+		const secondUnknown = await verifyAccessRequest(
+			adminGet("https://paab.test/admin", {
+				"Cf-Access-Jwt-Assertion": await makeUnknownToken("unknown-2"),
+			}),
+			prodEnv(),
+			missAt + 5_000,
+			{ fetchJwks },
+		);
+		expect(secondUnknown).toMatchObject({ ok: false, status: 403 });
+
+		const thirdUnknown = await verifyAccessRequest(
+			adminGet("https://paab.test/admin", {
+				"Cf-Access-Jwt-Assertion": await makeUnknownToken("unknown-3"),
+			}),
+			prodEnv(),
+			missAt + JWKS_UNKNOWN_KID_REFETCH_COOLDOWN_MS - 1,
+			{ fetchJwks },
+		);
+		expect(thirdUnknown).toMatchObject({ ok: false, status: 403 });
+		expect(fetchJwks).toHaveBeenCalledTimes(2);
+
+		const otherDomainEnv = prodEnv({
+			CF_ACCESS_TEAM_DOMAIN: "other-team.cloudflareaccess.com",
+		});
+		const otherDomainPrimed = await verifyAccessRequest(
+			adminGet("https://paab.test/admin", {
+				"Cf-Access-Jwt-Assertion": tokenPrimary,
+			}),
+			otherDomainEnv,
+			missAt + 5_000,
+			{ fetchJwks },
+		);
+		expect(otherDomainPrimed.ok).toBe(true);
 		expect(fetchJwks).toHaveBeenCalledTimes(3);
+
+		const otherDomainUnknown = await verifyAccessRequest(
+			adminGet("https://paab.test/admin", {
+				"Cf-Access-Jwt-Assertion": await makeUnknownToken("other-unknown"),
+			}),
+			otherDomainEnv,
+			missAt + 5_000,
+			{ fetchJwks },
+		);
+		expect(otherDomainUnknown).toMatchObject({ ok: false, status: 403 });
+		expect(fetchJwks).toHaveBeenCalledTimes(4);
+
+		keysByUrl.set(`https://${TEAM_DOMAIN}/cdn-cgi/access/certs`, [
+			primaryKey.jwk,
+			secondaryKey.jwk,
+		]);
+		const afterCooldown = await verifyAccessRequest(
+			adminGet("https://paab.test/admin", {
+				"Cf-Access-Jwt-Assertion": tokenSecondary,
+			}),
+			prodEnv(),
+			missAt + JWKS_UNKNOWN_KID_REFETCH_COOLDOWN_MS,
+			{ fetchJwks },
+		);
+		expect(afterCooldown.ok).toBe(true);
+		expect(fetchJwks).toHaveBeenCalledTimes(5);
+	});
+
+	it("throttles repeated unknown kids even when a fresh-cache refetch fails", async () => {
+		let shouldFail = false;
+		const fetchJwks = vi.fn(async () => {
+			if (shouldFail) {
+				throw new Error("upstream unavailable");
+			}
+			return { keys: [primaryKey.jwk] };
+		});
+
+		const tokenPrimary = await signJwt(primaryKey, {
+			aud: TEST_AUD,
+			exp: NOW_SEC + 900,
+			email: "owner@example.com",
+			sub: "u1",
+		});
+		const tokenUnknown1 = await signJwt(
+			{ ...primaryKey, kid: "unknown-a" },
+			{
+				aud: TEST_AUD,
+				exp: NOW_SEC + 900,
+				email: "owner@example.com",
+				sub: "u1",
+			},
+		);
+		const tokenUnknown2 = await signJwt(
+			{ ...primaryKey, kid: "unknown-b" },
+			{
+				aud: TEST_AUD,
+				exp: NOW_SEC + 900,
+				email: "owner@example.com",
+				sub: "u1",
+			},
+		);
+
+		const primed = await verifyAccessRequest(
+			adminGet("https://paab.test/admin", {
+				"Cf-Access-Jwt-Assertion": tokenPrimary,
+			}),
+			prodEnv(),
+			NOW_MS,
+			{ fetchJwks },
+		);
+		expect(primed.ok).toBe(true);
+
+		shouldFail = true;
+		const firstMiss = await verifyAccessRequest(
+			adminGet("https://paab.test/admin", {
+				"Cf-Access-Jwt-Assertion": tokenUnknown1,
+			}),
+			prodEnv(),
+			NOW_MS + 1_000,
+			{ fetchJwks },
+		);
+		expect(firstMiss).toMatchObject({ ok: false, status: 503 });
+		expect(fetchJwks).toHaveBeenCalledTimes(2);
+
+		const cachedHit = await verifyAccessRequest(
+			adminGet("https://paab.test/admin", {
+				"Cf-Access-Jwt-Assertion": tokenPrimary,
+			}),
+			prodEnv(),
+			NOW_MS + 2_000,
+			{ fetchJwks },
+		);
+		expect(cachedHit.ok).toBe(true);
+
+		const throttledMiss = await verifyAccessRequest(
+			adminGet("https://paab.test/admin", {
+				"Cf-Access-Jwt-Assertion": tokenUnknown2,
+			}),
+			prodEnv(),
+			NOW_MS + 2_000,
+			{ fetchJwks },
+		);
+		expect(throttledMiss).toMatchObject({ ok: false, status: 403 });
+		expect(fetchJwks).toHaveBeenCalledTimes(2);
+	});
+
+	it("falls back to stale cached keys when refresh fails after cache TTL expires", async () => {
+		let mode:
+			| "ok"
+			| "network-error"
+			| "invalid-payload"
+			| "empty-keys"
+			| "rotated" = "ok";
+		const fetchJwks = vi.fn(async () => {
+			if (mode === "network-error") {
+				throw new Error("network timeout");
+			}
+			if (mode === "invalid-payload") {
+				return { unexpected: true };
+			}
+			if (mode === "empty-keys") {
+				return { keys: [] };
+			}
+			if (mode === "rotated") {
+				return { keys: [primaryKey.jwk, secondaryKey.jwk] };
+			}
+			return { keys: [primaryKey.jwk] };
+		});
+
+		const tokenPrimary = await signJwt(primaryKey, {
+			aud: TEST_AUD,
+			exp: NOW_SEC + 900,
+			email: "owner@example.com",
+			sub: "u1",
+		});
+		const tokenSecondary = await signJwt(secondaryKey, {
+			aud: TEST_AUD,
+			exp: NOW_SEC + 900,
+			email: "owner@example.com",
+			sub: "u1",
+		});
+
+		const initial = await verifyAccessRequest(
+			adminGet("https://paab.test/admin", {
+				"Cf-Access-Jwt-Assertion": tokenPrimary,
+			}),
+			prodEnv(),
+			NOW_MS,
+			{ fetchJwks },
+		);
+		expect(initial.ok).toBe(true);
+		expect(fetchJwks).toHaveBeenCalledTimes(1);
+
+		const expiredNow = NOW_MS + JWKS_CACHE_TTL_MS;
+		for (const failingMode of [
+			"network-error",
+			"invalid-payload",
+			"empty-keys",
+		] as const) {
+			mode = failingMode;
+			const fallbackRes = await verifyAccessRequest(
+				adminGet("https://paab.test/admin", {
+					"Cf-Access-Jwt-Assertion": tokenPrimary,
+				}),
+				prodEnv(),
+				expiredNow,
+				{ fetchJwks },
+			);
+			expect(fallbackRes, failingMode).toEqual({
+				ok: true,
+				user: { email: "owner@example.com", sub: "u1" },
+				devMode: false,
+			});
+		}
+		expect(fetchJwks).toHaveBeenCalledTimes(4);
+
+		mode = "rotated";
+		const recovered = await verifyAccessRequest(
+			adminGet("https://paab.test/admin", {
+				"Cf-Access-Jwt-Assertion": tokenSecondary,
+			}),
+			prodEnv(),
+			expiredNow + 1_000,
+			{ fetchJwks },
+		);
+		expect(recovered.ok).toBe(true);
+		expect(fetchJwks).toHaveBeenCalledTimes(5);
+
+		clearJwksCache();
+		let httpCalls = 0;
+		const fetchSpy = vi
+			.spyOn(globalThis, "fetch")
+			.mockImplementation(async () => {
+				httpCalls += 1;
+				if (httpCalls === 1) {
+					return new Response(JSON.stringify({ keys: [primaryKey.jwk] }), {
+						status: 200,
+						headers: { "Content-Type": "application/json" },
+					});
+				}
+				return new Response("upstream error", { status: 500 });
+			});
+		try {
+			const defaultInitial = await verifyAccessRequest(
+				adminGet("https://paab.test/admin", {
+					"Cf-Access-Jwt-Assertion": tokenPrimary,
+				}),
+				prodEnv(),
+				NOW_MS,
+			);
+			expect(defaultInitial.ok).toBe(true);
+
+			const defaultFallback = await verifyAccessRequest(
+				adminGet("https://paab.test/admin", {
+					"Cf-Access-Jwt-Assertion": tokenPrimary,
+				}),
+				prodEnv(),
+				expiredNow,
+			);
+			expect(defaultFallback.ok).toBe(true);
+			expect(httpCalls).toBe(2);
+		} finally {
+			fetchSpy.mockRestore();
+			clearJwksCache();
+		}
+	});
+
+	it("returns 403 for bad signature and 503 for uncached kid when expired refresh fails", async () => {
+		let shouldFail = false;
+		const fetchJwks = vi.fn(async () => {
+			if (shouldFail) {
+				throw new Error("JWKS fetch failed with status 500");
+			}
+			return { keys: [primaryKey.jwk] };
+		});
+
+		const validPrimary = await signJwt(primaryKey, {
+			aud: TEST_AUD,
+			exp: NOW_SEC + 900,
+			email: "owner@example.com",
+			sub: "u1",
+		});
+		const parts = validPrimary.split(".");
+		const tamperedPayload = toBase64Url(
+			JSON.stringify({
+				aud: TEST_AUD,
+				exp: NOW_SEC + 900,
+				email: "attacker@example.com",
+				sub: "u1",
+			}),
+		);
+		const tamperedPrimary = `${parts[0]}.${tamperedPayload}.${parts[2]}`;
+		const validSecondary = await signJwt(secondaryKey, {
+			aud: TEST_AUD,
+			exp: NOW_SEC + 900,
+			email: "owner@example.com",
+			sub: "u1",
+		});
+
+		const initial = await verifyAccessRequest(
+			adminGet("https://paab.test/admin", {
+				"Cf-Access-Jwt-Assertion": validPrimary,
+			}),
+			prodEnv(),
+			NOW_MS,
+			{ fetchJwks },
+		);
+		expect(initial.ok).toBe(true);
+
+		shouldFail = true;
+		const expiredNow = NOW_MS + JWKS_CACHE_TTL_MS;
+
+		const badSig = await verifyAccessRequest(
+			adminGet("https://paab.test/admin", {
+				"Cf-Access-Jwt-Assertion": tamperedPrimary,
+			}),
+			prodEnv(),
+			expiredNow,
+			{ fetchJwks },
+		);
+		expect(badSig).toMatchObject({ ok: false, status: 403 });
+
+		const uncachedKid = await verifyAccessRequest(
+			adminGet("https://paab.test/admin", {
+				"Cf-Access-Jwt-Assertion": validSecondary,
+			}),
+			prodEnv(),
+			expiredNow,
+			{ fetchJwks },
+		);
+		expect(uncachedKid).toMatchObject({ ok: false, status: 503 });
+
+		const coldFailFetcher = vi.fn(async () => {
+			throw new Error("network down");
+		});
+		const coldFail = await verifyAccessRequest(
+			adminGet("https://paab.test/admin", {
+				"Cf-Access-Jwt-Assertion": validPrimary,
+			}),
+			prodEnv(),
+			NOW_MS,
+			{ fetchJwks: coldFailFetcher },
+		);
+		expect(coldFail).toMatchObject({ ok: false, status: 503 });
+
+		const emptyKeysFetcher = vi.fn(async () => ({ keys: [] }));
+		const emptyKeys = await verifyAccessRequest(
+			adminGet("https://paab.test/admin", {
+				"Cf-Access-Jwt-Assertion": validPrimary,
+			}),
+			prodEnv(),
+			NOW_MS,
+			{ fetchJwks: emptyKeysFetcher },
+		);
+		expect(emptyKeys).toMatchObject({ ok: false, status: 503 });
 	});
 
 	it("rejects missing header, expired, not-yet-valid, wrong aud, bad alg, and tampered signature with 403", async () => {
