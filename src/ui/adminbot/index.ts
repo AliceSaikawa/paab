@@ -1,8 +1,12 @@
 import {
 	type ChangeActor,
+	countUnrevertedAdminBotChanges,
+	DEFAULT_CHANGE_LOG_LIMIT,
+	inspectAdminBotChangesUndoState,
 	listAdminBotChanges,
 	listAgentsWithStatus,
 	listCategoriesWithUsage,
+	MAX_CHANGE_LOG_LIMIT,
 	revertAdminBotChange,
 	type UndoErrorCode,
 } from "../../admin";
@@ -21,10 +25,12 @@ import {
 } from "../../adminbot";
 import { isBodyRecordingEnabled } from "../../audit";
 import { auditBodyConfig } from "../../mcp/config";
+import { CHANGE_TARGET_TYPES, type ChangeTargetType } from "../../types";
 import { adminPageResponse, type FlashMessage } from "../layout";
 import type { AdminGetContext, AdminPostContext, AdminRoute } from "../router";
 import { CHANGE_ACTION_LABELS } from "../rules/render";
 import {
+	type AdminBotChangesQuery,
 	renderAdminBotPageBody,
 	renderBothPermissionsConfirmBody,
 	renderIssuedAdminTokenBody,
@@ -32,6 +38,95 @@ import {
 
 const ADMIN_BOT_PATH = "/admin/adminbot";
 const ADMIN_BOT_TITLE = "管理者ボット";
+// Reserve 1 row for lookahead pagination so queryChangeLog does not clamp the probe.
+const MAX_UI_CHANGE_LIMIT = MAX_CHANGE_LOG_LIMIT - 1;
+
+function defaultChangesQuery(): AdminBotChangesQuery {
+	return {
+		unrevertedOnly: false,
+		limit: DEFAULT_CHANGE_LOG_LIMIT,
+	};
+}
+
+function parseChangesQuery(
+	params: URLSearchParams,
+	prefix = "",
+):
+	| { ok: true; query: AdminBotChangesQuery }
+	| { ok: false; error: string; fallback: AdminBotChangesQuery } {
+	const unrevertedOnly = params.get(`${prefix}unreverted`) === "1";
+	const rawTargetType = (params.get(`${prefix}target_type`) ?? "").trim();
+	const rawBeforeId = (params.get(`${prefix}before_id`) ?? "").trim();
+	const rawLimit = (params.get(`${prefix}limit`) ?? "").trim();
+
+	const fallback: AdminBotChangesQuery = {
+		unrevertedOnly,
+		limit: DEFAULT_CHANGE_LOG_LIMIT,
+	};
+
+	let targetType: ChangeTargetType | undefined;
+	if (rawTargetType.length > 0) {
+		if (!(CHANGE_TARGET_TYPES as readonly string[]).includes(rawTargetType)) {
+			return {
+				ok: false,
+				error: `対象の指定が不正です: ${rawTargetType}`,
+				fallback,
+			};
+		}
+		targetType = rawTargetType as ChangeTargetType;
+		fallback.targetType = targetType;
+	}
+
+	let beforeId: number | undefined;
+	if (rawBeforeId.length > 0) {
+		if (!/^\d+$/.test(rawBeforeId)) {
+			return {
+				ok: false,
+				error: `before_id は 0 以上の整数で指定してください: ${rawBeforeId}`,
+				fallback,
+			};
+		}
+		const parsed = Number(rawBeforeId);
+		if (!Number.isSafeInteger(parsed)) {
+			return {
+				ok: false,
+				error: `before_id は 0 以上の整数で指定してください: ${rawBeforeId}`,
+				fallback,
+			};
+		}
+		beforeId = parsed;
+	}
+
+	let limit = DEFAULT_CHANGE_LOG_LIMIT;
+	if (rawLimit.length > 0) {
+		if (!/^[1-9]\d*$/.test(rawLimit)) {
+			return {
+				ok: false,
+				error: `limit は 1 以上の整数で指定してください: ${rawLimit}`,
+				fallback,
+			};
+		}
+		const parsed = Number(rawLimit);
+		if (!Number.isSafeInteger(parsed)) {
+			return {
+				ok: false,
+				error: `limit は 1 以上の整数で指定してください: ${rawLimit}`,
+				fallback,
+			};
+		}
+		limit = Math.min(parsed, MAX_UI_CHANGE_LIMIT);
+	}
+
+	return {
+		ok: true,
+		query: {
+			unrevertedOnly,
+			targetType,
+			beforeId,
+			limit,
+		},
+	};
+}
 
 function ownerActor(ctx: AdminPostContext): ChangeActor {
 	return { actorType: "owner", actorId: ctx.user.email };
@@ -79,14 +174,33 @@ function statusForUndoError(code: UndoErrorCode): 400 | 404 | 409 {
 
 async function renderAdminBotScreen(
 	ctx: AdminGetContext,
-	options: { status?: number; flash?: FlashMessage } = {},
+	options: {
+		status?: number;
+		flash?: FlashMessage;
+		changeQuery?: AdminBotChangesQuery;
+	} = {},
 ): Promise<Response> {
-	const [config, agents, categories, changes] = await Promise.all([
-		getAdminBotConfig(ctx.env.DB),
-		listAgentsWithStatus(ctx.env.DB, ctx.now),
-		listCategoriesWithUsage(ctx.env.DB),
-		listAdminBotChanges(ctx.env.DB),
-	]);
+	const changeQuery = options.changeQuery ?? defaultChangesQuery();
+	const [config, agents, categories, rawChanges, unrevertedCount] =
+		await Promise.all([
+			getAdminBotConfig(ctx.env.DB),
+			listAgentsWithStatus(ctx.env.DB, ctx.now),
+			listCategoriesWithUsage(ctx.env.DB),
+			listAdminBotChanges(ctx.env.DB, {
+				beforeId: changeQuery.beforeId,
+				limit: changeQuery.limit + 1,
+				unrevertedOnly: changeQuery.unrevertedOnly,
+				targetType: changeQuery.targetType,
+			}),
+			countUnrevertedAdminBotChanges(ctx.env.DB),
+		]);
+	const hasOlderChanges = rawChanges.length > changeQuery.limit;
+	const changes = rawChanges.slice(0, changeQuery.limit);
+	const nextBeforeId = hasOlderChanges ? (changes.at(-1)?.id ?? null) : null;
+	const undoAvailability = await inspectAdminBotChangesUndoState(
+		ctx.env.DB,
+		changes,
+	);
 	const designated =
 		config.agentId !== null
 			? (agents.find((item) => item.agent.id === config.agentId) ?? null)
@@ -106,6 +220,11 @@ async function renderAdminBotScreen(
 				agents,
 				categories,
 				changes,
+				changeQuery,
+				hasOlderChanges,
+				nextBeforeId,
+				unrevertedCount,
+				undoAvailability,
 				bodyRecordingEnabled,
 				now: ctx.now,
 				csrfToken: ctx.csrfToken,
@@ -117,7 +236,15 @@ async function renderAdminBotScreen(
 }
 
 async function handleGetAdminBot(ctx: AdminGetContext): Promise<Response> {
-	return renderAdminBotScreen(ctx);
+	const parsed = parseChangesQuery(ctx.url.searchParams);
+	if (!parsed.ok) {
+		return renderAdminBotScreen(ctx, {
+			status: 400,
+			flash: { kind: "error", message: parsed.error },
+			changeQuery: parsed.fallback,
+		});
+	}
+	return renderAdminBotScreen(ctx, { changeQuery: parsed.query });
 }
 
 async function handleDesignateAdminBot(
@@ -526,11 +653,17 @@ async function handleSetSuperadmin(ctx: AdminPostContext): Promise<Response> {
 async function handleRevertAdminBotChange(
 	ctx: AdminPostContext,
 ): Promise<Response> {
+	const parsedFilter = parseChangesQuery(ctx.form, "filter_");
+	const changeQuery = parsedFilter.ok
+		? parsedFilter.query
+		: parsedFilter.fallback;
+
 	const rawId = ctx.params.id ?? "";
 	if (!/^\d+$/.test(rawId)) {
 		return renderAdminBotScreen(ctx, {
 			status: 400,
 			flash: { kind: "error", message: "変更IDが不正です" },
+			changeQuery,
 		});
 	}
 	const changeId = Number(rawId);
@@ -538,26 +671,34 @@ async function handleRevertAdminBotChange(
 		return renderAdminBotScreen(ctx, {
 			status: 400,
 			flash: { kind: "error", message: "変更IDが不正です" },
+			changeQuery,
 		});
 	}
 
+	const cascade = ctx.form.get("cascade") === "1";
 	const result = await revertAdminBotChange(ctx.env.DB, {
 		changeId,
 		actor: ownerActor(ctx),
 		now: ctx.now,
+		cascade,
 	});
 	if (!result.ok) {
 		return renderAdminBotScreen(ctx, {
 			status: statusForUndoError(result.code),
 			flash: { kind: "error", message: result.message },
+			changeQuery,
 		});
 	}
 
+	const revertedIds = result.data.revertedChangeIds;
+	const message =
+		cascade && revertedIds !== undefined && revertedIds.length > 1
+			? `変更 #${result.data.revertedChangeId}（${CHANGE_ACTION_LABELS[result.data.action]}）を含む ${revertedIds.length} 件の変更をまとめて元に戻しました`
+			: `変更 #${result.data.revertedChangeId}（${CHANGE_ACTION_LABELS[result.data.action]}）を元に戻しました`;
+
 	return renderAdminBotScreen(ctx, {
-		flash: {
-			kind: "success",
-			message: `変更 #${result.data.revertedChangeId}（${CHANGE_ACTION_LABELS[result.data.action]}）を元に戻しました`,
-		},
+		flash: { kind: "success", message },
+		changeQuery,
 	});
 }
 

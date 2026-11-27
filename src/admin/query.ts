@@ -12,6 +12,7 @@ import {
 	CHANGE_ACTOR_TYPES,
 	CHANGE_TARGET_TYPES,
 	type ChangeLogEntry,
+	type ChangeTargetType,
 	TOKEN_PURPOSES,
 	type TokenPurpose,
 	type UnixMillis,
@@ -26,8 +27,19 @@ import type {
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+export const ADMIN_BOT_MUTATION_WINDOW_MS = 60 * 60 * 1000;
 export const DEFAULT_CHANGE_LOG_LIMIT = 100;
 export const MAX_CHANGE_LOG_LIMIT = 1000;
+
+export interface ListAdminBotChangesOptions {
+	occurredFrom?: UnixMillis;
+	occurredBefore?: UnixMillis;
+	targetType?: ChangeTargetType;
+	targetId?: string;
+	beforeId?: number;
+	limit?: number;
+	unrevertedOnly?: boolean;
+}
 
 export interface ChangeLogQuery {
 	sql: string;
@@ -98,6 +110,9 @@ export function buildChangeLogQuery(
 	if (filter.beforeId !== undefined) {
 		add("id < ?", requireId(filter.beforeId, "beforeId"));
 	}
+	if (filter.unrevertedOnly === true) {
+		where.push("reverted_at IS NULL");
+	}
 
 	const limit = filter.limit ?? DEFAULT_CHANGE_LOG_LIMIT;
 	if (!Number.isSafeInteger(limit) || limit < 1) {
@@ -110,7 +125,7 @@ export function buildChangeLogQuery(
 		"target_type, target_id, before_json, after_json, reverted_at",
 		"FROM change_log",
 		...(where.length > 0 ? [`WHERE ${where.join(" AND ")}`] : []),
-		"ORDER BY occurred_at DESC, id DESC",
+		"ORDER BY id DESC",
 		"LIMIT ?",
 	].join(" ");
 	return { sql, params };
@@ -126,6 +141,53 @@ export async function queryChangeLog(
 		.bind(...params)
 		.all<ChangeLogRow>();
 	return results.map(changeLogEntryFromRow);
+}
+
+/** Lists `change_log` entries performed by `admin_bot`, newest first. */
+export async function listAdminBotChanges(
+	db: D1Database,
+	limitOrOptions?: number | ListAdminBotChangesOptions,
+): Promise<ChangeLogEntry[]> {
+	const options: ListAdminBotChangesOptions =
+		typeof limitOrOptions === "number"
+			? { limit: limitOrOptions }
+			: (limitOrOptions ?? {});
+	return queryChangeLog(db, {
+		...options,
+		actorType: "admin_bot",
+	});
+}
+
+/** Counts all un-reverted `change_log` entries performed by `admin_bot`. */
+export async function countUnrevertedAdminBotChanges(
+	db: D1Database,
+): Promise<number> {
+	const row = await db
+		.prepare(
+			`SELECT COUNT(*) AS count
+			FROM change_log
+			WHERE actor_type = 'admin_bot' AND reverted_at IS NULL`,
+		)
+		.first<{ count: number }>();
+	return row?.count ?? 0;
+}
+
+/** Counts `admin_bot` mutations recorded in `change_log` within the rolling window ending at `now`. */
+export async function countRecentAdminBotMutations(
+	db: D1Database,
+	now: UnixMillis,
+	windowMs = ADMIN_BOT_MUTATION_WINDOW_MS,
+): Promise<number> {
+	const since = requireTime(now, "now") - windowMs;
+	const row = await db
+		.prepare(
+			`SELECT COUNT(*) AS count
+			FROM change_log
+			WHERE actor_type = 'admin_bot' AND occurred_at >= ?`,
+		)
+		.bind(since)
+		.first<{ count: number }>();
+	return row?.count ?? 0;
 }
 
 interface DailyCountRow {

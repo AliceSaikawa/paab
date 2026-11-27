@@ -37,6 +37,7 @@ export interface AdminMcpContext {
 	config: AdminBotConfig;
 	audit: AuditBodyConfig;
 	now: UnixMillis;
+	hourlyMutationLimit?: number;
 }
 
 export interface AdminToolAudit {
@@ -55,6 +56,7 @@ export interface AdminToolOutput {
 export interface AdminToolDefinition<Input extends z.ZodObject = z.ZodObject> {
 	name: string;
 	description: string;
+	mutating: boolean;
 	inputSchema: Input;
 	run(ctx: AdminMcpContext, args: z.infer<Input>): Promise<AdminToolOutput>;
 }
@@ -226,6 +228,7 @@ function renderAuditEntry(
 
 const viewAuditLog = defineAdminTool({
 	name: "view_audit_log",
+	mutating: false,
 	description:
 		"Read bridge audit log entries with optional filters and cursor pagination. Message bodies are omitted unless both the owner-enabled read_bodies switch and AUDIT_RECORD_BODIES are on (set include_body=false to omit bodies even when enabled; explicit include_body=true is denied while read_bodies is off). Returned bodies are framed as untrusted external data and logged as admin_body_read.",
 	inputSchema: z.object({

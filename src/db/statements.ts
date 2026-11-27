@@ -179,6 +179,24 @@ export function insertProposal(
 		);
 }
 
+export function insertPendingDescription(
+	db: D1Database,
+	pending: PendingDescription,
+): D1PreparedStatement {
+	return db
+		.prepare(
+			`INSERT INTO pending_descriptions
+				(agent_id, submission_id, description, submitted_at)
+			VALUES (?, ?, ?, ?)`,
+		)
+		.bind(
+			pending.agentId,
+			pending.submissionId,
+			pending.description,
+			pending.submittedAt,
+		);
+}
+
 export function upsertPendingDescription(
 	db: D1Database,
 	pending: PendingDescription,

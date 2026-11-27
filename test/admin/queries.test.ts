@@ -1,9 +1,12 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import {
 	type ChangeActor,
+	countRecentAdminBotMutations,
+	countUnrevertedAdminBotChanges,
 	createCategory,
 	grantAllowRule,
 	issueAgentToken,
+	listAdminBotChanges,
 	listAgentsWithStatus,
 	listAllowRulesGrouped,
 	listCategoriesWithUsage,
@@ -13,7 +16,7 @@ import {
 	resolveDefaultOwnerId,
 	suspendAgent,
 } from "../../src/admin";
-import { insertMessage, newId } from "../../src/db";
+import { insertChangeLogEntry, insertMessage, newId } from "../../src/db";
 import type { Agent, Category } from "../../src/types";
 import { createTestDb } from "../helpers/db";
 import {
@@ -114,6 +117,93 @@ describe("queryChangeLog", () => {
 		expect(
 			await queryChangeLog(db, { limit: MAX_CHANGE_LOG_LIMIT + 500 }),
 		).toEqual([]);
+	});
+
+	it("pages past 100 admin_bot entries with beforeId, filters unrevertedOnly and targetType, and counts recent mutations", async () => {
+		const statements: D1PreparedStatement[] = [];
+		for (let i = 0; i < 125; i += 1) {
+			statements.push(
+				insertChangeLogEntry(db, {
+					occurredAt: T0 + i * 1000,
+					actorType: "admin_bot",
+					actorId: "bot-1",
+					approverId: null,
+					action: i % 5 === 0 ? "allow_rule_revoked" : "agent_updated",
+					targetType: i % 5 === 0 ? "allow_rule" : "agent",
+					targetId: `target-${i}`,
+					beforeJson: "{}",
+					afterJson: "{}",
+					revertedAt: i >= 15 ? T0 + 999_999 : null,
+				}),
+			);
+		}
+		// One owner row and one admin_bot row older than 1 hour.
+		statements.push(
+			insertChangeLogEntry(db, {
+				occurredAt: T0 - HOUR_MS - 1,
+				actorType: "admin_bot",
+				actorId: "bot-1",
+				approverId: null,
+				action: "agent_updated",
+				targetType: "agent",
+				targetId: "old-target",
+				beforeJson: "{}",
+				afterJson: "{}",
+				revertedAt: null,
+			}),
+			insertChangeLogEntry(db, {
+				occurredAt: T0 + 100,
+				actorType: "owner",
+				actorId: "me",
+				approverId: null,
+				action: "agent_updated",
+				targetType: "agent",
+				targetId: "owner-target",
+				beforeJson: "{}",
+				afterJson: "{}",
+				revertedAt: null,
+			}),
+		);
+		await db.batch(statements);
+
+		const page1 = await listAdminBotChanges(db);
+		expect(page1).toHaveLength(100);
+		// Even with an out-of-order occurred_at (old-target inserted with a higher id), cursor pagination drops zero rows.
+		expect(page1[0]?.targetId).toBe("old-target");
+		const page2 = await listAdminBotChanges(db, {
+			beforeId: page1.at(-1)?.id,
+		});
+		expect(page2).toHaveLength(26);
+		expect(page2.at(-1)?.targetId).toBe("target-0");
+		const seenIds = new Set([...page1, ...page2].map((entry) => entry.id));
+		expect(seenIds.size).toBe(126);
+
+		const unreverted = await listAdminBotChanges(db, { unrevertedOnly: true });
+		expect(unreverted).toHaveLength(16);
+		expect(unreverted.every((entry) => entry.revertedAt === null)).toBe(true);
+		expect(await countUnrevertedAdminBotChanges(db)).toBe(16);
+
+		const allowRuleOnly = await listAdminBotChanges(db, {
+			unrevertedOnly: true,
+			targetType: "allow_rule",
+		});
+		expect(allowRuleOnly).toHaveLength(3);
+		expect(allowRuleOnly.map((entry) => entry.targetId)).toEqual([
+			"target-10",
+			"target-5",
+			"target-0",
+		]);
+
+		// At T0 + 124_000, the 125 entries at T0..T0+124_000 are within 1 hour, while old-target (T0 - HOUR_MS - 1) is outside.
+		expect(await countRecentAdminBotMutations(db, T0 + 124_000)).toBe(125);
+		// Exactly 1 hour after the last entry (T0 + 124_000 + HOUR_MS), only the last entry is still >= since.
+		expect(await countRecentAdminBotMutations(db, T0 + 124_000 + HOUR_MS)).toBe(
+			1,
+		);
+		// 1ms past 1 hour after the last entry, none remain in the window.
+		expect(
+			await countRecentAdminBotMutations(db, T0 + 124_000 + HOUR_MS + 1),
+		).toBe(0);
 	});
 });
 

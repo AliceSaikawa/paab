@@ -1,6 +1,8 @@
 import {
 	type AgentWithStatus,
 	type CategoryWithUsage,
+	type ChangeUndoAvailability,
+	DEFAULT_CHANGE_LOG_LIMIT,
 	isUndoableChangeAction,
 } from "../../admin";
 import {
@@ -10,7 +12,12 @@ import {
 	SUPERADMIN_DURATION_PRESETS,
 	type SuperadminState,
 } from "../../adminbot";
-import type { ChangeLogEntry, UnixMillis } from "../../types";
+import {
+	CHANGE_TARGET_TYPES,
+	type ChangeLogEntry,
+	type ChangeTargetType,
+	type UnixMillis,
+} from "../../types";
 import { csrfInput } from "../csrf";
 import { html, rawHtml, type SafeHtml } from "../html";
 import { formatTimestamp } from "../layout";
@@ -21,16 +28,63 @@ import {
 	describeChangeTarget,
 } from "../rules/render";
 
+export interface AdminBotChangesQuery {
+	unrevertedOnly: boolean;
+	targetType?: ChangeTargetType;
+	beforeId?: number;
+	limit: number;
+}
+
 export interface AdminBotPageView {
 	config: AdminBotConfig;
 	designated: AgentWithStatus | null;
 	agents: readonly AgentWithStatus[];
 	categories: readonly CategoryWithUsage[];
 	changes: readonly ChangeLogEntry[];
+	changeQuery: AdminBotChangesQuery;
+	hasOlderChanges: boolean;
+	nextBeforeId: number | null;
+	unrevertedCount: number;
+	undoAvailability: ReadonlyMap<number, ChangeUndoAvailability>;
 	bodyRecordingEnabled: boolean;
 	now: UnixMillis;
 	csrfToken: string;
 	adminMcpUrl: string;
+}
+
+const CHANGE_TARGET_TYPE_LABELS: Record<ChangeTargetType, string> = {
+	agent: "エージェント",
+	allow_rule: "許可ルール",
+	category: "カテゴリ",
+	description: "説明文",
+	token: "トークン",
+	admin_bot: "管理者ボット設定",
+};
+
+export function buildAdminBotHref(options: {
+	unrevertedOnly?: boolean;
+	targetType?: ChangeTargetType;
+	beforeId?: number;
+	limit?: number;
+}): string {
+	const params = new URLSearchParams();
+	if (options.unrevertedOnly) {
+		params.set("unreverted", "1");
+	}
+	if (options.targetType !== undefined) {
+		params.set("target_type", options.targetType);
+	}
+	if (options.beforeId !== undefined) {
+		params.set("before_id", String(options.beforeId));
+	}
+	if (
+		options.limit !== undefined &&
+		options.limit !== DEFAULT_CHANGE_LOG_LIMIT
+	) {
+		params.set("limit", String(options.limit));
+	}
+	const qs = params.toString();
+	return qs.length > 0 ? `/admin/adminbot?${qs}` : "/admin/adminbot";
 }
 
 export interface BothPermissionsConfirmView {
@@ -406,20 +460,154 @@ function renderDesignateSection(view: AdminBotPageView): SafeHtml {
 	`;
 }
 
+function renderFilterHiddenInputs(query: AdminBotChangesQuery): SafeHtml {
+	return html`${
+		query.unrevertedOnly
+			? html`<input type="hidden" name="filter_unreverted" value="1">`
+			: false
+	}${
+		query.targetType !== undefined
+			? html`<input type="hidden" name="filter_target_type" value="${query.targetType}">`
+			: false
+	}${
+		query.beforeId !== undefined
+			? html`<input type="hidden" name="filter_before_id" value="${String(query.beforeId)}">`
+			: false
+	}${
+		query.limit !== DEFAULT_CHANGE_LOG_LIMIT
+			? html`<input type="hidden" name="filter_limit" value="${String(query.limit)}">`
+			: false
+	}`;
+}
+
+function renderUndoCell(
+	entry: ChangeLogEntry,
+	view: AdminBotPageView,
+): SafeHtml {
+	if (entry.revertedAt !== null) {
+		return html`
+			<span class="badge">元に戻しました</span>
+			<span class="muted">（${formatTimestamp(entry.revertedAt)}）</span>
+		`;
+	}
+	if (!isUndoableChangeAction(entry.action)) {
+		return html`<span class="badge">取消不可</span>`;
+	}
+	const availability = view.undoAvailability.get(entry.id) ?? { kind: "ready" };
+	if (availability.kind === "blocked") {
+		return html`
+			<span class="badge">取消不可（競合あり）</span>
+			<span class="muted">${availability.reason}</span>
+		`;
+	}
+	const hiddenFilters = renderFilterHiddenInputs(view.changeQuery);
+	if (availability.kind === "cascade") {
+		return html`
+			<form
+				class="inline-form"
+				method="POST"
+				action="/admin/adminbot/changes/${entry.id}/revert"
+			>
+				${csrfInput(view.csrfToken)}
+				${hiddenFilters}
+				<input type="hidden" name="cascade" value="1">
+				<button type="submit" class="btn btn-danger">以降もまとめて元に戻す（${availability.count}件）</button>
+			</form>
+		`;
+	}
+	return html`
+		<form
+			class="inline-form"
+			method="POST"
+			action="/admin/adminbot/changes/${entry.id}/revert"
+		>
+			${csrfInput(view.csrfToken)}
+			${hiddenFilters}
+			<button type="submit" class="btn btn-danger">元に戻す</button>
+		</form>
+	`;
+}
+
+function renderChangePagination(view: AdminBotPageView): SafeHtml | false {
+	const latestHref =
+		view.changeQuery.beforeId !== undefined
+			? buildAdminBotHref({
+					unrevertedOnly: view.changeQuery.unrevertedOnly,
+					targetType: view.changeQuery.targetType,
+					limit: view.changeQuery.limit,
+				})
+			: null;
+	const olderHref =
+		view.hasOlderChanges && view.nextBeforeId !== null
+			? buildAdminBotHref({
+					unrevertedOnly: view.changeQuery.unrevertedOnly,
+					targetType: view.changeQuery.targetType,
+					beforeId: view.nextBeforeId,
+					limit: view.changeQuery.limit,
+				})
+			: null;
+	if (latestHref === null && olderHref === null) {
+		return false;
+	}
+	return html`
+		<div class="actions">
+			${latestHref !== null ? html`<a class="btn" href="${latestHref}">最新の変更へ</a>` : false}
+			${olderHref !== null ? html`<a class="btn" rel="next" href="${olderHref}">古い変更を表示</a>` : false}
+		</div>
+	`;
+}
+
 function renderAdminBotChangesSection(view: AdminBotPageView): SafeHtml {
 	const names = collectEntityNames(view.agents, view.categories, view.changes);
+	const hasActiveFilter =
+		view.changeQuery.unrevertedOnly ||
+		view.changeQuery.targetType !== undefined ||
+		view.changeQuery.beforeId !== undefined ||
+		view.changeQuery.limit !== DEFAULT_CHANGE_LOG_LIMIT;
+	const pagination = renderChangePagination(view);
 
 	return html`
 		<section class="card stack">
 			<div>
 				<h2>管理者ボットによる変更履歴</h2>
 				<p class="muted">
-					管理者ボットが実行した変更を新しい順に表示します。最新の変更から 1 操作で元に戻せます。
+					管理者ボットが実行した変更を新しい順に表示します。同じ対象に変更が重なっている場合も、所有者の変更が挟まっていなければ 1 操作でまとめて元に戻せます。
 				</p>
 			</div>
+			<div class="actions">
+				<span class="muted">
+					未取消の変更: <strong>${view.unrevertedCount}</strong> 件 / 表示中: ${view.changes.length} 件
+				</span>
+			</div>
+			<form method="GET" action="/admin/adminbot" class="actions">
+				<label>
+					<input
+						type="checkbox"
+						name="unreverted"
+						value="1"${view.changeQuery.unrevertedOnly ? rawHtml(" checked") : false}
+					>
+					未取消のみ
+				</label>
+				<label for="adminbot-change-target-type">対象</label>
+				<select id="adminbot-change-target-type" name="target_type" style="width: auto;">
+					<option value="">すべて</option>
+					${CHANGE_TARGET_TYPES.map(
+						(targetType) =>
+							html`<option value="${targetType}"${view.changeQuery.targetType === targetType ? rawHtml(" selected") : false}>${CHANGE_TARGET_TYPE_LABELS[targetType]}</option>`,
+					)}
+				</select>
+				${
+					view.changeQuery.limit !== DEFAULT_CHANGE_LOG_LIMIT
+						? html`<input type="hidden" name="limit" value="${String(view.changeQuery.limit)}">`
+						: false
+				}
+				<button type="submit" class="btn btn-primary">絞り込む</button>
+				${hasActiveFilter ? html`<a class="btn" href="/admin/adminbot">条件をクリア</a>` : false}
+			</form>
+			${pagination}
 			${
 				view.changes.length === 0
-					? html`<p class="muted">管理者ボットによる変更履歴はまだありません。</p>`
+					? html`<p class="muted">${hasActiveFilter ? "条件に一致する変更履歴はありません。" : "管理者ボットによる変更履歴はまだありません。"}</p>`
 					: html`
 						<div class="table-wrap">
 							<table>
@@ -449,33 +637,14 @@ function renderAdminBotChangesSection(view: AdminBotPageView): SafeHtml {
 												</td>
 												<td>${describeChangeTarget(entry, names)}</td>
 												<td>${describeChangeBeforeAfter(entry, names)}</td>
-												<td>
-													${
-														entry.revertedAt !== null
-															? html`
-																<span class="badge">元に戻しました</span>
-																<span class="muted">（${formatTimestamp(entry.revertedAt)}）</span>
-															`
-															: isUndoableChangeAction(entry.action)
-																? html`
-																	<form
-																		class="inline-form"
-																		method="POST"
-																		action="/admin/adminbot/changes/${entry.id}/revert"
-																	>
-																		${csrfInput(view.csrfToken)}
-																		<button type="submit" class="btn btn-danger">元に戻す</button>
-																	</form>
-																`
-																: html`<span class="badge">取消不可</span>`
-													}
-												</td>
+												<td>${renderUndoCell(entry, view)}</td>
 											</tr>
 										`,
 									)}
 								</tbody>
 							</table>
 						</div>
+						${pagination}
 					`
 			}
 		</section>

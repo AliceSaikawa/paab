@@ -137,6 +137,7 @@ export interface ChangeLogFilter {
 	targetId?: string;
 	beforeId?: number;
 	limit?: number;
+	unrevertedOnly?: boolean;
 }
 
 export interface ActiveTokenSummary {

@@ -5,16 +5,26 @@ import {
 	StreamableHTTPClientTransport,
 } from "@modelcontextprotocol/client";
 import { beforeEach, describe, expect, it } from "vitest";
-import { type ChangeActor, suspendAgent } from "../../src/admin";
+import {
+	type ChangeActor,
+	grantAllowRule,
+	suspendAgent,
+} from "../../src/admin";
 import {
 	designateAdminBot,
 	handleAdminMcpRequest,
 	issueAdminBotToken,
+	submitPendingDescription,
 } from "../../src/adminbot";
 import { queryAuditLog, recordAuditEvent } from "../../src/audit";
 import { issueToken } from "../../src/auth";
+import { insertChangeLogEntry } from "../../src/db";
 import { handleMcpRequest } from "../../src/mcp";
-import type { McpEnv } from "../../src/mcp/config";
+import {
+	adminBotHourlyMutationLimit,
+	DEFAULT_ADMIN_BOT_HOURLY_MUTATION_LIMIT,
+	type McpEnv,
+} from "../../src/mcp/config";
 import type { Agent, Category } from "../../src/types";
 import { createTestDb } from "../helpers/db";
 import { HOUR_MS, seedAgent, seedCategory, T0 } from "../helpers/fixtures";
@@ -451,5 +461,172 @@ describe("view_audit_log tool", () => {
 		expect(
 			logs.filter((e) => e.eventType === "admin_tool_called"),
 		).toHaveLength(1);
+	});
+});
+
+describe("/mcp/admin hourly mutation rate limit", () => {
+	it("parses ADMIN_BOT_HOURLY_MUTATION_LIMIT and falls back to the default on invalid values", () => {
+		expect(adminBotHourlyMutationLimit({ DB: db })).toBe(
+			DEFAULT_ADMIN_BOT_HOURLY_MUTATION_LIMIT,
+		);
+		expect(
+			adminBotHourlyMutationLimit({
+				DB: db,
+				ADMIN_BOT_HOURLY_MUTATION_LIMIT: "12",
+			}),
+		).toBe(12);
+		expect(
+			adminBotHourlyMutationLimit({
+				DB: db,
+				ADMIN_BOT_HOURLY_MUTATION_LIMIT: "0",
+			}),
+		).toBe(0);
+		expect(
+			adminBotHourlyMutationLimit({
+				DB: db,
+				ADMIN_BOT_HOURLY_MUTATION_LIMIT: "-5",
+			}),
+		).toBe(DEFAULT_ADMIN_BOT_HOURLY_MUTATION_LIMIT);
+		expect(
+			adminBotHourlyMutationLimit({
+				DB: db,
+				ADMIN_BOT_HOURLY_MUTATION_LIMIT: "not-a-number",
+			}),
+		).toBe(DEFAULT_ADMIN_BOT_HOURLY_MUTATION_LIMIT);
+	});
+
+	it("rejects mutating tools past the rolling 1-hour limit, logs admin_rate_limit_exceeded, allows read-only tools, and recovers after 1 hour", async () => {
+		await grantAllowRule(db, {
+			fromAgentId: muse.id,
+			toAgentId: grok.id,
+			categoryId: schedule.id,
+			actor: OWNER,
+			now: T0,
+		});
+		const sub = await submitPendingDescription(db, {
+			agentId: grok.id,
+			description: "new grok bio",
+			now: T0,
+		});
+		if (!sub.ok) throw new Error("submit failed");
+
+		const limitedEnv: McpEnv = {
+			DB: env.DB,
+			ADMIN_BOT_HOURLY_MUTATION_LIMIT: "2",
+		};
+		const client = await connectAdmin(adminToken, {
+			env: limitedEnv,
+			now: T0 + 10,
+		});
+
+		// First 2 mutating calls succeed.
+		expect(
+			(
+				await call(client, "lower_daily_limit", {
+					agent: "grok",
+					new_limit: 9,
+				})
+			).isError,
+		).toBe(false);
+		expect(
+			(
+				await call(client, "lower_daily_limit", {
+					agent: "grok",
+					new_limit: 8,
+				})
+			).isError,
+		).toBe(false);
+
+		// 3rd mutating calls (tightening, description review, proposal) are rejected.
+		const deniedTighten = await call(client, "suspend_agent", {
+			agent: "grok",
+		});
+		expect(deniedTighten.isError).toBe(true);
+		expect(deniedTighten.text).toMatch(/hourly mutation limit exceeded/i);
+
+		const deniedReview = await call(client, "review_description", {
+			agent: "grok",
+			submission_id: sub.data.pending.submissionId,
+			decision: "reject",
+		});
+		expect(deniedReview.isError).toBe(true);
+		expect(deniedReview.text).toMatch(/hourly mutation limit exceeded/i);
+
+		const deniedProposal = await call(client, "propose_category", {
+			name: "travel",
+			reason: "testing rate limit",
+		});
+		expect(deniedProposal.isError).toBe(true);
+		expect(deniedProposal.text).toMatch(/hourly mutation limit exceeded/i);
+
+		// Target state remained untouched by denied calls.
+		const grokRow = await db
+			.prepare("SELECT status, daily_question_limit FROM agents WHERE id = ?")
+			.bind(grok.id)
+			.first<{ status: string; daily_question_limit: number }>();
+		expect(grokRow).toEqual({ status: "active", daily_question_limit: 8 });
+
+		// Denied attempts are recorded in audit_log with outcome=denied and reason_code=admin_rate_limit_exceeded.
+		const auditAfterDeny = await queryAuditLog(db);
+		const rateDenied = auditAfterDeny.filter(
+			(entry) => entry.reasonCode === "admin_rate_limit_exceeded",
+		);
+		expect(rateDenied).toHaveLength(3);
+		for (const entry of rateDenied) {
+			expect(entry).toMatchObject({
+				eventType: "admin_tool_denied",
+				outcome: "denied",
+				fromAgentId: muse.id,
+				reasonCode: "admin_rate_limit_exceeded",
+			});
+		}
+
+		// Read-only tools are NOT blocked by the mutation limit.
+		expect((await call(client, "view_audit_log")).isError).toBe(false);
+		expect((await call(client, "list_proposals")).isError).toBe(false);
+		expect((await call(client, "list_pending_descriptions")).isError).toBe(
+			false,
+		);
+
+		// After the 1-hour rolling window elapses, mutations succeed again.
+		const laterClient = await connectAdmin(adminToken, {
+			env: limitedEnv,
+			now: T0 + 10 + HOUR_MS + 1,
+		});
+		const afterWindow = await call(laterClient, "suspend_agent", {
+			agent: "grok",
+		});
+		expect(afterWindow.isError).toBe(false);
+	});
+
+	it("enforces the default 60/hour mutation limit when ADMIN_BOT_HOURLY_MUTATION_LIMIT is unset", async () => {
+		const statements: D1PreparedStatement[] = [];
+		for (let i = 0; i < DEFAULT_ADMIN_BOT_HOURLY_MUTATION_LIMIT; i += 1) {
+			statements.push(
+				insertChangeLogEntry(db, {
+					occurredAt: T0 + i,
+					actorType: "admin_bot",
+					actorId: muse.id,
+					approverId: null,
+					action: "agent_updated",
+					targetType: "agent",
+					targetId: grok.id,
+					beforeJson: "{}",
+					afterJson: "{}",
+					revertedAt: null,
+				}),
+			);
+		}
+		await db.batch(statements);
+
+		const client = await connectAdmin(adminToken, {
+			now: T0 + DEFAULT_ADMIN_BOT_HOURLY_MUTATION_LIMIT + 1,
+		});
+		const denied = await call(client, "suspend_agent", { agent: "grok" });
+		expect(denied.isError).toBe(true);
+		expect(denied.text).toContain(
+			`(${DEFAULT_ADMIN_BOT_HOURLY_MUTATION_LIMIT} per hour)`,
+		);
+		expect((await call(client, "view_audit_log")).isError).toBe(false);
 	});
 });

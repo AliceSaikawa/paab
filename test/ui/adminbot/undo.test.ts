@@ -15,8 +15,15 @@ import {
 	designateAdminBot,
 	handleAdminMcpRequest,
 	issueAdminBotToken,
+	listPendingDescriptions,
+	rejectPendingDescription,
+	submitPendingDescription,
 } from "../../../src/adminbot";
-import { type AgentRow, agentFromRow } from "../../../src/db";
+import {
+	type AgentRow,
+	agentFromRow,
+	insertChangeLogEntry,
+} from "../../../src/db";
 import { checkQuestion } from "../../../src/policy";
 import {
 	handleAdminRequest,
@@ -494,5 +501,268 @@ describe("/admin/adminbot 1-click Undo UI", () => {
 			{ fetchJwks: session.fetcher },
 		);
 		expect(noCsrf.status).toBe(403);
+	});
+
+	it("paginates past 100 admin_bot changes and filters by unreverted=1 and target_type", async () => {
+		const owner = { actorType: "owner" as const, actorId: ADMIN_EMAIL };
+		const museReg = await registerAgent(db, {
+			name: "muse",
+			dailyQuestionLimit: 20,
+			actor: owner,
+			now: T0,
+		});
+		const grokReg = await registerAgent(db, {
+			name: "grok",
+			dailyQuestionLimit: 200,
+			actor: owner,
+			now: T0 + 1,
+		});
+		if (!museReg.ok || !grokReg.ok) throw new Error("register failed");
+		const muse = museReg.data.agent;
+		const grok = grokReg.data.agent;
+		const schedule = await seedCategory(db, { name: "schedule" });
+
+		// First bot change (#1): grant an allow rule (will be pushed past the first 100 entries).
+		const oldestGrant = await grantAllowRule(db, {
+			fromAgentId: muse.id,
+			toAgentId: grok.id,
+			categoryId: schedule.id,
+			actor: { actorType: "admin_bot", actorId: muse.id },
+			now: T0 + 10,
+		});
+		if (!oldestGrant.ok) throw new Error("oldest grant failed");
+
+		// Flood 104 more admin_bot changes (105 total), with 90 already reverted and 14 still un-reverted.
+		const flood: D1PreparedStatement[] = [];
+		for (let i = 0; i < 104; i += 1) {
+			flood.push(
+				insertChangeLogEntry(db, {
+					occurredAt: T0 + 20 + i,
+					actorType: "admin_bot",
+					actorId: muse.id,
+					approverId: null,
+					action: "agent_updated",
+					targetType: "agent",
+					targetId: grok.id,
+					beforeJson: JSON.stringify({
+						id: grok.id,
+						name: "grok",
+						dailyQuestionLimit: 200 - i,
+					}),
+					afterJson: JSON.stringify({
+						id: grok.id,
+						name: "grok",
+						dailyQuestionLimit: 199 - i,
+					}),
+					revertedAt: i >= 14 ? T0 + 500 : null,
+				}),
+			);
+		}
+		await db.batch(flood);
+
+		const { session, html: page1Html } = await openAdminBotSession(T0 + 1000);
+		expect(page1Html).toContain("未取消の変更: <strong>15</strong> 件");
+		expect(page1Html).toContain("表示中: 100 件");
+		expect(page1Html).toContain("古い変更を表示");
+		expect(page1Html).not.toContain(
+			`/admin/adminbot/changes/${oldestGrant.changeId}/revert`,
+		);
+
+		// Follow the before_id link to page 2 and undo the 105th oldest change in 1 click.
+		const nextLinkMatch =
+			/href="(\/admin\/adminbot\?[^"]*before_id=\d+[^"]*)"/.exec(page1Html);
+		expect(nextLinkMatch?.[1]).toBeTruthy();
+		const nextHref = (nextLinkMatch?.[1] ?? "").replaceAll("&amp;", "&");
+		const page2 = await adminGet(session, nextHref, T0 + 1001);
+		expect(page2.response.status).toBe(200);
+		expect(page2.html).toContain("表示中: 5 件");
+		expect(page2.html).toContain("最新の変更へ");
+		expect(page2.html).toContain(
+			`/admin/adminbot/changes/${oldestGrant.changeId}/revert`,
+		);
+
+		// Filtering by unreverted=1 surfaces all 15 un-reverted entries (including the oldest grant) on page 1.
+		const unrevertedPage = await adminGet(
+			session,
+			"/admin/adminbot?unreverted=1",
+			T0 + 1002,
+		);
+		expect(unrevertedPage.response.status).toBe(200);
+		expect(unrevertedPage.html).toContain("表示中: 15 件");
+		expect(unrevertedPage.html).toContain(
+			`/admin/adminbot/changes/${oldestGrant.changeId}/revert`,
+		);
+
+		// Filtering by target_type=allow_rule isolates the allow_rule entry.
+		const ruleOnlyPage = await adminGet(
+			session,
+			"/admin/adminbot?target_type=allow_rule",
+			T0 + 1003,
+		);
+		expect(ruleOnlyPage.response.status).toBe(200);
+		expect(ruleOnlyPage.html).toContain("表示中: 1 件");
+		expect(ruleOnlyPage.html).toContain(
+			`/admin/adminbot/changes/${oldestGrant.changeId}/revert`,
+		);
+
+		// Invalid query parameters return 400 with flash error.
+		expect(
+			(
+				await adminGet(
+					session,
+					"/admin/adminbot?target_type=invalid",
+					T0 + 1004,
+				)
+			).response.status,
+		).toBe(400);
+		expect(
+			(await adminGet(session, "/admin/adminbot?before_id=abc", T0 + 1005))
+				.response.status,
+		).toBe(400);
+
+		// Revert that 105th oldest allow_rule_granted change in 1 click.
+		const undoOldest = await adminPost(
+			session,
+			`/admin/adminbot/changes/${oldestGrant.changeId}/revert`,
+			{ filter_unreverted: "1" },
+			T0 + 1006,
+		);
+		expect(undoOldest.response.status).toBe(200);
+		expect(undoOldest.html).toContain(
+			`変更 #${oldestGrant.changeId}（許可ルール追加）を元に戻しました`,
+		);
+		expect(
+			(
+				await checkQuestion(db, {
+					fromAgentId: muse.id,
+					toAgentName: "grok",
+					categoryName: "schedule",
+					now: T0 + 1007,
+				})
+			).allowed,
+		).toBe(false);
+	});
+
+	it("renders 1-click cascade rollback for stacked changes and 1-click undo for description_rejected", async () => {
+		const owner = { actorType: "owner" as const, actorId: ADMIN_EMAIL };
+		const museReg = await registerAgent(db, {
+			name: "muse",
+			dailyQuestionLimit: 20,
+			actor: owner,
+			now: T0,
+		});
+		const grokReg = await registerAgent(db, {
+			name: "grok",
+			dailyQuestionLimit: 30,
+			actor: owner,
+			now: T0 + 1,
+		});
+		if (!museReg.ok || !grokReg.ok) throw new Error("register failed");
+		const muse = museReg.data.agent;
+		const grok = grokReg.data.agent;
+		const botActor = { actorType: "admin_bot" as const, actorId: muse.id };
+
+		const step1 = await updateAgent(db, {
+			agentId: grok.id,
+			dailyQuestionLimit: 20,
+			actor: botActor,
+			now: T0 + 10,
+		});
+		const step2 = await updateAgent(db, {
+			agentId: grok.id,
+			dailyQuestionLimit: 10,
+			actor: botActor,
+			now: T0 + 11,
+		});
+		const step3 = await updateAgent(db, {
+			agentId: grok.id,
+			dailyQuestionLimit: 5,
+			actor: botActor,
+			now: T0 + 12,
+		});
+		const sub = await submitPendingDescription(db, {
+			agentId: grok.id,
+			description: "restorable rejected bio",
+			now: T0 + 13,
+		});
+		if (
+			!step1.ok ||
+			step1.changeId === null ||
+			!step2.ok ||
+			step2.changeId === null ||
+			!step3.ok ||
+			step3.changeId === null ||
+			!sub.ok
+		) {
+			throw new Error("setup failed");
+		}
+		const rejected = await rejectPendingDescription(db, {
+			agentId: grok.id,
+			expectedSubmissionId: sub.data.pending.submissionId,
+			actor: botActor,
+			now: T0 + 14,
+		});
+		if (!rejected.ok) throw new Error("reject failed");
+
+		const { session, html } = await openAdminBotSession(T0 + 20);
+		expect(html).toContain("以降もまとめて元に戻す（3件）");
+		expect(html).toContain('name="cascade" value="1"');
+		expect(html).toContain(
+			`/admin/adminbot/changes/${rejected.changeId}/revert`,
+		);
+		expect(html).not.toContain("取消不可");
+
+		// 1-click cascade revert from step1 restores limit to 30 and reverts all 3 limit changes.
+		const cascadeRes = await adminPost(
+			session,
+			`/admin/adminbot/changes/${step1.changeId}/revert`,
+			{ cascade: "1" },
+			T0 + 21,
+		);
+		expect(cascadeRes.response.status).toBe(200);
+		expect(cascadeRes.html).toContain("3 件の変更をまとめて元に戻しました");
+		expect((await loadAgent(grok.id)).dailyQuestionLimit).toBe(30);
+
+		// 1-click undo of description_rejected restores the pending description row.
+		const restoreDescRes = await adminPost(
+			session,
+			`/admin/adminbot/changes/${rejected.changeId}/revert`,
+			{},
+			T0 + 22,
+		);
+		expect(restoreDescRes.response.status).toBe(200);
+		expect(restoreDescRes.html).toContain(
+			`変更 #${rejected.changeId}（説明文却下）を元に戻しました`,
+		);
+		const pending = await listPendingDescriptions(db);
+		expect(pending).toHaveLength(1);
+		expect(pending[0]?.pendingDescription).toBe("restorable rejected bio");
+
+		// When an owner change intervenes on the same field, the UI marks the older bot change as conflicted and POST cascade=1 returns 409.
+		const botChange = await updateAgent(db, {
+			agentId: grok.id,
+			dailyQuestionLimit: 12,
+			actor: botActor,
+			now: T0 + 30,
+		});
+		await updateAgent(db, {
+			agentId: grok.id,
+			dailyQuestionLimit: 25,
+			actor: owner,
+			now: T0 + 31,
+		});
+		if (!botChange.ok || botChange.changeId === null) {
+			throw new Error("botChange failed");
+		}
+		const afterOwnerPage = await adminGet(session, "/admin/adminbot", T0 + 32);
+		expect(afterOwnerPage.html).toContain("取消不可（競合あり）");
+		const blockedCascade = await adminPost(
+			session,
+			`/admin/adminbot/changes/${botChange.changeId}/revert`,
+			{ cascade: "1" },
+			T0 + 33,
+		);
+		expect(blockedCascade.response.status).toBe(409);
+		expect((await loadAgent(grok.id)).dailyQuestionLimit).toBe(25);
 	});
 });

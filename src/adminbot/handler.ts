@@ -1,7 +1,11 @@
 import { createMcpHandler } from "@modelcontextprotocol/server";
 import { recordAuditEvent } from "../audit";
 import { auditReasonCode, authenticate } from "../auth";
-import { auditBodyConfig, type McpEnv } from "../mcp/config";
+import {
+	adminBotHourlyMutationLimit,
+	auditBodyConfig,
+	type McpEnv,
+} from "../mcp/config";
 import type { UnixMillis } from "../types";
 import { getAdminBotConfig } from "./config";
 import { createAdminMcpServer } from "./server";
@@ -65,6 +69,7 @@ export async function handleAdminMcpRequest(
 		config,
 		audit,
 		now,
+		hourlyMutationLimit: adminBotHourlyMutationLimit(env),
 	};
 	return createMcpHandler(() => createAdminMcpServer(ctx)).fetch(request);
 }

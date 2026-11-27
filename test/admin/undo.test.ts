@@ -5,6 +5,7 @@ import {
 	deleteAgent,
 	deleteCategory,
 	grantAllowRule,
+	inspectAdminBotChangesUndoState,
 	listAdminBotChanges,
 	queryChangeLog,
 	registerAgent,
@@ -16,10 +17,17 @@ import {
 } from "../../src/admin";
 import {
 	approvePendingDescription,
+	listPendingDescriptions,
 	rejectPendingDescription,
 	submitPendingDescription,
 } from "../../src/adminbot";
-import { type AgentRow, agentFromRow } from "../../src/db";
+import {
+	type AgentRow,
+	agentFromRow,
+	insertChangeLogEntry,
+	type PendingDescriptionRow,
+	pendingDescriptionFromRow,
+} from "../../src/db";
 import { checkQuestion } from "../../src/policy";
 import { createTestDb } from "../helpers/db";
 import { seedAgent, seedCategory, T0 } from "../helpers/fixtures";
@@ -39,6 +47,14 @@ async function loadAgent(id: string) {
 		.bind(id)
 		.first<AgentRow>();
 	return row ? agentFromRow(row) : null;
+}
+
+async function loadPendingDescription(agentId: string) {
+	const row = await db
+		.prepare("SELECT * FROM pending_descriptions WHERE agent_id = ?")
+		.bind(agentId)
+		.first<PendingDescriptionRow>();
+	return row ? pendingDescriptionFromRow(row) : null;
 }
 
 describe("listAdminBotChanges", () => {
@@ -513,7 +529,7 @@ describe("revertAdminBotChange", () => {
 		).toMatchObject({ ok: false, code: "invalid_input" });
 	});
 
-	it("reverts description_approved without clobbering unrelated agent fields, detects newer description conflicts, and treats description_rejected as non-undoable", async () => {
+	it("reverts description_approved without clobbering unrelated agent fields and detects newer description conflicts", async () => {
 		const grok = await seedAgent(db, {
 			name: "grok",
 			description: "original bio",
@@ -557,15 +573,6 @@ describe("revertAdminBotChange", () => {
 			now: T0 + 6,
 		});
 		if (!rejected.ok) throw new Error("reject failed");
-
-		// description_rejected is not undoable.
-		expect(
-			await revertAdminBotChange(db, {
-				changeId: rejected.changeId,
-				actor: OWNER,
-				now: T0 + 7,
-			}),
-		).toMatchObject({ ok: false, code: "not_undoable" });
 
 		// Reverting description_approved restores ONLY description and preserves status + dailyQuestionLimit.
 		const reverted1 = await revertAdminBotChange(db, {
@@ -651,5 +658,434 @@ describe("revertAdminBotChange", () => {
 			}),
 		).toMatchObject({ ok: true });
 		expect((await loadAgent(grok.id))?.description).toBe("original bio");
+	});
+
+	it("reverts description_rejected back into pending_descriptions and refuses when a newer submission exists or the agent was deleted", async () => {
+		const grok = await seedAgent(db, {
+			name: "grok",
+			description: "original bio",
+		});
+
+		const sub = await submitPendingDescription(db, {
+			agentId: grok.id,
+			description: "candidate bio to restore",
+			now: T0 + 1,
+		});
+		if (!sub.ok) throw new Error("submit failed");
+		const rejected = await rejectPendingDescription(db, {
+			agentId: grok.id,
+			expectedSubmissionId: sub.data.pending.submissionId,
+			actor: BOT,
+			now: T0 + 2,
+		});
+		if (!rejected.ok) throw new Error("reject failed");
+		expect(await loadPendingDescription(grok.id)).toBeNull();
+
+		// Unrelated agent changes must not block reverting description_rejected.
+		await suspendAgent(db, { agentId: grok.id, actor: OWNER, now: T0 + 3 });
+
+		const restored = await revertAdminBotChange(db, {
+			changeId: rejected.changeId,
+			actor: OWNER,
+			now: T0 + 4,
+		});
+		expect(restored).toEqual({
+			ok: true,
+			data: {
+				revertedChangeId: rejected.changeId,
+				action: "description_rejected",
+				targetType: "description",
+				targetId: grok.id,
+			},
+			changeId: expect.any(Number),
+		});
+		expect(await loadPendingDescription(grok.id)).toEqual({
+			agentId: grok.id,
+			submissionId: sub.data.pending.submissionId,
+			description: "candidate bio to restore",
+			submittedAt: T0 + 1,
+		});
+		expect((await loadAgent(grok.id))?.description).toBe("original bio");
+		expect(
+			(await listPendingDescriptions(db)).map((p) => p.pendingDescription),
+		).toEqual(["candidate bio to restore"]);
+
+		// Double-undo is rejected.
+		expect(
+			await revertAdminBotChange(db, {
+				changeId: rejected.changeId,
+				actor: OWNER,
+				now: T0 + 5,
+			}),
+		).toMatchObject({ ok: false, code: "already_reverted" });
+
+		// Reject again, then submit a newer draft: undo must fail with conflict_newer_change and preserve the new draft.
+		const rejected2 = await rejectPendingDescription(db, {
+			agentId: grok.id,
+			expectedSubmissionId: sub.data.pending.submissionId,
+			actor: BOT,
+			now: T0 + 6,
+		});
+		if (!rejected2.ok) throw new Error("reject 2 failed");
+		const newerSub = await submitPendingDescription(db, {
+			agentId: grok.id,
+			description: "freshly submitted draft",
+			now: T0 + 7,
+		});
+		if (!newerSub.ok) throw new Error("newer submit failed");
+
+		expect(
+			await revertAdminBotChange(db, {
+				changeId: rejected2.changeId,
+				actor: OWNER,
+				now: T0 + 8,
+			}),
+		).toMatchObject({ ok: false, code: "conflict_newer_change" });
+		expect((await loadPendingDescription(grok.id))?.description).toBe(
+			"freshly submitted draft",
+		);
+
+		// Legacy snapshot (without submissionId / submittedAt) still restores cleanly.
+		const alice = await seedAgent(db, { name: "alice" });
+		const legacyInsert = await insertChangeLogEntry(db, {
+			occurredAt: T0 + 10,
+			actorType: "admin_bot",
+			actorId: BOT.actorId,
+			approverId: null,
+			action: "description_rejected",
+			targetType: "description",
+			targetId: alice.id,
+			beforeJson: JSON.stringify({
+				agentId: alice.id,
+				name: "alice",
+				description: "legacy rejected draft",
+			}),
+			afterJson: null,
+			revertedAt: null,
+		}).run();
+		const legacyChangeId = Number(legacyInsert.meta.last_row_id);
+		const legacyRestore = await revertAdminBotChange(db, {
+			changeId: legacyChangeId,
+			actor: OWNER,
+			now: T0 + 11,
+		});
+		expect(legacyRestore.ok).toBe(true);
+		expect(await loadPendingDescription(alice.id)).toMatchObject({
+			agentId: alice.id,
+			description: "legacy rejected draft",
+			submittedAt: T0 + 10,
+		});
+
+		// Deleted agent fails cleanly with not_found.
+		const bob = await seedAgent(db, { name: "bob" });
+		const bobSub = await submitPendingDescription(db, {
+			agentId: bob.id,
+			description: "bob draft",
+			now: T0 + 12,
+		});
+		if (!bobSub.ok) throw new Error("bob submit failed");
+		const bobRejected = await rejectPendingDescription(db, {
+			agentId: bob.id,
+			expectedSubmissionId: bobSub.data.pending.submissionId,
+			actor: BOT,
+			now: T0 + 13,
+		});
+		if (!bobRejected.ok) throw new Error("bob reject failed");
+		await deleteAgent(db, { agentId: bob.id, actor: OWNER, now: T0 + 14 });
+		expect(
+			await revertAdminBotChange(db, {
+				changeId: bobRejected.changeId,
+				actor: OWNER,
+				now: T0 + 15,
+			}),
+		).toMatchObject({ ok: false, code: "not_found" });
+	});
+
+	it("supports 1-operation cascade undo for stacked admin_bot changes while refusing when an owner change intervened", async () => {
+		const muse = await seedAgent(db, { name: "muse" });
+		const grok = await seedAgent(db, {
+			name: "grok",
+			dailyQuestionLimit: 20,
+			status: "active",
+		});
+
+		const c1 = await updateAgent(db, {
+			agentId: grok.id,
+			dailyQuestionLimit: 15,
+			actor: BOT,
+			now: T0 + 1,
+		});
+		// Unrelated owner change on a different field (status) must NOT block limit cascade.
+		await suspendAgent(db, { agentId: grok.id, actor: OWNER, now: T0 + 2 });
+		const c2 = await updateAgent(db, {
+			agentId: grok.id,
+			dailyQuestionLimit: 10,
+			actor: BOT,
+			now: T0 + 3,
+		});
+		const c3 = await updateAgent(db, {
+			agentId: grok.id,
+			dailyQuestionLimit: 5,
+			actor: BOT,
+			now: T0 + 4,
+		});
+		if (
+			!c1.ok ||
+			c1.changeId === null ||
+			!c2.ok ||
+			c2.changeId === null ||
+			!c3.ok ||
+			c3.changeId === null
+		) {
+			throw new Error("stacked updates failed");
+		}
+
+		const botEntries = await listAdminBotChanges(db);
+		const availability = await inspectAdminBotChangesUndoState(db, botEntries);
+		expect(availability.get(c3.changeId)).toEqual({ kind: "ready" });
+		expect(availability.get(c2.changeId)).toEqual({
+			kind: "cascade",
+			count: 2,
+			blockerIds: [c3.changeId],
+		});
+		expect(availability.get(c1.changeId)).toEqual({
+			kind: "cascade",
+			count: 3,
+			blockerIds: [c2.changeId, c3.changeId],
+		});
+
+		// Default single undo still returns conflict_newer_change.
+		expect(
+			await revertAdminBotChange(db, {
+				changeId: c1.changeId,
+				actor: OWNER,
+				now: T0 + 5,
+			}),
+		).toMatchObject({ ok: false, code: "conflict_newer_change" });
+
+		// Cascade undo reverts c3, c2, c1 in one operation and keeps owner's suspension intact.
+		const cascaded = await revertAdminBotChange(db, {
+			changeId: c1.changeId,
+			actor: OWNER,
+			now: T0 + 6,
+			cascade: true,
+		});
+		expect(cascaded).toEqual({
+			ok: true,
+			data: {
+				revertedChangeId: c1.changeId,
+				action: "agent_updated",
+				targetType: "agent",
+				targetId: grok.id,
+				revertedChangeIds: [c3.changeId, c2.changeId, c1.changeId],
+			},
+			changeId: expect.any(Number),
+		});
+		expect(await loadAgent(grok.id)).toMatchObject({
+			dailyQuestionLimit: 20,
+			status: "suspended",
+		});
+
+		const logsAfterCascade = await queryChangeLog(db);
+		for (const id of [c1.changeId, c2.changeId, c3.changeId]) {
+			expect(logsAfterCascade.find((e) => e.id === id)?.revertedAt).toBe(
+				T0 + 6,
+			);
+		}
+		expect(
+			logsAfterCascade.filter((e) => e.action === "change_reverted"),
+		).toHaveLength(3);
+
+		// Owner intervening on the SAME field blocks even cascade undo.
+		const b1 = await updateAgent(db, {
+			agentId: grok.id,
+			dailyQuestionLimit: 12,
+			actor: BOT,
+			now: T0 + 10,
+		});
+		await updateAgent(db, {
+			agentId: grok.id,
+			dailyQuestionLimit: 30,
+			actor: OWNER,
+			now: T0 + 11,
+		});
+		const b2 = await updateAgent(db, {
+			agentId: grok.id,
+			dailyQuestionLimit: 8,
+			actor: BOT,
+			now: T0 + 12,
+		});
+		if (!b1.ok || b1.changeId === null || !b2.ok || b2.changeId === null) {
+			throw new Error("owner-intervened updates failed");
+		}
+		const afterOwner = await inspectAdminBotChangesUndoState(
+			db,
+			await listAdminBotChanges(db),
+		);
+		expect(afterOwner.get(b1.changeId)?.kind).toBe("blocked");
+		expect(
+			await revertAdminBotChange(db, {
+				changeId: b1.changeId,
+				actor: OWNER,
+				now: T0 + 13,
+				cascade: true,
+			}),
+		).toMatchObject({ ok: false, code: "conflict_newer_change" });
+		expect((await loadAgent(grok.id))?.dailyQuestionLimit).toBe(8);
+
+		// Cascade undo for category_created + admin_bot allow_rule_granted.
+		const cat = await createCategory(db, {
+			name: "travel",
+			actor: BOT,
+			now: T0 + 20,
+		});
+		if (!cat.ok) throw new Error("createCategory failed");
+		const rule = await grantAllowRule(db, {
+			fromAgentId: muse.id,
+			toAgentId: grok.id,
+			categoryId: cat.data.category.id,
+			actor: BOT,
+			now: T0 + 21,
+		});
+		if (!rule.ok) throw new Error("grant failed");
+
+		const catCascade = await revertAdminBotChange(db, {
+			changeId: cat.changeId,
+			actor: OWNER,
+			now: T0 + 22,
+			cascade: true,
+		});
+		expect(catCascade).toMatchObject({
+			ok: true,
+			data: {
+				revertedChangeId: cat.changeId,
+				revertedChangeIds: [rule.changeId, cat.changeId],
+			},
+		});
+		expect(
+			await db
+				.prepare("SELECT id FROM categories WHERE id = ?")
+				.bind(cat.data.category.id)
+				.first(),
+		).toBeNull();
+
+		// Cascade undo for allow_rule grant -> revoke (net no-op on allow_rules).
+		const work = await seedCategory(db, { name: "work" });
+		const g1 = await grantAllowRule(db, {
+			fromAgentId: muse.id,
+			toAgentId: grok.id,
+			categoryId: work.id,
+			actor: BOT,
+			now: T0 + 30,
+		});
+		const r1 = await revokeAllowRule(db, {
+			fromAgentId: muse.id,
+			toAgentId: grok.id,
+			categoryId: work.id,
+			actor: BOT,
+			now: T0 + 31,
+		});
+		if (!g1.ok || !r1.ok) throw new Error("grant/revoke failed");
+		const ruleCascade = await revertAdminBotChange(db, {
+			changeId: g1.changeId,
+			actor: OWNER,
+			now: T0 + 32,
+			cascade: true,
+		});
+		expect(ruleCascade).toMatchObject({
+			ok: true,
+			data: {
+				revertedChangeId: g1.changeId,
+				revertedChangeIds: [r1.changeId, g1.changeId],
+			},
+		});
+		expect(
+			(
+				await checkQuestion(db, {
+					fromAgentId: muse.id,
+					toAgentName: "grok",
+					categoryName: "work",
+					now: T0 + 33,
+				})
+			).allowed,
+		).toBe(false);
+
+		// Owner rule on a bot-created category refuses category cascade.
+		const cat2 = await createCategory(db, {
+			name: "owner-used",
+			actor: BOT,
+			now: T0 + 40,
+		});
+		if (!cat2.ok) throw new Error("cat2 failed");
+		await grantAllowRule(db, {
+			fromAgentId: muse.id,
+			toAgentId: grok.id,
+			categoryId: cat2.data.category.id,
+			actor: OWNER,
+			now: T0 + 41,
+		});
+		expect(
+			await revertAdminBotChange(db, {
+				changeId: cat2.changeId,
+				actor: OWNER,
+				now: T0 + 42,
+				cascade: true,
+			}),
+		).toMatchObject({ ok: false, code: "conflict_newer_change" });
+
+		// Cascade undo for description_rejected followed by a newer admin_bot description_approved.
+		const d1Sub = await submitPendingDescription(db, {
+			agentId: grok.id,
+			description: "draft 1 rejected",
+			now: T0 + 50,
+		});
+		if (!d1Sub.ok) throw new Error("d1 submit failed");
+		const d1Rej = await rejectPendingDescription(db, {
+			agentId: grok.id,
+			expectedSubmissionId: d1Sub.data.pending.submissionId,
+			actor: BOT,
+			now: T0 + 51,
+		});
+		const d2Sub = await submitPendingDescription(db, {
+			agentId: grok.id,
+			description: "draft 2 approved",
+			now: T0 + 52,
+		});
+		if (!d1Rej.ok || !d2Sub.ok) throw new Error("d1/d2 setup failed");
+		const d2App = await approvePendingDescription(db, {
+			agentId: grok.id,
+			expectedSubmissionId: d2Sub.data.pending.submissionId,
+			actor: BOT,
+			now: T0 + 53,
+		});
+		if (!d2App.ok) throw new Error("d2 approve failed");
+
+		expect(
+			await revertAdminBotChange(db, {
+				changeId: d1Rej.changeId,
+				actor: OWNER,
+				now: T0 + 54,
+			}),
+		).toMatchObject({ ok: false, code: "conflict_newer_change" });
+
+		const descCascade = await revertAdminBotChange(db, {
+			changeId: d1Rej.changeId,
+			actor: OWNER,
+			now: T0 + 55,
+			cascade: true,
+		});
+		expect(descCascade).toMatchObject({
+			ok: true,
+			data: {
+				revertedChangeId: d1Rej.changeId,
+				revertedChangeIds: [d2App.changeId, d1Rej.changeId],
+			},
+		});
+		expect((await loadAgent(grok.id))?.description).toBe("");
+		expect(await loadPendingDescription(grok.id)).toMatchObject({
+			agentId: grok.id,
+			submissionId: d1Sub.data.pending.submissionId,
+			description: "draft 1 rejected",
+		});
 	});
 });
