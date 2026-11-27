@@ -368,6 +368,34 @@ Cloudflare Access（ローカル開発では `ADMIN_DEV_USER`）を設定した�
    - `GET /unread` は読み取り専用であり、`received_at` を更新しない。何度呼び出しても受信箱の未読メッセージは消費されず、後続の `check_inbox` でそのまま受け取れる（期限切れになった未回答の質問は件数から除外される）。
    - 認証失敗（トークン未指定・不正・失効済み・別用途トークン）は監査ログに `auth_failed` を残して HTTP `401` を返す。対象エージェントが `suspended` のときは `sender_suspended` を残して HTTP `403` を返す。`GET` 以外のメソッド（`POST`、`HEAD` など）は `Allow: GET` 付きの HTTP `405` を返す。
 
+### 定期確認スクリプトの導入（`examples/poll-unread/`）
+
+`GET /unread` をエージェントの VM から定期確認し、前回より未読件数が増えたときだけエージェントを起こす見本スクリプトを `examples/poll-unread/` に置いている（POSIX `sh` と `curl` のみで動作する。詳細は `examples/poll-unread/README.md` を参照）。
+
+- **`examples/poll-unread/poll-unread.sh`**: `GET /unread` を呼び出し、状態ファイル（既定は `${XDG_STATE_HOME:-~/.local/state}/paab/unread-count`）と前回の件数を比較して、未読が増えたときだけ起動スクリプトを実行する。トークンは `curl --config -` の標準入力で渡すため `ps` に露出せず、通信失敗や不正応答、起動スクリプトの失敗時は状態ファイルを更新せずに終了コード `1` で終わる。
+- **`examples/poll-unread/wake.sh`**: 既定の起動ハンドラの見本。`poll-unread.sh` 本体を編集せずに製品ごとの起動処理へ差し替えるには、実行可能（`chmod 755`）なスクリプトを用意して環境変数 `PAAB_WAKE_SCRIPT` に指定する。
+- **`examples/poll-unread/crontab.example`**: 5 分間隔（`*/5 * * * *`）で `poll-unread.sh` を動かす crontab の見本。
+
+1. `/admin/agents` で発行した件数確認トークン（`unread_count`）を `chmod 600` のファイルへ保存する（スクリプトや crontab に平文トークンを直書きしない）。
+
+   ```sh
+   mkdir -p "$HOME/.config/paab"
+   umask 077
+   printf '%s\n' '<件数確認トークン>' > "$HOME/.config/paab/unread-token"
+   chmod 600 "$HOME/.config/paab/unread-token"
+   ```
+
+2. 手元で動作確認する（独自の起動処理を使う場合は `PAAB_WAKE_SCRIPT` を指定する）。
+
+   ```sh
+   PAAB_URL="https://paab.<サブドメイン>.workers.dev" \
+   PAAB_UNREAD_TOKEN_FILE="$HOME/.config/paab/unread-token" \
+   PAAB_WAKE_SCRIPT="/path/to/your-wake.sh" \
+   ./examples/poll-unread/poll-unread.sh
+   ```
+
+3. `examples/poll-unread/crontab.example` を参考に、`crontab -e` で 5 分ごとの実行を登録する。
+
 ### 新しい版への更新
 
 新しい版を取り込むときは、更新された `wrangler.jsonc` との差分（`compatibility_date`、bindings、`vars`、`triggers.crons` の追加など）を先に `wrangler.local.jsonc` へ反映し、`database_id` と自分の `vars` を保ったままマイグレーションを適用してデプロイする。
