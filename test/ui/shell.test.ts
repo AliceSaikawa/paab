@@ -754,28 +754,20 @@ describe("CSRF protection, routing, and security headers", () => {
 		expect(timeHtml.html).toContain("<time datetime=");
 	});
 
-	it("serves all implemented nav tabs with 200 and returns 404 for unknown admin paths", async () => {
+	it("serves all nav tabs with 200 and returns 404 for unknown admin paths", async () => {
 		await createTestDb();
 
-		const proposalsRes = await handleAdminRequest(
-			adminGet("https://paab.test/admin/proposals"),
-			devEnv(),
-			NOW_MS,
-		);
-		expect(proposalsRes.status).toBe(200);
-		expect(await proposalsRes.text()).toContain(
-			'href="/admin/proposals" aria-current="page"',
-		);
-
-		const descriptionsRes = await handleAdminRequest(
-			adminGet("https://paab.test/admin/descriptions"),
-			devEnv(),
-			NOW_MS,
-		);
-		expect(descriptionsRes.status).toBe(200);
-		expect(await descriptionsRes.text()).toContain(
-			'href="/admin/descriptions" aria-current="page"',
-		);
+		for (const tab of ADMIN_NAV_TABS) {
+			const res = await handleAdminRequest(
+				adminGet(`https://paab.test${tab.href}`),
+				devEnv(),
+				NOW_MS,
+			);
+			expect(res.status, tab.href).toBe(200);
+			expect(await res.text(), tab.href).toContain(
+				`href="${tab.href}" aria-current="page"`,
+			);
+		}
 
 		const notFoundRes = await handleAdminRequest(
 			adminGet("https://paab.test/admin/nonexistent"),

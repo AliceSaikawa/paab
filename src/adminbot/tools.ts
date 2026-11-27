@@ -1,5 +1,6 @@
 import { z } from "zod";
 import {
+	AUDIT_WRITE_CHUNK,
 	type AuditBodyConfig,
 	type AuditEvent,
 	type AuditLogFilter,
@@ -21,6 +22,13 @@ import {
 import { DESCRIPTION_TOOLS } from "./description-tools";
 import { PROPOSAL_TOOLS } from "./proposal-tools";
 import { TIGHTENING_TOOLS } from "./tightening";
+
+/**
+ * Maximum entries returned per `view_audit_log` page when message bodies are
+ * included, matching `AUDIT_WRITE_CHUNK` so all `admin_body_read` rows are
+ * written in a single D1 batch.
+ */
+export const MAX_ADMIN_BODY_AUDIT_LIMIT = AUDIT_WRITE_CHUNK;
 
 /** Request-scoped context passed to every `/mcp/admin` tool. */
 export interface AdminMcpContext {
@@ -248,7 +256,7 @@ const viewAuditLog = defineAdminTool({
 			.max(MAX_AUDIT_QUERY_LIMIT)
 			.optional()
 			.describe(
-				`Maximum entries to return (1-${MAX_AUDIT_QUERY_LIMIT}, default ${DEFAULT_AUDIT_QUERY_LIMIT}).`,
+				`Maximum entries to return (1-${MAX_AUDIT_QUERY_LIMIT}, default ${DEFAULT_AUDIT_QUERY_LIMIT}; capped at ${MAX_ADMIN_BODY_AUDIT_LIMIT} when message bodies are included).`,
 			),
 		before_id: z
 			.number()
@@ -318,7 +326,10 @@ const viewAuditLog = defineAdminTool({
 		const includeBody =
 			ctx.config.readBodies && bodyRecordingOn && args.include_body !== false;
 
-		const limit = args.limit ?? DEFAULT_AUDIT_QUERY_LIMIT;
+		const requestedLimit = args.limit ?? DEFAULT_AUDIT_QUERY_LIMIT;
+		const limit = includeBody
+			? Math.min(requestedLimit, MAX_ADMIN_BODY_AUDIT_LIMIT)
+			: requestedLimit;
 		const order = args.oldest === true ? "asc" : "desc";
 		const baseFilter: AuditLogFilter = {
 			occurredFrom,
@@ -374,7 +385,16 @@ const viewAuditLog = defineAdminTool({
 					messageId: entry.messageId ?? `audit:${entry.id}`,
 				}));
 			if (bodyReadEvents.length > 0) {
-				await recordAuditEvents(ctx.db, ctx.audit, bodyReadEvents);
+				const recorded = await recordAuditEvents(
+					ctx.db,
+					ctx.audit,
+					bodyReadEvents,
+				);
+				if (!recorded) {
+					return adminToolFail(
+						"failed to record admin_body_read audit log; message bodies were withheld",
+					);
+				}
 			}
 		}
 

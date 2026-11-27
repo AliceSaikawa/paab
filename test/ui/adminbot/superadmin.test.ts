@@ -18,12 +18,14 @@ import {
 	setAdminBotReadBodies,
 	setAdminBotSuperadmin,
 } from "../../../src/adminbot";
+import type { ChangeLogEntry } from "../../../src/types";
 import {
 	handleAdminRequest,
 	type JwkKey,
 	type JwksFetcher,
 	type UiEnv,
 } from "../../../src/ui";
+import { describeChangeBeforeAfter } from "../../../src/ui/rules/render";
 import { createTestDb } from "../../helpers/db";
 import { DAY_MS, HOUR_MS, seedCategory, T0 } from "../../helpers/fixtures";
 import { call } from "../../mcp/support";
@@ -619,5 +621,66 @@ describe("/admin/adminbot superadmin switch UI", () => {
 		);
 		expect(noCsrf.status).toBe(403);
 		expect((await getAdminBotConfig(db)).superadminUntil).toBeNull();
+	});
+
+	it("renders superadmin status in change_log relative to entry.occurredAt", () => {
+		const names = {
+			agents: new Map([["agent-1", "muse"]]),
+			categories: new Map<string, string>(),
+		};
+		const baseEntry: Omit<
+			ChangeLogEntry,
+			"occurredAt" | "action" | "beforeJson" | "afterJson"
+		> = {
+			id: 1,
+			actorType: "owner",
+			actorId: ADMIN_EMAIL,
+			approverId: null,
+			targetType: "admin_bot",
+			targetId: "agent-1",
+			revertedAt: null,
+		};
+
+		const expiredToActive: ChangeLogEntry = {
+			...baseEntry,
+			occurredAt: T0 + 10 * DAY_MS,
+			action: "admin_bot_switches_updated",
+			beforeJson: JSON.stringify({
+				agentId: "agent-1",
+				readBodies: false,
+				superadminUntil: T0 + 7 * DAY_MS,
+				updatedAt: T0,
+			}),
+			afterJson: JSON.stringify({
+				agentId: "agent-1",
+				readBodies: false,
+				superadminUntil: T0 + 17 * DAY_MS,
+				updatedAt: T0 + 10 * DAY_MS,
+			}),
+		};
+		expect(describeChangeBeforeAfter(expiredToActive, names)).toBe(
+			"変更前: muse（最高管理者=期限切れ） / 変更後: muse（最高管理者=有効）",
+		);
+
+		const exactBoundaryToPermanent: ChangeLogEntry = {
+			...baseEntry,
+			occurredAt: T0 + 7 * DAY_MS,
+			action: "admin_bot_switches_updated",
+			beforeJson: JSON.stringify({
+				agentId: "agent-1",
+				readBodies: true,
+				superadminUntil: T0 + 7 * DAY_MS,
+				updatedAt: T0,
+			}),
+			afterJson: JSON.stringify({
+				agentId: "agent-1",
+				readBodies: true,
+				superadminUntil: SUPERADMIN_PERMANENT,
+				updatedAt: T0 + 7 * DAY_MS,
+			}),
+		};
+		expect(describeChangeBeforeAfter(exactBoundaryToPermanent, names)).toBe(
+			"変更前: muse（本文閲覧=ON・最高管理者=期限切れ） / 変更後: muse（本文閲覧=ON・最高管理者=無期限）",
+		);
 	});
 });

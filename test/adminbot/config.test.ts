@@ -11,6 +11,8 @@ import {
 	getAdminBotConfig,
 	issueAdminBotToken,
 	revokeAdminBotToken,
+	setAdminBotReadBodies,
+	setAdminBotSuperadmin,
 } from "../../src/adminbot";
 import { authenticate, hashToken } from "../../src/auth";
 import { newId } from "../../src/db";
@@ -392,5 +394,100 @@ describe("issueAdminBotToken and revokeAdminBotToken", () => {
 		expect(
 			await authenticate(db, `Bearer ${second.data.token}`, "admin"),
 		).toMatchObject({ ok: false, reason: "token_revoked" });
+	});
+});
+
+function interceptFirstBatch(
+	baseDb: D1Database,
+	beforeBatch: () => Promise<void>,
+): D1Database {
+	let intercepted = false;
+	return new Proxy(baseDb, {
+		get(target, prop) {
+			if (prop === "batch") {
+				return async <T = unknown>(
+					statements: D1PreparedStatement[],
+				): Promise<D1Result<T>[]> => {
+					if (!intercepted) {
+						intercepted = true;
+						await beforeBatch();
+					}
+					return target.batch<T>(statements);
+				};
+			}
+			const value = Reflect.get(target, prop, target);
+			return typeof value === "function" ? value.bind(target) : value;
+		},
+	});
+}
+
+describe("concurrent re-designation during switch updates", () => {
+	it("aborts setAdminBotReadBodies with not_admin_bot, leaves new bot switches OFF, and writes 0 change_log entries", async () => {
+		await designateAdminBot(db, { agentId: muse.id, actor: OWNER, now: T0 });
+
+		let logsAfterRedesignate = 0;
+		const racedDb = interceptFirstBatch(db, async () => {
+			const redesignated = await designateAdminBot(db, {
+				agentId: grok.id,
+				actor: OWNER,
+				now: T0 + 5,
+			});
+			expect(redesignated.ok).toBe(true);
+			logsAfterRedesignate = (await queryChangeLog(db)).length;
+		});
+
+		const res = await setAdminBotReadBodies(racedDb, {
+			enabled: true,
+			actor: OWNER,
+			now: T0 + 10,
+		});
+		expect(res).toMatchObject({ ok: false, code: "not_admin_bot" });
+		expect(await getAdminBotConfig(db)).toEqual({
+			agentId: grok.id,
+			readBodies: false,
+			superadminUntil: null,
+			updatedAt: T0 + 5,
+		});
+
+		const logs = await queryChangeLog(db);
+		expect(logs).toHaveLength(logsAfterRedesignate);
+		expect(
+			logs.filter((entry) => entry.action === "admin_bot_switches_updated"),
+		).toHaveLength(0);
+	});
+
+	it("aborts setAdminBotSuperadmin with not_admin_bot, leaves new bot switches OFF, and writes 0 change_log entries", async () => {
+		await designateAdminBot(db, { agentId: muse.id, actor: OWNER, now: T0 });
+
+		let logsAfterRedesignate = 0;
+		const racedDb = interceptFirstBatch(db, async () => {
+			const redesignated = await designateAdminBot(db, {
+				agentId: grok.id,
+				actor: OWNER,
+				now: T0 + 5,
+			});
+			expect(redesignated.ok).toBe(true);
+			logsAfterRedesignate = (await queryChangeLog(db)).length;
+		});
+
+		const res = await setAdminBotSuperadmin(racedDb, {
+			mode: "days",
+			days: 7,
+			actor: OWNER,
+			now: T0 + 10,
+		});
+		expect(res).toMatchObject({ ok: false, code: "not_admin_bot" });
+		expect(await getAdminBotConfig(db)).toEqual({
+			agentId: grok.id,
+			readBodies: false,
+			superadminUntil: null,
+			updatedAt: T0 + 5,
+		});
+
+		const logs = await queryChangeLog(db);
+		expect(logs).toHaveLength(logsAfterRedesignate);
+		expect(
+			logs.filter((entry) => entry.action === "admin_bot_switches_updated"),
+		).toHaveLength(0);
 	});
 });

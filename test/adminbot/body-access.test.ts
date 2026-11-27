@@ -3,7 +3,7 @@ import {
 	Client,
 	StreamableHTTPClientTransport,
 } from "@modelcontextprotocol/client";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { type ChangeActor, queryChangeLog } from "../../src/admin";
 import {
 	clearAdminBot,
@@ -11,12 +11,14 @@ import {
 	getAdminBotConfig,
 	handleAdminMcpRequest,
 	issueAdminBotToken,
+	MAX_ADMIN_BODY_AUDIT_LIMIT,
 	setAdminBotReadBodies,
 } from "../../src/adminbot";
 import {
 	type AuditBodyConfig,
 	queryAuditLog,
 	recordAuditEvent,
+	recordAuditEvents,
 } from "../../src/audit";
 import type { McpEnv } from "../../src/mcp/config";
 import type { Agent, Category } from "../../src/types";
@@ -509,6 +511,132 @@ describe("view_audit_log body access permission (design 4, 5.3)", () => {
 		const logs = await queryAuditLog(db);
 		expect(
 			logs.filter((entry) => entry.eventType === "admin_body_read"),
+		).toHaveLength(0);
+	});
+
+	it("caps returned entries at MAX_ADMIN_BODY_AUDIT_LIMIT when includeBody is active and provides a valid cursor", async () => {
+		const totalSeeded = MAX_ADMIN_BODY_AUDIT_LIMIT + 5;
+		const events = Array.from({ length: totalSeeded }, (_, index) => ({
+			eventType: "question_accepted" as const,
+			occurredAt: T0 + index * 1000,
+			fromAgentId: muse.id,
+			toAgentId: grok.id,
+			categoryId: schedule.id,
+			messageId: crypto.randomUUID(),
+			body: `CAP_BODY_${String(index).padStart(2, "0")}`,
+		}));
+		expect(await recordAuditEvents(db, RECORDING_CONFIG, events)).toBe(true);
+
+		await setAdminBotReadBodies(db, {
+			enabled: true,
+			actor: OWNER,
+			now: T0 + 100_000,
+		});
+
+		const client = await connectAdmin(adminToken, {
+			env: mcpEnv({ recordBodies: "true" }),
+			now: T0 + HOUR_MS,
+		});
+
+		const page1 = await call(client, "view_audit_log", { limit: 50 });
+		expect(page1.isError).toBe(false);
+		expect(page1.text).toContain(`entries: ${MAX_ADMIN_BODY_AUDIT_LIMIT}`);
+		expect(page1.text).toContain("has_more: true");
+		const cursorMatch = /^next_before_id: (\d+)$/m.exec(page1.text);
+		expect(cursorMatch?.[1]).toBeTruthy();
+		const nextBeforeId = Number(cursorMatch?.[1]);
+		expect(nextBeforeId).toBeGreaterThan(0);
+
+		const bodyReadsAfterPage1 = (await queryAuditLog(db)).filter(
+			(entry) => entry.eventType === "admin_body_read",
+		);
+		expect(bodyReadsAfterPage1).toHaveLength(MAX_ADMIN_BODY_AUDIT_LIMIT);
+
+		const page2 = await call(client, "view_audit_log", {
+			before_id: nextBeforeId,
+			limit: 50,
+		});
+		expect(page2.isError).toBe(false);
+		expect(page2.text).toContain("entries: 5");
+		expect(page2.text).toContain("has_more: false");
+		expect(page2.text).toContain("CAP_BODY_00");
+		expect(page2.text).not.toContain("CAP_BODY_29");
+
+		const bodyReadsAfterPage2 = (await queryAuditLog(db)).filter(
+			(entry) => entry.eventType === "admin_body_read",
+		);
+		expect(bodyReadsAfterPage2).toHaveLength(totalSeeded);
+	});
+
+	it("fails closed without returning any message bodies when recording admin_body_read fails", async () => {
+		const secretBody1 = "FAIL_CLOSED_SECRET_BODY_ONE";
+		const secretBody2 = "FAIL_CLOSED_SECRET_BODY_TWO";
+		await recordAuditEvent(db, RECORDING_CONFIG, {
+			eventType: "question_accepted",
+			occurredAt: T0,
+			fromAgentId: muse.id,
+			toAgentId: grok.id,
+			categoryId: schedule.id,
+			messageId: crypto.randomUUID(),
+			body: secretBody1,
+		});
+		await recordAuditEvent(db, RECORDING_CONFIG, {
+			eventType: "question_answered",
+			occurredAt: T0 + 1000,
+			fromAgentId: muse.id,
+			toAgentId: grok.id,
+			categoryId: schedule.id,
+			messageId: crypto.randomUUID(),
+			body: secretBody2,
+		});
+
+		await setAdminBotReadBodies(db, {
+			enabled: true,
+			actor: OWNER,
+			now: T0 + 2000,
+		});
+
+		const failingBatchDb = new Proxy(db, {
+			get(target, prop) {
+				if (prop === "batch") {
+					return async () => {
+						throw new Error("simulated D1 batch write error");
+					};
+				}
+				const value = Reflect.get(target, prop, target);
+				return typeof value === "function" ? value.bind(target) : value;
+			},
+		});
+
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		try {
+			const client = await connectAdmin(adminToken, {
+				env: {
+					...mcpEnv({ recordBodies: "true" }),
+					DB: failingBatchDb,
+				},
+				now: T0 + HOUR_MS,
+			});
+
+			const res = await call(client, "view_audit_log", { include_body: true });
+			expect(res.isError).toBe(true);
+			expect(res.text).toContain(
+				"failed to record admin_body_read audit log; message bodies were withheld",
+			);
+			expect(res.text).not.toContain(secretBody1);
+			expect(res.text).not.toContain(secretBody2);
+			expect(res.text).not.toContain("body:");
+			expect(res.text).not.toContain("<untrusted_external_data");
+		} finally {
+			errorSpy.mockRestore();
+		}
+
+		const logs = await queryAuditLog(db);
+		expect(
+			logs.filter((entry) => entry.eventType === "admin_body_read"),
+		).toHaveLength(0);
+		expect(
+			logs.filter((entry) => entry.eventType === "admin_tool_called"),
 		).toHaveLength(0);
 	});
 });

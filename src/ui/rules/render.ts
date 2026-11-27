@@ -332,7 +332,11 @@ function describeSnapshot(
 				typeof record.superadminUntil === "number" &&
 				record.superadminUntil > 0
 			) {
-				extras.push("最高管理者=有効");
+				extras.push(
+					record.superadminUntil > entry.occurredAt
+						? "最高管理者=有効"
+						: "最高管理者=期限切れ",
+				);
 			}
 			return extras.length > 0 ? `${name}（${extras.join("・")}）` : name;
 		}

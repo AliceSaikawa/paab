@@ -9,6 +9,7 @@ import {
 import {
 	fail as adminFail,
 	runWithChangeLog,
+	type ValidatedContext,
 	validateContext,
 	validateId,
 } from "../admin/validate";
@@ -413,6 +414,61 @@ export async function revokeAdminBotToken(
 	});
 }
 
+async function commitAdminBotSwitchUpdate(
+	db: D1Database,
+	updateStatement: D1PreparedStatement,
+	ctx: ValidatedContext,
+	expectedAgentId: string,
+	before: AdminBotConfig,
+	after: AdminBotConfig,
+): Promise<SetAdminBotSwitchesResult> {
+	const [updateRes, changeRes] = await db.batch([
+		updateStatement,
+		db
+			.prepare(
+				`INSERT INTO change_log
+					(occurred_at, actor_type, actor_id, approver_id, action,
+					target_type, target_id, before_json, after_json, reverted_at)
+				SELECT ?, ?, ?, ?, 'admin_bot_switches_updated', 'admin_bot', ?, ?, ?, NULL
+				WHERE EXISTS (
+					SELECT 1 FROM admin_bot_config WHERE id = 1 AND agent_id = ?
+				)`,
+			)
+			.bind(
+				ctx.now,
+				ctx.actorType,
+				ctx.actorId,
+				ctx.approverId,
+				expectedAgentId,
+				JSON.stringify(before),
+				JSON.stringify(after),
+				expectedAgentId,
+			),
+	]);
+
+	if ((updateRes?.meta.changes ?? 0) === 0) {
+		return fail(
+			"not_admin_bot",
+			"管理者ボットの指名が変更されたため権限スイッチを更新できませんでした",
+		);
+	}
+
+	const changeId = Number(changeRes?.meta.last_row_id);
+	if (
+		(changeRes?.meta.changes ?? 0) !== 1 ||
+		!Number.isSafeInteger(changeId) ||
+		changeId <= 0
+	) {
+		throw new Error("change_log insert did not return a valid last_row_id");
+	}
+
+	return {
+		ok: true,
+		data: { config: after, changed: true },
+		changeId,
+	};
+}
+
 /**
  * Toggles the optional `read_bodies` permission switch for the currently
  * designated administrator bot (design section 5.2, 5.3). Owner-only.
@@ -456,36 +512,20 @@ export async function setAdminBotReadBodies(
 		updatedAt: ctx.value.now,
 	};
 
-	const changeId = await runWithChangeLog(
+	return commitAdminBotSwitchUpdate(
 		db,
-		[
-			db
-				.prepare(
-					`UPDATE admin_bot_config
-					SET read_bodies = ?, updated_at = ?
-					WHERE id = 1`,
-				)
-				.bind(input.enabled ? 1 : 0, ctx.value.now),
-		],
-		{
-			occurredAt: ctx.value.now,
-			actorType: ctx.value.actorType,
-			actorId: ctx.value.actorId,
-			approverId: ctx.value.approverId,
-			action: "admin_bot_switches_updated",
-			targetType: "admin_bot",
-			targetId: current.agentId,
-			beforeJson: JSON.stringify(current),
-			afterJson: JSON.stringify(next),
-			revertedAt: null,
-		},
+		db
+			.prepare(
+				`UPDATE admin_bot_config
+				SET read_bodies = ?, updated_at = ?
+				WHERE id = 1 AND agent_id = ?`,
+			)
+			.bind(input.enabled ? 1 : 0, ctx.value.now, current.agentId),
+		ctx.value,
+		current.agentId,
+		current,
+		next,
 	);
-
-	return {
-		ok: true,
-		data: { config: next, changed: true },
-		changeId,
-	};
 }
 
 /**
@@ -607,34 +647,18 @@ export async function setAdminBotSuperadmin(
 		updatedAt: ctx.value.now,
 	};
 
-	const changeId = await runWithChangeLog(
+	return commitAdminBotSwitchUpdate(
 		db,
-		[
-			db
-				.prepare(
-					`UPDATE admin_bot_config
-					SET superadmin_until = ?, updated_at = ?
-					WHERE id = 1`,
-				)
-				.bind(nextSuperadminUntil, ctx.value.now),
-		],
-		{
-			occurredAt: ctx.value.now,
-			actorType: ctx.value.actorType,
-			actorId: ctx.value.actorId,
-			approverId: ctx.value.approverId,
-			action: "admin_bot_switches_updated",
-			targetType: "admin_bot",
-			targetId: current.agentId,
-			beforeJson: JSON.stringify(current),
-			afterJson: JSON.stringify(next),
-			revertedAt: null,
-		},
+		db
+			.prepare(
+				`UPDATE admin_bot_config
+				SET superadmin_until = ?, updated_at = ?
+				WHERE id = 1 AND agent_id = ?`,
+			)
+			.bind(nextSuperadminUntil, ctx.value.now, current.agentId),
+		ctx.value,
+		current.agentId,
+		current,
+		next,
 	);
-
-	return {
-		ok: true,
-		data: { config: next, changed: true },
-		changeId,
-	};
 }
