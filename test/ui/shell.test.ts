@@ -401,7 +401,7 @@ describe("Cloudflare Access JWT verification", () => {
 
 	it("fails closed with 503 when unconfigured or partially configured, even if ADMIN_DEV_USER is set", async () => {
 		const unconfigured = await handleAdminRequest(
-			adminGet(),
+			adminGet("http://localhost:8787/admin"),
 			{
 				DB: env.DB,
 				CF_ACCESS_TEAM_DOMAIN: "",
@@ -415,7 +415,7 @@ describe("Cloudflare Access JWT verification", () => {
 		);
 
 		const onlyDomain = await handleAdminRequest(
-			adminGet(),
+			adminGet("http://localhost:8787/admin"),
 			{
 				DB: env.DB,
 				CF_ACCESS_TEAM_DOMAIN: TEAM_DOMAIN,
@@ -427,7 +427,7 @@ describe("Cloudflare Access JWT verification", () => {
 		expect(onlyDomain.status).toBe(503);
 
 		const onlyAud = await handleAdminRequest(
-			adminGet(),
+			adminGet("http://localhost:8787/admin"),
 			{
 				DB: env.DB,
 				CF_ACCESS_TEAM_DOMAIN: "",
@@ -439,15 +439,61 @@ describe("Cloudflare Access JWT verification", () => {
 		expect(onlyAud.status).toBe(503);
 	});
 
-	it("allows ADMIN_DEV_USER only when Access vars are unset, and rejects it when Access vars are set", async () => {
-		const devRes = await handleAdminRequest(adminGet(), devEnv(), NOW_MS);
-		expect(devRes.status).toBe(200);
-		const devBody = await devRes.text();
-		expect(devBody).toContain("owner@example.com");
-		expect(devBody).toContain("開発モード");
+	it("allows ADMIN_DEV_USER only on loopback hosts when Access vars are unset, and rejects it when Access vars are set", async () => {
+		for (const loopbackUrl of [
+			"http://localhost:8787/admin",
+			"https://LOCALHOST/admin",
+			"http://127.0.0.1:8787/admin",
+			"http://[::1]:8787/admin",
+		]) {
+			const verified = await verifyAccessRequest(
+				adminGet(loopbackUrl),
+				devEnv(),
+				NOW_MS,
+			);
+			expect(verified, loopbackUrl).toEqual({
+				ok: true,
+				user: { email: "owner@example.com", sub: "dev" },
+				devMode: true,
+			});
+
+			const devRes = await handleAdminRequest(
+				adminGet(loopbackUrl),
+				devEnv(),
+				NOW_MS,
+			);
+			expect(devRes.status, loopbackUrl).toBe(200);
+			const devBody = await devRes.text();
+			expect(devBody, loopbackUrl).toContain("owner@example.com");
+			expect(devBody, loopbackUrl).toContain("開発モード");
+		}
+
+		for (const nonLoopbackUrl of [
+			"https://paab.example.workers.dev/admin",
+			"https://localhost.example.com/admin",
+			"https://localhost.evil.com/admin",
+			"http://sub.localhost:8787/admin",
+			"http://localhost.:8787/admin",
+			"http://127.0.0.2:8787/admin",
+			"http://[::ffff:127.0.0.1]:8787/admin",
+			"https://paab.test/admin",
+		]) {
+			const rejected = await handleAdminRequest(
+				adminGet(nonLoopbackUrl, {
+					Host: "localhost",
+					"X-Forwarded-Host": "localhost",
+				}),
+				devEnv(),
+				NOW_MS,
+			);
+			expect(rejected.status, nonLoopbackUrl).toBe(503);
+			expect(await rejected.text(), nonLoopbackUrl).toContain(
+				"Cloudflare Access が設定されていません",
+			);
+		}
 
 		const prodWithDevUser = await handleAdminRequest(
-			adminGet(),
+			adminGet("http://localhost:8787/admin"),
 			prodEnv({ ADMIN_DEV_USER: "owner@example.com" }),
 			NOW_MS,
 			{ fetchJwks: jwksFor(primaryKey) },
@@ -505,7 +551,7 @@ describe("CSRF protection, routing, and security headers", () => {
 		];
 
 		const httpsGet = await handleAdminRequest(
-			adminGet("https://paab.test/admin/test-action"),
+			adminGet("https://localhost/admin/test-action"),
 			devEnv(),
 			NOW_MS,
 			{ routes: testRoutes },
@@ -526,7 +572,7 @@ describe("CSRF protection, routing, and security headers", () => {
 		const csrfToken = tokenMatch?.[1] ?? "";
 
 		const secondGet = await handleAdminRequest(
-			adminGet("https://paab.test/admin/test-action", { Cookie: cookiePair }),
+			adminGet("https://localhost/admin/test-action", { Cookie: cookiePair }),
 			devEnv(),
 			NOW_MS,
 			{ routes: testRoutes },
@@ -549,11 +595,11 @@ describe("CSRF protection, routing, and security headers", () => {
 		expect(csrfCookieName(new URL("http://localhost:8787"))).toBe("paab_csrf");
 
 		const okPost = await handleAdminRequest(
-			new Request("https://paab.test/admin/test-action", {
+			new Request("https://localhost/admin/test-action", {
 				method: "POST",
 				headers: {
 					Cookie: cookiePair,
-					Origin: "https://paab.test",
+					Origin: "https://localhost",
 				},
 				body: new URLSearchParams({ csrf_token: csrfToken, name: "muse" }),
 			}),
@@ -566,9 +612,9 @@ describe("CSRF protection, routing, and security headers", () => {
 		expect(await okPost.text()).toContain("保存: muse");
 
 		const noCookiePost = await handleAdminRequest(
-			new Request("https://paab.test/admin/test-action", {
+			new Request("https://localhost/admin/test-action", {
 				method: "POST",
-				headers: { Origin: "https://paab.test" },
+				headers: { Origin: "https://localhost" },
 				body: new URLSearchParams({ csrf_token: csrfToken }),
 			}),
 			devEnv(),
@@ -578,9 +624,9 @@ describe("CSRF protection, routing, and security headers", () => {
 		expect(noCookiePost.status).toBe(403);
 
 		const noFieldPost = await handleAdminRequest(
-			new Request("https://paab.test/admin/test-action", {
+			new Request("https://localhost/admin/test-action", {
 				method: "POST",
-				headers: { Cookie: cookiePair, Origin: "https://paab.test" },
+				headers: { Cookie: cookiePair, Origin: "https://localhost" },
 				body: new URLSearchParams({ name: "muse" }),
 			}),
 			devEnv(),
@@ -590,9 +636,9 @@ describe("CSRF protection, routing, and security headers", () => {
 		expect(noFieldPost.status).toBe(403);
 
 		const wrongTokenPost = await handleAdminRequest(
-			new Request("https://paab.test/admin/test-action", {
+			new Request("https://localhost/admin/test-action", {
 				method: "POST",
-				headers: { Cookie: cookiePair, Origin: "https://paab.test" },
+				headers: { Cookie: cookiePair, Origin: "https://localhost" },
 				body: new URLSearchParams({
 					csrf_token: "A".repeat(43),
 				}),
@@ -604,7 +650,7 @@ describe("CSRF protection, routing, and security headers", () => {
 		expect(wrongTokenPost.status).toBe(403);
 
 		const crossOriginPost = await handleAdminRequest(
-			new Request("https://paab.test/admin/test-action", {
+			new Request("https://localhost/admin/test-action", {
 				method: "POST",
 				headers: {
 					Cookie: cookiePair,
@@ -619,7 +665,7 @@ describe("CSRF protection, routing, and security headers", () => {
 		expect(crossOriginPost.status).toBe(403);
 
 		const nullOriginPost = await handleAdminRequest(
-			new Request("https://paab.test/admin/test-action", {
+			new Request("https://localhost/admin/test-action", {
 				method: "POST",
 				headers: {
 					Cookie: cookiePair,
@@ -634,7 +680,7 @@ describe("CSRF protection, routing, and security headers", () => {
 		expect(nullOriginPost.status).toBe(403);
 
 		const crossRefererPost = await handleAdminRequest(
-			new Request("https://paab.test/admin/test-action", {
+			new Request("https://localhost/admin/test-action", {
 				method: "POST",
 				headers: {
 					Cookie: cookiePair,
@@ -649,7 +695,7 @@ describe("CSRF protection, routing, and security headers", () => {
 		expect(crossRefererPost.status).toBe(403);
 
 		const putReq = await handleAdminRequest(
-			new Request("https://paab.test/admin/test-action", { method: "PUT" }),
+			new Request("https://localhost/admin/test-action", { method: "PUT" }),
 			devEnv(),
 			NOW_MS,
 			{ routes: testRoutes },
@@ -657,11 +703,11 @@ describe("CSRF protection, routing, and security headers", () => {
 		expect(putReq.status).toBe(405);
 
 		const unauthedPost = await handleAdminRequest(
-			new Request("https://paab.test/admin/test-action", {
+			new Request("https://localhost/admin/test-action", {
 				method: "POST",
 				headers: {
 					Cookie: cookiePair,
-					Origin: "https://paab.test",
+					Origin: "https://localhost",
 				},
 				body: new URLSearchParams({ csrf_token: csrfToken, name: "muse" }),
 			}),
@@ -672,11 +718,11 @@ describe("CSRF protection, routing, and security headers", () => {
 		expect(unauthedPost.status).toBe(403);
 
 		const wrongContentTypePost = await handleAdminRequest(
-			new Request("https://paab.test/admin/test-action", {
+			new Request("https://localhost/admin/test-action", {
 				method: "POST",
 				headers: {
 					Cookie: cookiePair,
-					Origin: "https://paab.test",
+					Origin: "https://localhost",
 					"Content-Type": "application/json",
 				},
 				body: JSON.stringify({ csrf_token: csrfToken }),
@@ -701,11 +747,11 @@ describe("CSRF protection, routing, and security headers", () => {
 			},
 		];
 		const paramPost = await handleAdminRequest(
-			new Request("https://paab.test/admin/items/agent-123/action", {
+			new Request("https://localhost/admin/items/agent-123/action", {
 				method: "POST",
 				headers: {
 					Cookie: cookiePair,
-					Origin: "https://paab.test",
+					Origin: "https://localhost",
 				},
 				body: new URLSearchParams({ csrf_token: csrfToken }),
 			}),
@@ -721,7 +767,7 @@ describe("CSRF protection, routing, and security headers", () => {
 
 	it("renders layout with navigation tabs, timestamp element, and matching CSP script hash", async () => {
 		const response = await handleAdminRequest(
-			adminGet("https://paab.test/admin"),
+			adminGet("https://localhost/admin"),
 			devEnv(),
 			NOW_MS,
 		);
@@ -759,7 +805,7 @@ describe("CSRF protection, routing, and security headers", () => {
 
 		for (const tab of ADMIN_NAV_TABS) {
 			const res = await handleAdminRequest(
-				adminGet(`https://paab.test${tab.href}`),
+				adminGet(`https://localhost${tab.href}`),
 				devEnv(),
 				NOW_MS,
 			);
@@ -770,7 +816,7 @@ describe("CSRF protection, routing, and security headers", () => {
 		}
 
 		const notFoundRes = await handleAdminRequest(
-			adminGet("https://paab.test/admin/nonexistent"),
+			adminGet("https://localhost/admin/nonexistent"),
 			devEnv(),
 			NOW_MS,
 		);
