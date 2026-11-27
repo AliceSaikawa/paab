@@ -27,6 +27,7 @@ describe("examples/poll-unread structural contracts", () => {
 		expect(pollUnreadSh).toContain("PAAB_UNREAD_TOKEN_FILE");
 		expect(pollUnreadSh).toContain("PAAB_STATE_FILE");
 		expect(pollUnreadSh).toContain("PAAB_CURL_TIMEOUT");
+		expect(pollUnreadSh).toContain("PAAB_WAKE_COOLDOWN_SECONDS");
 	});
 
 	it("poll-unread.sh delegates waking via PAAB_WAKE_SCRIPT and updates state atomically", () => {
@@ -35,6 +36,7 @@ describe("examples/poll-unread structural contracts", () => {
 		expect(pollUnreadSh).toContain("PAAB_PREV_UNREAD_COUNT");
 		expect(pollUnreadSh).toContain("wake.sh");
 		expect(pollUnreadSh).toMatch(/\bmv\b/);
+		expect(pollUnreadSh).not.toMatch(/\$unread["']?\s+-gt\s+["']?\$prev/);
 	});
 
 	it("wake.sh uses POSIX sh with set -eu and prints the sample notification", () => {

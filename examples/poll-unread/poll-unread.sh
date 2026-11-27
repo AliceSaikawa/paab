@@ -1,5 +1,5 @@
 #!/bin/sh
-# Poll paab GET /unread and invoke a wake script only when the unread count increases.
+# Poll paab GET /unread and invoke a wake script whenever unread messages exist.
 # Requires only POSIX sh, curl, and standard POSIX utilities.
 set -eu
 
@@ -11,6 +11,19 @@ nl=${nl%x}
 die() {
 	printf 'poll-unread: %s\n' "$1" >&2
 	exit 1
+}
+
+is_non_neg_int() {
+	case "$1" in
+		0) return 0 ;;
+		[1-9]*)
+			case "$1" in
+				*[!0-9]*) return 1 ;;
+				*) return 0 ;;
+			esac
+			;;
+		*) return 1 ;;
+	esac
 }
 
 # 1. Validate PAAB_URL and strip trailing slashes.
@@ -37,13 +50,18 @@ case "$base_url" in
 		;;
 esac
 
-# 2. Validate PAAB_CURL_TIMEOUT (positive integer, default 10).
+# 2. Validate numeric configuration.
 PAAB_CURL_TIMEOUT=${PAAB_CURL_TIMEOUT:-10}
 case "$PAAB_CURL_TIMEOUT" in
 	''|[!1-9]*|*[!0-9]*)
 		die "PAAB_CURL_TIMEOUT must be a positive integer: $PAAB_CURL_TIMEOUT"
 		;;
 esac
+
+PAAB_WAKE_COOLDOWN_SECONDS=${PAAB_WAKE_COOLDOWN_SECONDS:-0}
+if ! is_non_neg_int "$PAAB_WAKE_COOLDOWN_SECONDS"; then
+	die "PAAB_WAKE_COOLDOWN_SECONDS must be a non-negative integer: $PAAB_WAKE_COOLDOWN_SECONDS"
+fi
 
 # 3. Resolve token from PAAB_UNREAD_TOKEN or PAAB_UNREAD_TOKEN_FILE.
 if [ -n "${PAAB_UNREAD_TOKEN:-}" ]; then
@@ -139,31 +157,36 @@ EOF
 	die "malformed JSON response from ${base_url}/unread"
 fi
 
-case "$unread" in
-	0|[1-9]*)
-		case "$unread" in
-			*[!0-9]*) die "invalid unread count parsed from response" ;;
-		esac
-		;;
-	*) die "invalid unread count parsed from response" ;;
-esac
+if ! is_non_neg_int "$unread"; then
+	die "invalid unread count parsed from response"
+fi
 
-# 7. Read previous count from state file (default 0 if missing, unreadable, or non-numeric).
+# 7. Read previous state ("<count> <last_wake_epoch>", or legacy "<count>").
+# Default to 0 0 if missing, unreadable, or malformed.
 prev=0
+last_wake=0
 if [ -f "$PAAB_STATE_FILE" ] && [ -r "$PAAB_STATE_FILE" ]; then
-	raw_prev=$(cat -- "$PAAB_STATE_FILE" 2>/dev/null || true)
-	case "$raw_prev" in
-		*"$cr") raw_prev=${raw_prev%"$cr"} ;;
+	raw_state=$(cat -- "$PAAB_STATE_FILE" 2>/dev/null || true)
+	case "$raw_state" in
+		*"$cr") raw_state=${raw_state%"$cr"} ;;
 	esac
-	case "$raw_prev" in
-		0) prev=0 ;;
-		[1-9]*)
-			case "$raw_prev" in
-				*[!0-9]*) prev=0 ;;
-				*) prev=$raw_prev ;;
-			esac
+	case "$raw_state" in
+		*"$nl"*|*"$cr"*) ;;
+		*' '*)
+			raw_prev=${raw_state%% *}
+			raw_wake=${raw_state#* }
+			if is_non_neg_int "$raw_prev" && is_non_neg_int "$raw_wake"; then
+				if [ "$raw_prev" -gt 0 ] || [ "$raw_wake" -eq 0 ]; then
+					prev=$raw_prev
+					last_wake=$raw_wake
+				fi
+			fi
 			;;
-		*) prev=0 ;;
+		*)
+			if is_non_neg_int "$raw_state"; then
+				prev=$raw_state
+			fi
+			;;
 	esac
 fi
 
@@ -200,19 +223,35 @@ write_state_atomic() {
 	fi
 }
 
-# 8. Wake only when unread > prev, and update state atomically.
-if [ "$unread" -gt "$prev" ]; then
-	if [ ! -f "$PAAB_WAKE_SCRIPT" ] || [ ! -x "$PAAB_WAKE_SCRIPT" ]; then
-		die "PAAB_WAKE_SCRIPT is not an executable file: $PAAB_WAKE_SCRIPT"
-	fi
-	case "$PAAB_WAKE_SCRIPT" in
-		*/*) wake_exec=$PAAB_WAKE_SCRIPT ;;
-		*) wake_exec="./$PAAB_WAKE_SCRIPT" ;;
-	esac
-	if ! PAAB_UNREAD_COUNT="$unread" PAAB_PREV_UNREAD_COUNT="$prev" "$wake_exec" "$unread" "$prev"; then
-		die "wake script exited with non-zero status: $PAAB_WAKE_SCRIPT"
-	fi
-	write_state_atomic "$PAAB_STATE_FILE" "$unread"
+# 8. Wake whenever unread >= 1 (unless suppressed by cooldown), and update state atomically.
+if [ "$unread" -eq 0 ]; then
+	write_state_atomic "$PAAB_STATE_FILE" "0 0"
 else
-	write_state_atomic "$PAAB_STATE_FILE" "$unread"
+	if ! now=$(date +%s) || ! is_non_neg_int "$now"; then
+		die "failed to read current UNIX timestamp"
+	fi
+
+	should_wake=1
+	if [ "$PAAB_WAKE_COOLDOWN_SECONDS" -gt 0 ] \
+		&& [ "$last_wake" -gt 0 ] \
+		&& [ "$now" -ge "$last_wake" ] \
+		&& [ "$((now - last_wake))" -lt "$PAAB_WAKE_COOLDOWN_SECONDS" ]; then
+		should_wake=0
+	fi
+
+	if [ "$should_wake" -eq 1 ]; then
+		if [ ! -f "$PAAB_WAKE_SCRIPT" ] || [ ! -x "$PAAB_WAKE_SCRIPT" ]; then
+			die "PAAB_WAKE_SCRIPT is not an executable file: $PAAB_WAKE_SCRIPT"
+		fi
+		case "$PAAB_WAKE_SCRIPT" in
+			*/*) wake_exec=$PAAB_WAKE_SCRIPT ;;
+			*) wake_exec="./$PAAB_WAKE_SCRIPT" ;;
+		esac
+		if ! PAAB_UNREAD_COUNT="$unread" PAAB_PREV_UNREAD_COUNT="$prev" "$wake_exec" "$unread" "$prev"; then
+			die "wake script exited with non-zero status: $PAAB_WAKE_SCRIPT"
+		fi
+		write_state_atomic "$PAAB_STATE_FILE" "${unread} ${now}"
+	else
+		write_state_atomic "$PAAB_STATE_FILE" "${unread} ${last_wake}"
+	fi
 fi

@@ -170,7 +170,49 @@ function runPoll(env) {
 	});
 }
 
-test("state transitions: 0->0, 0->2, 2->2, 2->3, 3->0, 0->1 and trailing slash URL", async (t) => {
+function readState(stateFile) {
+	const raw = readFileSync(stateFile, "utf8").trim();
+	const parts = raw.split(" ");
+	assert.equal(parts.length, 2, `expected '<count> <timestamp>', got: ${raw}`);
+	assert.match(parts[0], /^(0|[1-9][0-9]*)$/);
+	assert.match(parts[1], /^(0|[1-9][0-9]*)$/);
+	return {
+		raw,
+		count: Number(parts[0]),
+		lastWake: Number(parts[1]),
+	};
+}
+
+function createFakeDateBin(dir, initialEpoch) {
+	const binDir = path.join(dir, "fake-date-bin");
+	const epochFile = path.join(dir, "fake-epoch.txt");
+	const dateShim = path.join(binDir, "date");
+	mkdirSync(binDir, { recursive: true });
+	writeFileSync(epochFile, `${initialEpoch}\n`, "utf8");
+	writeFileSync(
+		dateShim,
+		[
+			"#!/bin/sh",
+			"set -eu",
+			'if [ "$#" -eq 1 ] && [ "$1" = "+%s" ]; then',
+			`	cat -- "${epochFile}"`,
+			"	exit 0",
+			"fi",
+			"exit 1",
+			"",
+		].join("\n"),
+		"utf8",
+	);
+	chmodSync(dateShim, 0o755);
+	return {
+		binDir,
+		setEpoch(epoch) {
+			writeFileSync(epochFile, `${epoch}\n`, "utf8");
+		},
+	};
+}
+
+test("state transitions: 0->0, 0->2, 2->2, 2->1, 1->1, 1->3, 3->0, 0->1 and trailing slash URL", async (t) => {
 	const token = "unread-token-lifecycle";
 	const server = await startMockUnreadServer(token);
 	const dir = makeTempDir();
@@ -194,7 +236,7 @@ test("state transitions: 0->0, 0->2, 2->2, 2->3, 3->0, 0->1 and trailing slash U
 	let res = await runPoll(baseEnv);
 	assert.equal(res.status, 0, res.stderr);
 	assert.deepEqual(wake.readCalls(), []);
-	assert.equal(readFileSync(stateFile, "utf8").trim(), "0");
+	assert.equal(readFileSync(stateFile, "utf8").trim(), "0 0");
 	assert.equal(server.requests.at(-1)?.url, "/unread");
 
 	// 0 -> 2: wakes once with (2, 0) and env vars
@@ -202,31 +244,64 @@ test("state transitions: 0->0, 0->2, 2->2, 2->3, 3->0, 0->1 and trailing slash U
 	res = await runPoll(baseEnv);
 	assert.equal(res.status, 0, res.stderr);
 	assert.deepEqual(wake.readCalls(), ["arg1=2 arg2=0 env_cur=2 env_prev=0"]);
-	assert.equal(readFileSync(stateFile, "utf8").trim(), "2");
+	const stateAfter2 = readState(stateFile);
+	assert.equal(stateAfter2.count, 2);
+	assert.ok(stateAfter2.lastWake > 0);
 
-	// 2 -> 2: does not wake again
+	// 2 -> 2: unchanged positive count still wakes with (2, 2)
 	server.setCount(2);
 	res = await runPoll(baseEnv);
 	assert.equal(res.status, 0, res.stderr);
-	assert.deepEqual(wake.readCalls(), ["arg1=2 arg2=0 env_cur=2 env_prev=0"]);
-	assert.equal(readFileSync(stateFile, "utf8").trim(), "2");
+	assert.deepEqual(wake.readCalls(), [
+		"arg1=2 arg2=0 env_cur=2 env_prev=0",
+		"arg1=2 arg2=2 env_cur=2 env_prev=2",
+	]);
+	const stateAfter2Again = readState(stateFile);
+	assert.equal(stateAfter2Again.count, 2);
+	assert.ok(stateAfter2Again.lastWake >= stateAfter2.lastWake);
 
-	// 2 -> 3: wakes once with (3, 2)
+	// 2 -> 1: smaller positive count still wakes with (1, 2)
+	server.setCount(1);
+	res = await runPoll(baseEnv);
+	assert.equal(res.status, 0, res.stderr);
+	assert.deepEqual(wake.readCalls(), [
+		"arg1=2 arg2=0 env_cur=2 env_prev=0",
+		"arg1=2 arg2=2 env_cur=2 env_prev=2",
+		"arg1=1 arg2=2 env_cur=1 env_prev=2",
+	]);
+	assert.equal(readState(stateFile).count, 1);
+
+	// 1 -> 1: simulates 1 -> read to 0 -> new message arrives (1) before next poll
+	server.setCount(1);
+	res = await runPoll(baseEnv);
+	assert.equal(res.status, 0, res.stderr);
+	assert.deepEqual(wake.readCalls(), [
+		"arg1=2 arg2=0 env_cur=2 env_prev=0",
+		"arg1=2 arg2=2 env_cur=2 env_prev=2",
+		"arg1=1 arg2=2 env_cur=1 env_prev=2",
+		"arg1=1 arg2=1 env_cur=1 env_prev=1",
+	]);
+	assert.equal(readState(stateFile).count, 1);
+
+	// 1 -> 3: wakes with (3, 1)
 	server.setCount(3);
 	res = await runPoll(baseEnv);
 	assert.equal(res.status, 0, res.stderr);
 	assert.deepEqual(wake.readCalls(), [
 		"arg1=2 arg2=0 env_cur=2 env_prev=0",
-		"arg1=3 arg2=2 env_cur=3 env_prev=2",
+		"arg1=2 arg2=2 env_cur=2 env_prev=2",
+		"arg1=1 arg2=2 env_cur=1 env_prev=2",
+		"arg1=1 arg2=1 env_cur=1 env_prev=1",
+		"arg1=3 arg2=1 env_cur=3 env_prev=1",
 	]);
-	assert.equal(readFileSync(stateFile, "utf8").trim(), "3");
+	assert.equal(readState(stateFile).count, 3);
 
-	// 3 -> 0: does not wake, resets state to 0
+	// 3 -> 0: does not wake, resets state to 0 0
 	server.setCount(0);
 	res = await runPoll(baseEnv);
 	assert.equal(res.status, 0, res.stderr);
-	assert.equal(wake.readCalls().length, 2);
-	assert.equal(readFileSync(stateFile, "utf8").trim(), "0");
+	assert.equal(wake.readCalls().length, 5);
+	assert.equal(readFileSync(stateFile, "utf8").trim(), "0 0");
 
 	// 0 -> 1: wakes again with (1, 0)
 	server.setCount(1);
@@ -234,10 +309,175 @@ test("state transitions: 0->0, 0->2, 2->2, 2->3, 3->0, 0->1 and trailing slash U
 	assert.equal(res.status, 0, res.stderr);
 	assert.deepEqual(wake.readCalls(), [
 		"arg1=2 arg2=0 env_cur=2 env_prev=0",
-		"arg1=3 arg2=2 env_cur=3 env_prev=2",
+		"arg1=2 arg2=2 env_cur=2 env_prev=2",
+		"arg1=1 arg2=2 env_cur=1 env_prev=2",
+		"arg1=1 arg2=1 env_cur=1 env_prev=1",
+		"arg1=3 arg2=1 env_cur=3 env_prev=1",
 		"arg1=1 arg2=0 env_cur=1 env_prev=0",
 	]);
-	assert.equal(readFileSync(stateFile, "utf8").trim(), "1");
+	const stateAfterFinal1 = readState(stateFile);
+	assert.equal(stateAfterFinal1.count, 1);
+	assert.ok(stateAfterFinal1.lastWake > 0);
+});
+
+test("PAAB_WAKE_COOLDOWN_SECONDS throttles repeated wakes until expiry, unread reset, or clock rollback", async (t) => {
+	const token = "unread-token-cooldown";
+	const server = await startMockUnreadServer(token);
+	const dir = makeTempDir();
+	t.after(async () => {
+		await server.close();
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	const stateFile = path.join(dir, "state/unread-count");
+	const wake = createRecorderWakeScript(dir);
+	const failingWake = createRecorderWakeScript(dir, {
+		exitCode: 1,
+		name: "failing-wake.sh",
+	});
+	const fakeDate = createFakeDateBin(dir, 1000);
+	const baseEnv = {
+		HOME: dir,
+		PATH: `${fakeDate.binDir}:${process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin"}`,
+		PAAB_URL: server.baseUrl,
+		PAAB_UNREAD_TOKEN: token,
+		PAAB_STATE_FILE: stateFile,
+		PAAB_WAKE_SCRIPT: wake.scriptPath,
+		PAAB_WAKE_COOLDOWN_SECONDS: "60",
+	};
+
+	// t=1000, 0 -> 1: wakes immediately and records last_wake=1000
+	server.setCount(1);
+	let res = await runPoll(baseEnv);
+	assert.equal(res.status, 0, res.stderr);
+	assert.deepEqual(wake.readCalls(), ["arg1=1 arg2=0 env_cur=1 env_prev=0"]);
+	assert.equal(readFileSync(stateFile, "utf8").trim(), "1 1000");
+
+	// t=1059 (59s < 60s), 1 -> 1: suppressed, last_wake preserved
+	fakeDate.setEpoch(1059);
+	server.setCount(1);
+	res = await runPoll(baseEnv);
+	assert.equal(res.status, 0, res.stderr);
+	assert.equal(wake.readCalls().length, 1);
+	assert.equal(readFileSync(stateFile, "utf8").trim(), "1 1000");
+
+	// t=1059 (still in cooldown), 1 -> 2: suppressed, count updated but last_wake not extended
+	server.setCount(2);
+	res = await runPoll(baseEnv);
+	assert.equal(res.status, 0, res.stderr);
+	assert.equal(wake.readCalls().length, 1);
+	assert.equal(readFileSync(stateFile, "utf8").trim(), "2 1000");
+
+	// t=1060 (60s >= 60s), 2 -> 2: cooldown expired, wakes again
+	fakeDate.setEpoch(1060);
+	server.setCount(2);
+	res = await runPoll(baseEnv);
+	assert.equal(res.status, 0, res.stderr);
+	assert.deepEqual(wake.readCalls(), [
+		"arg1=1 arg2=0 env_cur=1 env_prev=0",
+		"arg1=2 arg2=2 env_cur=2 env_prev=2",
+	]);
+	assert.equal(readFileSync(stateFile, "utf8").trim(), "2 1060");
+
+	// t=1070, 2 -> 0: resets state to 0 0
+	fakeDate.setEpoch(1070);
+	server.setCount(0);
+	res = await runPoll(baseEnv);
+	assert.equal(res.status, 0, res.stderr);
+	assert.equal(wake.readCalls().length, 2);
+	assert.equal(readFileSync(stateFile, "utf8").trim(), "0 0");
+
+	// t=1075 (15s after last wake, but unread dropped to 0): wakes immediately
+	fakeDate.setEpoch(1075);
+	server.setCount(1);
+	res = await runPoll(baseEnv);
+	assert.equal(res.status, 0, res.stderr);
+	assert.deepEqual(wake.readCalls(), [
+		"arg1=1 arg2=0 env_cur=1 env_prev=0",
+		"arg1=2 arg2=2 env_cur=2 env_prev=2",
+		"arg1=1 arg2=0 env_cur=1 env_prev=0",
+	]);
+	assert.equal(readFileSync(stateFile, "utf8").trim(), "1 1075");
+
+	// Clock rollback (t=1000 < last_wake=1075): wakes instead of getting stuck
+	fakeDate.setEpoch(1000);
+	server.setCount(1);
+	res = await runPoll(baseEnv);
+	assert.equal(res.status, 0, res.stderr);
+	assert.deepEqual(wake.readCalls(), [
+		"arg1=1 arg2=0 env_cur=1 env_prev=0",
+		"arg1=2 arg2=2 env_cur=2 env_prev=2",
+		"arg1=1 arg2=0 env_cur=1 env_prev=0",
+		"arg1=1 arg2=1 env_cur=1 env_prev=1",
+	]);
+	assert.equal(readFileSync(stateFile, "utf8").trim(), "1 1000");
+
+	// Failed wake does not start cooldown: next poll retries immediately
+	fakeDate.setEpoch(2000);
+	server.setCount(0);
+	res = await runPoll(baseEnv);
+	assert.equal(res.status, 0, res.stderr);
+	assert.equal(readFileSync(stateFile, "utf8").trim(), "0 0");
+
+	server.setCount(1);
+	res = await runPoll({
+		...baseEnv,
+		PAAB_WAKE_SCRIPT: failingWake.scriptPath,
+	});
+	assert.notEqual(res.status, 0);
+	assert.equal(readFileSync(stateFile, "utf8").trim(), "0 0");
+
+	fakeDate.setEpoch(2001);
+	res = await runPoll(baseEnv);
+	assert.equal(res.status, 0, res.stderr);
+	assert.equal(wake.readCalls().length, 5);
+	assert.equal(readFileSync(stateFile, "utf8").trim(), "1 2001");
+});
+
+test("PAAB_WAKE_COOLDOWN_SECONDS works with system date and resets when unread drops to 0", async (t) => {
+	const token = "unread-token-real-date";
+	const server = await startMockUnreadServer(token);
+	const dir = makeTempDir();
+	t.after(async () => {
+		await server.close();
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	const stateFile = path.join(dir, "unread-count");
+	const wake = createRecorderWakeScript(dir);
+	const baseEnv = {
+		HOME: dir,
+		PAAB_URL: server.baseUrl,
+		PAAB_UNREAD_TOKEN: token,
+		PAAB_STATE_FILE: stateFile,
+		PAAB_WAKE_SCRIPT: wake.scriptPath,
+		PAAB_WAKE_COOLDOWN_SECONDS: "3600",
+	};
+
+	server.setCount(1);
+	let res = await runPoll(baseEnv);
+	assert.equal(res.status, 0, res.stderr);
+	assert.equal(wake.readCalls().length, 1);
+	const firstState = readState(stateFile);
+	assert.equal(firstState.count, 1);
+	assert.ok(firstState.lastWake > 0);
+
+	// Immediate second poll is suppressed by real system clock cooldown
+	res = await runPoll(baseEnv);
+	assert.equal(res.status, 0, res.stderr);
+	assert.equal(wake.readCalls().length, 1);
+	assert.equal(readFileSync(stateFile, "utf8").trim(), firstState.raw);
+
+	// Unread drops to 0 -> resets state, so subsequent 0 -> 1 wakes immediately
+	server.setCount(0);
+	res = await runPoll(baseEnv);
+	assert.equal(res.status, 0, res.stderr);
+	assert.equal(readFileSync(stateFile, "utf8").trim(), "0 0");
+
+	server.setCount(1);
+	res = await runPoll(baseEnv);
+	assert.equal(res.status, 0, res.stderr);
+	assert.equal(wake.readCalls().length, 2);
 });
 
 test("default wake.sh runs when PAAB_WAKE_SCRIPT is unset", async (t) => {
@@ -258,10 +498,9 @@ test("default wake.sh runs when PAAB_WAKE_SCRIPT is unset", async (t) => {
 	});
 	assert.equal(res.status, 0, res.stderr);
 	assert.equal(res.stdout, "[paab] new unread messages: 2 (previous: 0)\n");
-	assert.equal(
-		readFileSync(path.join(dir, "xdg-state/paab/unread-count"), "utf8").trim(),
-		"2",
-	);
+	const state = readState(path.join(dir, "xdg-state/paab/unread-count"));
+	assert.equal(state.count, 2);
+	assert.ok(state.lastWake > 0);
 });
 
 test("network errors, non-200 HTTP, and malformed JSON preserve state and recover on next poll", async (t) => {
@@ -283,12 +522,14 @@ test("network errors, non-200 HTTP, and malformed JSON preserve state and recove
 		PAAB_WAKE_SCRIPT: wake.scriptPath,
 	};
 
-	// Establish initial state = 1
+	// Establish initial state = "1 <timestamp>"
 	server.setCount(1);
 	let res = await runPoll(baseEnv);
 	assert.equal(res.status, 0, res.stderr);
 	assert.equal(wake.readCalls().length, 1);
-	assert.equal(readFileSync(stateFile, "utf8").trim(), "1");
+	const initialState = readState(stateFile);
+	assert.equal(initialState.count, 1);
+	assert.ok(initialState.lastWake > 0);
 
 	// Unreachable server (bind and immediately close an ephemeral port)
 	const deadServer = http.createServer();
@@ -300,28 +541,28 @@ test("network errors, non-200 HTTP, and malformed JSON preserve state and recove
 	assert.notEqual(res.status, 0);
 	assert.notEqual(res.stderr.trim(), "");
 	assert.equal(wake.readCalls().length, 1);
-	assert.equal(readFileSync(stateFile, "utf8").trim(), "1");
+	assert.equal(readFileSync(stateFile, "utf8").trim(), initialState.raw);
 
 	// HTTP 500
 	server.setStatus(500, "Internal Server Error");
 	res = await runPoll(baseEnv);
 	assert.notEqual(res.status, 0);
 	assert.equal(wake.readCalls().length, 1);
-	assert.equal(readFileSync(stateFile, "utf8").trim(), "1");
+	assert.equal(readFileSync(stateFile, "utf8").trim(), initialState.raw);
 
 	// HTTP 401 (wrong token)
 	server.setCount(5);
 	res = await runPoll({ ...baseEnv, PAAB_UNREAD_TOKEN: "wrong-token" });
 	assert.notEqual(res.status, 0);
 	assert.equal(wake.readCalls().length, 1);
-	assert.equal(readFileSync(stateFile, "utf8").trim(), "1");
+	assert.equal(readFileSync(stateFile, "utf8").trim(), initialState.raw);
 
 	// HTTP 403 (suspended agent)
 	server.setStatus(403, "agent suspended");
 	res = await runPoll(baseEnv);
 	assert.notEqual(res.status, 0);
 	assert.equal(wake.readCalls().length, 1);
-	assert.equal(readFileSync(stateFile, "utf8").trim(), "1");
+	assert.equal(readFileSync(stateFile, "utf8").trim(), initialState.raw);
 
 	// HTTP 302 redirect (even with JSON body) must be rejected
 	server.setStatus(302, '{"unread": 9}', {
@@ -331,7 +572,7 @@ test("network errors, non-200 HTTP, and malformed JSON preserve state and recove
 	res = await runPoll(baseEnv);
 	assert.notEqual(res.status, 0);
 	assert.equal(wake.readCalls().length, 1);
-	assert.equal(readFileSync(stateFile, "utf8").trim(), "1");
+	assert.equal(readFileSync(stateFile, "utf8").trim(), initialState.raw);
 
 	// Malformed JSON variants
 	const malformedBodies = [
@@ -357,7 +598,7 @@ test("network errors, non-200 HTTP, and malformed JSON preserve state and recove
 			`expected failure for body: ${JSON.stringify(body)}`,
 		);
 		assert.equal(wake.readCalls().length, 1);
-		assert.equal(readFileSync(stateFile, "utf8").trim(), "1");
+		assert.equal(readFileSync(stateFile, "utf8").trim(), initialState.raw);
 	}
 
 	// Recovers immediately on the next valid poll (including multi-line whitespace JSON)
@@ -368,7 +609,9 @@ test("network errors, non-200 HTTP, and malformed JSON preserve state and recove
 		"arg1=1 arg2=0 env_cur=1 env_prev=0",
 		"arg1=4 arg2=1 env_cur=4 env_prev=1",
 	]);
-	assert.equal(readFileSync(stateFile, "utf8").trim(), "4");
+	const recoveredState = readState(stateFile);
+	assert.equal(recoveredState.count, 4);
+	assert.ok(recoveredState.lastWake >= initialState.lastWake);
 });
 
 test("PAAB_UNREAD_TOKEN_FILE (chmod 600), header escaping, and token validation", async (t) => {
@@ -399,6 +642,8 @@ test("PAAB_UNREAD_TOKEN_FILE (chmod 600), header escaping, and token validation"
 	assert.equal(res.status, 0, res.stderr);
 	assert.deepEqual(wake.readCalls(), ["arg1=2 arg2=0 env_cur=2 env_prev=0"]);
 	assert.equal(server.requests.at(-1)?.authorization, `Bearer ${specialToken}`);
+	const persistedState = readState(stateFile);
+	assert.equal(persistedState.count, 2);
 
 	// Reject empty token file
 	const emptyFile = path.join(dir, "empty-token");
@@ -438,7 +683,7 @@ test("PAAB_UNREAD_TOKEN_FILE (chmod 600), header escaping, and token validation"
 		PAAB_WAKE_SCRIPT: wake.scriptPath,
 	});
 	assert.notEqual(res.status, 0);
-	assert.equal(readFileSync(stateFile, "utf8").trim(), "2");
+	assert.equal(readFileSync(stateFile, "utf8").trim(), persistedState.raw);
 });
 
 test("custom PAAB_WAKE_SCRIPT failure leaves state unchanged and retries on next run", async (t) => {
@@ -501,10 +746,12 @@ test("custom PAAB_WAKE_SCRIPT failure leaves state unchanged and retries on next
 	});
 	assert.equal(res.status, 0, res.stderr);
 	assert.deepEqual(okWake.readCalls(), ["arg1=2 arg2=0 env_cur=2 env_prev=0"]);
-	assert.equal(readFileSync(stateFile, "utf8").trim(), "2");
+	const state = readState(stateFile);
+	assert.equal(state.count, 2);
+	assert.ok(state.lastWake > 0);
 });
 
-test("corrupt state file defaults to 0 and invalid PAAB_CURL_TIMEOUT fails early", async (t) => {
+test("corrupt or legacy state file and invalid numeric config handling", async (t) => {
 	const token = "unread-token-edge";
 	const server = await startMockUnreadServer(token);
 	const dir = makeTempDir();
@@ -534,21 +781,78 @@ test("corrupt state file defaults to 0 and invalid PAAB_CURL_TIMEOUT fails early
 			`expected failure for timeout ${badTimeout}`,
 		);
 	}
+
+	// Invalid PAAB_WAKE_COOLDOWN_SECONDS rejected without waking or modifying state
+	for (const badCooldown of [
+		"-1",
+		"-5",
+		"abc",
+		"05",
+		"00",
+		"1.5",
+		"10s",
+		" 5",
+	]) {
+		const badRes = await runPoll({
+			HOME: dir,
+			PAAB_URL: server.baseUrl,
+			PAAB_UNREAD_TOKEN: token,
+			PAAB_STATE_FILE: stateFile,
+			PAAB_WAKE_SCRIPT: wake.scriptPath,
+			PAAB_WAKE_COOLDOWN_SECONDS: badCooldown,
+		});
+		assert.notEqual(
+			badRes.status,
+			0,
+			`expected failure for cooldown ${JSON.stringify(badCooldown)}`,
+		);
+		assert.match(badRes.stderr, /PAAB_WAKE_COOLDOWN_SECONDS/);
+	}
 	assert.deepEqual(wake.readCalls(), []);
 	assert.equal(readFileSync(stateFile, "utf8"), "not-a-number\n");
 
-	// Valid run treats non-numeric state file as 0 and atomically repairs it to 1
-	const res = await runPoll({
+	// Malformed state files default to 0 0 and are atomically repaired
+	for (const corruptState of [
+		"not-a-number\n",
+		"* *\n",
+		"0 1000\n",
+		"2 abc\n",
+	]) {
+		writeFileSync(stateFile, corruptState, "utf8");
+		const beforeCount = wake.readCalls().length;
+		const res = await runPoll({
+			HOME: dir,
+			PAAB_URL: server.baseUrl,
+			PAAB_UNREAD_TOKEN: token,
+			PAAB_STATE_FILE: stateFile,
+			PAAB_WAKE_SCRIPT: wake.scriptPath,
+			PAAB_CURL_TIMEOUT: "5",
+			PAAB_WAKE_COOLDOWN_SECONDS: "3600",
+		});
+		assert.equal(res.status, 0, res.stderr);
+		assert.equal(wake.readCalls().length, beforeCount + 1);
+		assert.equal(wake.readCalls().at(-1), "arg1=1 arg2=0 env_cur=1 env_prev=0");
+		const repaired = readState(stateFile);
+		assert.equal(repaired.count, 1);
+		assert.ok(repaired.lastWake > 0);
+	}
+
+	// Legacy single-number state file preserves prev count and wakes immediately without cooldown
+	writeFileSync(stateFile, "2\n", "utf8");
+	server.setCount(2);
+	const legacyRes = await runPoll({
 		HOME: dir,
 		PAAB_URL: server.baseUrl,
 		PAAB_UNREAD_TOKEN: token,
 		PAAB_STATE_FILE: stateFile,
 		PAAB_WAKE_SCRIPT: wake.scriptPath,
-		PAAB_CURL_TIMEOUT: "5",
+		PAAB_WAKE_COOLDOWN_SECONDS: "3600",
 	});
-	assert.equal(res.status, 0, res.stderr);
-	assert.deepEqual(wake.readCalls(), ["arg1=1 arg2=0 env_cur=1 env_prev=0"]);
-	assert.equal(readFileSync(stateFile, "utf8").trim(), "1");
+	assert.equal(legacyRes.status, 0, legacyRes.stderr);
+	assert.equal(wake.readCalls().at(-1), "arg1=2 arg2=2 env_cur=2 env_prev=2");
+	const upgraded = readState(stateFile);
+	assert.equal(upgraded.count, 2);
+	assert.ok(upgraded.lastWake > 0);
 });
 
 test("bearer token is passed via curl --config - stdin and never appears in curl argv", async (t) => {

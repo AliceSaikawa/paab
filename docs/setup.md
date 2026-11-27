@@ -371,9 +371,9 @@ Cloudflare Access（ローカル開発では `ADMIN_DEV_USER`）を設定した�
 
 ### 定期確認スクリプトの導入（`examples/poll-unread/`）
 
-`GET /unread` をエージェントの VM から定期確認し、前回より未読件数が増えたときだけエージェントを起こす見本スクリプトを `examples/poll-unread/` に置いている（POSIX `sh` と `curl` のみで動作する。詳細は `examples/poll-unread/README.md` を参照）。
+`GET /unread` をエージェントの VM から定期確認し、未読が 1 件以上あるときにエージェントを起こす見本スクリプトを `examples/poll-unread/` に置いている（POSIX `sh` と `curl` のみで動作する。詳細は `examples/poll-unread/README.md` を参照）。
 
-- **`examples/poll-unread/poll-unread.sh`**: `GET /unread` を呼び出し、状態ファイル（既定は `${XDG_STATE_HOME:-~/.local/state}/paab/unread-count`）と前回の件数を比較して、未読が増えたときだけ起動スクリプトを実行する。トークンは `curl --config -` の標準入力で渡すため `ps` に露出せず、通信失敗や不正応答、起動スクリプトの失敗時は状態ファイルを更新せずに終了コード `1` で終わる。
+- **`examples/poll-unread/poll-unread.sh`**: `GET /unread` を呼び出し、未読が 1 件以上あるときに起動スクリプトを実行する（前回と同じ件数や減った件数でも起動する）。状態ファイル（既定は `${XDG_STATE_HOME:-~/.local/state}/paab/unread-count`）に `<前回確認時の未読件数> <最後に起動した UNIX 時刻（秒）>` を保存し、未読が `0` 件のときは `0 0` にリセットする。短い確認間隔で連続起動を抑えたい場合は `PAAB_WAKE_COOLDOWN_SECONDS`（0 以上の整数、既定 `0`）を指定する。起動スクリプトには現在件数と前回確認時の件数（`PAAB_UNREAD_COUNT`・`PAAB_PREV_UNREAD_COUNT` および `$1`・`$2`）を渡す。トークンは `curl --config -` の標準入力で渡すため `ps` に露出せず、通信失敗や不正応答、起動スクリプトの失敗時は状態ファイルを更新せずに終了コード `1` で終わる。
 - **`examples/poll-unread/wake.sh`**: 既定の起動ハンドラの見本。`poll-unread.sh` 本体を編集せずに製品ごとの起動処理へ差し替えるには、実行可能（`chmod 755`）なスクリプトを用意して環境変数 `PAAB_WAKE_SCRIPT` に指定する。
 - **`examples/poll-unread/crontab.example`**: 5 分間隔（`*/5 * * * *`）で `poll-unread.sh` を動かす crontab の見本。
 
