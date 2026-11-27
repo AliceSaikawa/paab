@@ -8,7 +8,7 @@ export {
 	type RecordBlockedQuestionInput,
 	recordBlockedQuestion,
 	type SubmitQuestionInput,
-	type SubmittedQuestion,
+	type SubmitQuestionResult,
 	submitQuestion,
 } from "./ask";
 export { BODY_RETENTION_MS, QUESTION_TTL_MS } from "./constants";

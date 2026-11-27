@@ -90,6 +90,177 @@ describe("ask", () => {
 		expect(refused.isError).toBe(true);
 		expect(await messageCount()).toBe(0);
 	});
+
+	it("enforces daily_question_limit atomically across concurrent ask calls", async () => {
+		await world.db
+			.prepare("UPDATE agents SET daily_question_limit = 2 WHERE id = ?")
+			.bind(world.alice.agent.id)
+			.run();
+
+		const alice = await connect(world.alice.token);
+		const bob = await connect(world.bob.token);
+
+		const initialId = await askBob(alice, "First question");
+
+		const concurrentResults = await Promise.all(
+			Array.from({ length: 5 }, (_, i) =>
+				call(alice, "ask", {
+					to: "bob",
+					category: "schedule",
+					question: `Concurrent question ${i}`,
+				}),
+			),
+		);
+		for (const res of concurrentResults) {
+			expect(res.isError).toBe(false);
+		}
+		const concurrentIds = concurrentResults.map((res) =>
+			questionIdOf(res.text),
+		);
+
+		const { results: questionRows } = await world.db
+			.prepare(
+				"SELECT id, status, body FROM messages WHERE kind = 'question' AND from_agent_id = ?",
+			)
+			.bind(world.alice.agent.id)
+			.all<{ id: string; status: string; body: string | null }>();
+
+		const pending = questionRows.filter((row) => row.status === "pending");
+		const blocked = questionRows.filter((row) => row.status === "blocked");
+		expect(pending).toHaveLength(2);
+		expect(pending.map((row) => row.id)).toContain(initialId);
+		expect(blocked).toHaveLength(4);
+		for (const row of blocked) {
+			expect(row.body).toBeNull();
+			expect(concurrentIds).toContain(row.id);
+		}
+
+		const bobInbox = await call(bob, "check_inbox");
+		expect(bobInbox.text).toContain("messages: 2");
+
+		const aliceInbox = await call(alice, "check_inbox");
+		expect(aliceInbox.text).toContain("messages: 4");
+		for (const row of blocked) {
+			expect(aliceInbox.text).toContain(`question_id: ${row.id}`);
+		}
+
+		const audits = await queryAuditLog(world.db);
+		const concurrentAudits = audits.filter(
+			(entry) =>
+				entry.messageId !== null && concurrentIds.includes(entry.messageId),
+		);
+		expect(
+			concurrentAudits.filter(
+				(entry) => entry.eventType === "question_accepted",
+			),
+		).toHaveLength(1);
+		const blockedAudits = concurrentAudits.filter(
+			(entry) => entry.eventType === "question_blocked",
+		);
+		expect(blockedAudits).toHaveLength(4);
+		for (const entry of blockedAudits) {
+			expect(entry.reasonCode).toBe("daily_limit_exceeded");
+		}
+	});
+
+	it("blocks every concurrent ask call when daily_question_limit is 0", async () => {
+		await world.db
+			.prepare("UPDATE agents SET daily_question_limit = 0 WHERE id = ?")
+			.bind(world.alice.agent.id)
+			.run();
+
+		const alice = await connect(world.alice.token);
+		const bob = await connect(world.bob.token);
+
+		const results = await Promise.all(
+			Array.from({ length: 3 }, (_, i) =>
+				call(alice, "ask", {
+					to: "bob",
+					category: "schedule",
+					question: `Zero-limit question ${i}`,
+				}),
+			),
+		);
+		for (const res of results) {
+			expect(res.isError).toBe(false);
+		}
+		const ids = results.map((res) => questionIdOf(res.text));
+
+		const { results: questionRows } = await world.db
+			.prepare(
+				"SELECT id, status FROM messages WHERE kind = 'question' AND from_agent_id = ?",
+			)
+			.bind(world.alice.agent.id)
+			.all<{ id: string; status: string }>();
+		expect(questionRows.filter((row) => row.status === "pending")).toHaveLength(
+			0,
+		);
+		expect(questionRows.filter((row) => row.status === "blocked")).toHaveLength(
+			3,
+		);
+
+		const bobInbox = await call(bob, "check_inbox");
+		expect(bobInbox.text).toContain("no new messages");
+
+		const aliceInbox = await call(alice, "check_inbox");
+		expect(aliceInbox.text).toContain("messages: 3");
+		for (const id of ids) {
+			expect(aliceInbox.text).toContain(`question_id: ${id}`);
+		}
+
+		const audits = await queryAuditLog(world.db);
+		expect(audits).toHaveLength(3);
+		for (const entry of audits) {
+			expect(entry.eventType).toBe("question_blocked");
+			expect(entry.reasonCode).toBe("daily_limit_exceeded");
+		}
+	});
+
+	it("preserves reason-code precedence when already at daily_question_limit", async () => {
+		await world.db
+			.prepare("UPDATE agents SET daily_question_limit = 1 WHERE id = ?")
+			.bind(world.alice.agent.id)
+			.run();
+
+		const alice = await connect(world.alice.token);
+		await askBob(alice, "Consumes daily quota");
+
+		const noRuleId = questionIdOf(
+			(
+				await call(alice, "ask", {
+					to: "bob",
+					category: "health",
+					question: "No rule",
+				})
+			).text,
+		);
+		const missingRecipientId = questionIdOf(
+			(
+				await call(alice, "ask", {
+					to: "nobody",
+					category: "schedule",
+					question: "Missing recipient",
+				})
+			).text,
+		);
+		const overLimitId = questionIdOf(
+			(
+				await call(alice, "ask", {
+					to: "bob",
+					category: "schedule",
+					question: "Over limit",
+				})
+			).text,
+		);
+
+		const audits = await queryAuditLog(world.db);
+		const reasonByMessage = new Map(
+			audits.map((entry) => [entry.messageId, entry.reasonCode]),
+		);
+		expect(reasonByMessage.get(noRuleId)).toBe("no_allow_rule");
+		expect(reasonByMessage.get(missingRecipientId)).toBe("recipient_not_found");
+		expect(reasonByMessage.get(overLimitId)).toBe("daily_limit_exceeded");
+	});
 });
 
 describe("answer", () => {

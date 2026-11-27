@@ -109,6 +109,10 @@ describe("expiry at the 7 day boundary", () => {
 
 	it("expires more questions than fit in one transaction", async () => {
 		const total = 60;
+		await db
+			.prepare("UPDATE agents SET daily_question_limit = ? WHERE id = ?")
+			.bind(total, world.asker.id)
+			.run();
 		for (let i = 0; i < total; i++) {
 			await ask(world, T0 + i);
 		}

@@ -1,4 +1,5 @@
 import { insertMessage, newId } from "../db";
+import { UTC_DAY_MS, utcDayStart } from "../policy";
 import type { UnixMillis } from "../types";
 import { QUESTION_TTL_MS } from "./constants";
 import { rejectionFor } from "./rejection";
@@ -11,37 +12,64 @@ export interface SubmitQuestionInput {
 	now: UnixMillis;
 }
 
-export interface SubmittedQuestion {
-	questionId: string;
-	expiresAt: UnixMillis;
-}
+export type SubmitQuestionResult =
+	| { ok: true; questionId: string; expiresAt: UnixMillis }
+	| { ok: false; reason: "daily_limit_exceeded" };
 
 /**
- * Stores a question the bridge accepted. The recipient gets it on its next
- * inbox fetch. Rule matching, limits and body validation are the caller's
- * job.
+ * Stores a question the bridge accepted, enforcing the sender's
+ * `daily_question_limit` atomically in the same statement so concurrent
+ * calls cannot exceed it. The recipient gets it on its next inbox fetch.
+ * Rule matching and body validation are the caller's job.
+ *
+ * Throws if `fromAgentId` does not exist.
  */
 export async function submitQuestion(
 	db: D1Database,
 	input: SubmitQuestionInput,
-): Promise<SubmittedQuestion> {
+): Promise<SubmitQuestionResult> {
 	const questionId = newId();
 	const expiresAt = input.now + QUESTION_TTL_MS;
-	await insertMessage(db, {
-		id: questionId,
-		kind: "question",
-		fromAgentId: input.fromAgentId,
-		toAgentId: input.toAgentId,
-		categoryId: input.categoryId,
-		body: input.body,
-		inReplyTo: null,
-		status: "pending",
-		createdAt: input.now,
-		receivedAt: null,
-		expiresAt,
-		bodyDeletedAt: null,
-	}).run();
-	return { questionId, expiresAt };
+	const dayStart = utcDayStart(input.now);
+	const dayEnd = dayStart + UTC_DAY_MS;
+	const result = await db
+		.prepare(
+			`INSERT INTO messages
+				(id, kind, from_agent_id, to_agent_id, category_id, body, in_reply_to,
+				status, created_at, received_at, expires_at, body_deleted_at)
+			SELECT ?1, 'question', ?2, ?3, ?4, ?5, NULL,
+				'pending', ?6, NULL, ?7, NULL
+			FROM agents
+			WHERE id = ?2
+				AND (
+					SELECT COUNT(*) FROM messages
+					WHERE kind = 'question' AND from_agent_id = ?2
+						AND created_at >= ?8 AND created_at < ?9
+				) < daily_question_limit`,
+		)
+		.bind(
+			questionId,
+			input.fromAgentId,
+			input.toAgentId,
+			input.categoryId,
+			input.body,
+			input.now,
+			expiresAt,
+			dayStart,
+			dayEnd,
+		)
+		.run();
+	if (result.meta.changes === 1) {
+		return { ok: true, questionId, expiresAt };
+	}
+	const sender = await db
+		.prepare("SELECT 1 AS found FROM agents WHERE id = ?")
+		.bind(input.fromAgentId)
+		.first<{ found: number }>();
+	if (sender === null) {
+		throw new Error(`Unknown sender agent: ${input.fromAgentId}`);
+	}
+	return { ok: false, reason: "daily_limit_exceeded" };
 }
 
 export interface RecordBlockedQuestionInput {

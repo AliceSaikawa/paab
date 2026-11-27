@@ -356,13 +356,14 @@ describe("/admin/agents unread_count token management UI", () => {
 
 		// Issued unread_count token works on GET /unread and is rejected on /mcp.
 		const schedule = await seedCategory(db, { name: "予定" });
-		await submitQuestion(db, {
+		const submitted = await submitQuestion(db, {
 			fromAgentId: grokId,
 			toAgentId: museId,
 			categoryId: schedule.id,
 			body: "明日の予定は？",
 			now: T0 + 16,
 		});
+		expect(submitted.ok).toBe(true);
 		const unreadOk = await unreadRawGet(unreadToken1, T0 + 20);
 		expect(unreadOk.status).toBe(200);
 		expect(await unreadOk.json()).toEqual({ unread: 1 });

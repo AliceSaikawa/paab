@@ -141,15 +141,20 @@ describe("GET /unread", () => {
 			body: secretQuestionBody,
 			now: T0,
 		});
+		if (!q1.ok) throw new Error(q1.reason);
 
 		// 2. Expired pending question addressed to alice (past TTL before maintenance runs).
-		await submitQuestion(db, {
-			fromAgentId: bob.id,
-			toAgentId: alice.id,
-			categoryId: schedule.id,
-			body: "EXPIRED_QUESTION_BODY",
-			now: T0 - QUESTION_TTL_MS - 1,
-		});
+		expect(
+			(
+				await submitQuestion(db, {
+					fromAgentId: bob.id,
+					toAgentId: alice.id,
+					categoryId: schedule.id,
+					body: "EXPIRED_QUESTION_BODY",
+					now: T0 - QUESTION_TTL_MS - 1,
+				})
+			).ok,
+		).toBe(true);
 
 		// 3. Answer addressed to alice (alice asked bob, bob answered).
 		const secretAnswerBody = "TOP_SECRET_ANSWER_BODY";
@@ -160,6 +165,7 @@ describe("GET /unread", () => {
 			body: "Are you free?",
 			now: T0,
 		});
+		if (!qFromAlice1.ok) throw new Error(qFromAlice1.reason);
 		const answerRes = await answerQuestion(db, {
 			questionId: qFromAlice1.questionId,
 			responderAgentId: bob.id,
@@ -177,13 +183,17 @@ describe("GET /unread", () => {
 		});
 
 		// 5. Question addressed to bob (must NOT be counted for alice).
-		await submitQuestion(db, {
-			fromAgentId: alice.id,
-			toAgentId: bob.id,
-			categoryId: schedule.id,
-			body: "For bob only",
-			now: T0 + 3000,
-		});
+		expect(
+			(
+				await submitQuestion(db, {
+					fromAgentId: alice.id,
+					toAgentId: bob.id,
+					categoryId: schedule.id,
+					body: "For bob only",
+					now: T0 + 3000,
+				})
+			).ok,
+		).toBe(true);
 
 		const res = await unreadGet(
 			`Bearer ${aliceUnreadToken}`,
@@ -218,6 +228,7 @@ describe("GET /unread", () => {
 			body: "Please keep me unread",
 			now: T0,
 		});
+		if (!q.ok) throw new Error(q.reason);
 
 		for (let i = 0; i < 3; i++) {
 			const res = await unreadGet(

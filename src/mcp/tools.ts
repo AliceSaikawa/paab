@@ -24,6 +24,7 @@ import {
 	DESCRIPTION_MAX_LENGTH,
 	descriptionProblem,
 	listAllowedRecipients,
+	type PolicyReasonCode,
 } from "../policy";
 import type { Agent, UnixMillis } from "../types";
 import { type Frame, renderFramed } from "./frame";
@@ -97,6 +98,17 @@ async function namesById(
 
 const UNKNOWN_NAME = "(unknown)";
 
+// Identical for accepted and blocked questions, so that the asker
+// cannot tell them apart here (design 3.4).
+function askResult(questionId: string): ToolOutput {
+	return ok(
+		block([
+			`question_id: ${questionId}`,
+			"status: accepted; the reply (answer or rejection) arrives in your inbox via check_inbox",
+		]),
+	);
+}
+
 const ask = defineTool({
 	name: "ask",
 	description:
@@ -128,61 +140,60 @@ const ask = defineTool({
 			categoryName: category,
 			now: ctx.now,
 		});
-		let questionId: string;
+		let blockedReason: PolicyReasonCode;
 		if (decision.allowed) {
-			({ questionId } = await submitQuestion(ctx.db, {
+			const submitted = await submitQuestion(ctx.db, {
 				fromAgentId: ctx.agent.id,
 				toAgentId: decision.toAgentId,
 				categoryId: decision.categoryId,
 				body: question,
 				now: ctx.now,
-			}));
-			await recordAuditEvent(ctx.db, ctx.audit, {
-				eventType: "question_accepted",
-				occurredAt: ctx.now,
-				fromAgentId: ctx.agent.id,
-				toAgentId: decision.toAgentId,
-				categoryId: decision.categoryId,
-				messageId: questionId,
-				body: question,
 			});
-			await notifyAgentImmediately(ctx.db, {
-				agentId: decision.toAgentId,
-				now: ctx.now,
-				audit: ctx.audit,
-				waitUntil: ctx.waitUntil,
-				fetcher: ctx.webhookFetcher,
-				allowInsecureLocalhost: ctx.allowInsecureLocalhostWebhook,
-			});
+			if (submitted.ok) {
+				await recordAuditEvent(ctx.db, ctx.audit, {
+					eventType: "question_accepted",
+					occurredAt: ctx.now,
+					fromAgentId: ctx.agent.id,
+					toAgentId: decision.toAgentId,
+					categoryId: decision.categoryId,
+					messageId: submitted.questionId,
+					body: question,
+				});
+				await notifyAgentImmediately(ctx.db, {
+					agentId: decision.toAgentId,
+					now: ctx.now,
+					audit: ctx.audit,
+					waitUntil: ctx.waitUntil,
+					fetcher: ctx.webhookFetcher,
+					allowInsecureLocalhost: ctx.allowInsecureLocalhostWebhook,
+				});
+				return askResult(submitted.questionId);
+			}
+			blockedReason = submitted.reason;
 		} else {
-			({ questionId } = await recordBlockedQuestion(ctx.db, {
-				fromAgentId: ctx.agent.id,
-				toAgentId: decision.toAgentId,
-				categoryId: decision.categoryId,
-				now: ctx.now,
-			}));
-			await recordAuditEvent(ctx.db, ctx.audit, {
-				eventType: "question_blocked",
-				occurredAt: ctx.now,
-				fromAgentId: ctx.agent.id,
-				toAgentId: decision.toAgentId,
-				categoryId: decision.categoryId,
-				reasonCode: decision.reasonCode,
-				messageId: questionId,
-			});
-			await scheduleDelayedWake(ctx.db, {
-				agentId: ctx.agent.id,
-				now: ctx.now,
-			});
+			blockedReason = decision.reasonCode;
 		}
-		// Identical for accepted and blocked questions, so that the asker
-		// cannot tell them apart here (design 3.4).
-		return ok(
-			block([
-				`question_id: ${questionId}`,
-				"status: accepted; the reply (answer or rejection) arrives in your inbox via check_inbox",
-			]),
-		);
+
+		const { questionId } = await recordBlockedQuestion(ctx.db, {
+			fromAgentId: ctx.agent.id,
+			toAgentId: decision.toAgentId,
+			categoryId: decision.categoryId,
+			now: ctx.now,
+		});
+		await recordAuditEvent(ctx.db, ctx.audit, {
+			eventType: "question_blocked",
+			occurredAt: ctx.now,
+			fromAgentId: ctx.agent.id,
+			toAgentId: decision.toAgentId,
+			categoryId: decision.categoryId,
+			reasonCode: blockedReason,
+			messageId: questionId,
+		});
+		await scheduleDelayedWake(ctx.db, {
+			agentId: ctx.agent.id,
+			now: ctx.now,
+		});
+		return askResult(questionId);
 	},
 });
 
