@@ -40,7 +40,7 @@ export async function handleAdminMcpRequest(
 
 	if (auth.suspended) {
 		await recordAuditEvent(db, audit, {
-			eventType: "auth_failed",
+			eventType: "agent_suspended_rejected",
 			occurredAt: now,
 			fromAgentId: auth.agent.id,
 			reasonCode: "sender_suspended",

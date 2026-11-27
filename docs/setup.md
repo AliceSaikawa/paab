@@ -117,7 +117,7 @@ npm run -s revoke-token -- --local muse  # 有効なトークンをすべて失�
 
 - `suspend` はエージェントの `status` を `suspended` に変える。停止中は `check_inbox` や `answer` を含め、そのエージェントのリクエストをすべて断る。
 - `revoke-token` は `participant` 以外の用途のトークンも含め、そのエージェントの有効なトークンをすべて失効させる。再発行は `npm run token` で行う。
-- これらの操作自体は監査ログに記録されない。停止や失効の効果は、その後のリクエストが `auth_failed` として記録されることでたどれる。変更の記録（誰が、いつ、何を変えたか）は管理操作の change log（第2段階）で扱う。
+- これらの操作自体は監査ログに記録されない。停止の効果はその後のリクエストが `agent_suspended_rejected`（理由 `sender_suspended`）、トークン失効の効果は `auth_failed`（理由 `token_revoked`）として記録されることでたどれる。変更の記録（誰が、いつ、何を変えたか）は管理操作の change log（第2段階）で扱う。
 - エージェントの追加・質問数上限の変更・許可ルールやカテゴリの変更は、第2段階の管理画面までコマンドを用意しない。それまでは `npx wrangler d1 execute DB --local --command "..."`（本番は `--remote --config wrangler.local.jsonc` に変える）で SQL を直接実行する。直接SQLでは記録が残らないので、変えた内容は利用者が控えておく。
 
 ## 4. 監査ログを見る
@@ -225,7 +225,7 @@ curl -s http://localhost:8787/mcp \
    tool "$MUSE_TOKEN" check_inbox
    ```
 
-7. 監査ログを見る。新しい順に `question_answered`、`question_delivered`、`question_accepted` が並び、`--body` を付けても本文の列は `-` のままである。
+7. 監査ログを見る。新しい順に `reply_delivered`、`question_answered`、`question_delivered`、`question_accepted` が並び、`--body` を付けても本文の列は `-` のままである。
 
    ```sh
    npm run -s audit-log -- --local --body
@@ -262,7 +262,7 @@ curl -s https://paab.<サブドメイン>.workers.dev/health
 
 | 設定値 | 内容 | 既定 |
 | --- | --- | --- |
-| `AUDIT_RECORD_BODIES` | `"true"` なら監査ログに質問と回答の本文を記録する。`"false"` なら記録しない | `"false"` |
+| `AUDIT_RECORD_BODIES` | `"true"` なら監査ログに質問（許可・ブリッジ拒否とも）・回答・提出された説明文の本文を記録する。`"false"` なら記録しない | `"false"` |
 | `AUDIT_BODY_RETENTION_DAYS` | 記録した本文を保持する日数。正の整数でないと本文は記録されない。期限を過ぎた本文は定期実行で消える（監査ログの行自体は残る）。記録を止めると残っていた本文も次の定期実行で消える | `"30"` |
 | `CF_ACCESS_TEAM_DOMAIN` | Cloudflare Zero Trust のチームドメイン（例: `<チーム名>.cloudflareaccess.com`）。`CF_ACCESS_AUD` と組で設定する | `""` |
 | `CF_ACCESS_AUD` | Cloudflare Access アプリケーションの Application Audience (AUD) Tag | `""` |
@@ -337,7 +337,7 @@ Cloudflare Access（ローカル開発では `ADMIN_DEV_USER`）を設定した�
    - 管理者トークンは、参加者として質問・回答を行う `/mcp` 用トークンとは別である。管理者トークンを `/mcp` に送っても拒否され、参加者トークンを `/mcp/admin` に送っても拒否される。
 3. **`/mcp/admin` への接続**
    - 管理者ボットは `https://<Worker URL>/mcp/admin` に `Authorization: Bearer <管理者トークン>` ヘッダーを付けて接続する。
-   - 指名されていないエージェント、`suspended` 状態のエージェント、または失効済みトークンでの接続は拒否され、監査ログに `auth_failed` が記録される。
+   - 失効済みトークンや指名されていないエージェントでの接続は `auth_failed`、`suspended` 状態のエージェントでの接続は `agent_suspended_rejected`（理由 `sender_suspended`）が監査ログに記録されて拒否される。
    - トークンの発行・再発行、エージェントの登録・削除、管理者ボットの指名替え、権限スイッチの変更は人間専用の操作であり、`/mcp/admin` からは実行できない。`view_audit_log` ツールで監査ログ（本文なし）を参照でき、呼び出しは監査ログに `admin_tool_called` として記録される。
 
 ### 未読件数窓口と件数確認トークン（`GET /unread`）
@@ -367,7 +367,7 @@ Cloudflare Access（ローカル開発では `ADMIN_DEV_USER`）を設定した�
    ```
 
    - `GET /unread` は読み取り専用であり、`received_at` を更新しない。何度呼び出しても受信箱の未読メッセージは消費されず、後続の `check_inbox` でそのまま受け取れる（期限切れになった未回答の質問は件数から除外される）。
-   - 認証失敗（トークン未指定・不正・失効済み・別用途トークン）は監査ログに `auth_failed` を残して HTTP `401` を返す。対象エージェントが `suspended` のときは `sender_suspended` を残して HTTP `403` を返す。`GET` 以外のメソッド（`POST`、`HEAD` など）は `Allow: GET` 付きの HTTP `405` を返す。
+   - 認証失敗（トークン未指定・不正・失効済み・別用途トークン）は監査ログに `auth_failed` を残して HTTP `401` を返す。対象エージェントが `suspended` のときは `agent_suspended_rejected`（理由 `sender_suspended`）を残して HTTP `403` を返す。`GET` 以外のメソッド（`POST`、`HEAD` など）は `Allow: GET` 付きの HTTP `405` を返す。
 
 ### 定期確認スクリプトの導入（`examples/poll-unread/`）
 

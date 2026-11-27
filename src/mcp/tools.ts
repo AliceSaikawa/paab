@@ -2,6 +2,8 @@ import { z } from "zod";
 import { submitPendingDescription } from "../adminbot/descriptions";
 import {
 	type AuditBodyConfig,
+	type AuditEvent,
+	allowAnswerFailedAudit,
 	recordAuditEvent,
 	recordAuditEvents,
 } from "../audit";
@@ -25,7 +27,7 @@ import {
 	descriptionProblem,
 	listAllowedRecipients,
 } from "../policy";
-import type { Agent, UnixMillis } from "../types";
+import type { Agent, ReasonCode, UnixMillis } from "../types";
 import { type Frame, renderFramed } from "./frame";
 import {
 	ANSWER_MAX_LENGTH,
@@ -93,6 +95,37 @@ async function namesById(
 		.bind(JSON.stringify([...new Set(ids)]))
 		.all<{ id: string; name: string }>();
 	return new Map(results.map((row) => [row.id, row.name]));
+}
+
+interface QuestionAuditMeta {
+	toAgentId: string | null;
+	categoryId: string | null;
+}
+
+async function questionMetadataById(
+	db: D1Database,
+	questionIds: string[],
+): Promise<Map<string, QuestionAuditMeta>> {
+	if (questionIds.length === 0) {
+		return new Map();
+	}
+	const { results } = await db
+		.prepare(
+			`SELECT id, to_agent_id, category_id FROM messages
+			WHERE id IN (SELECT value FROM json_each(?))`,
+		)
+		.bind(JSON.stringify([...new Set(questionIds)]))
+		.all<{
+			id: string;
+			to_agent_id: string | null;
+			category_id: string | null;
+		}>();
+	return new Map(
+		results.map((row) => [
+			row.id,
+			{ toAgentId: row.to_agent_id, categoryId: row.category_id },
+		]),
+	);
 }
 
 const UNKNOWN_NAME = "(unknown)";
@@ -169,6 +202,7 @@ const ask = defineTool({
 				categoryId: decision.categoryId,
 				reasonCode: decision.reasonCode,
 				messageId: questionId,
+				body: question,
 			});
 			await scheduleDelayedWake(ctx.db, {
 				agentId: ctx.agent.id,
@@ -215,6 +249,45 @@ function renderInboxItem(
 	}
 }
 
+function deliveryAuditEvent(
+	item: InboxItem,
+	receiverAgentId: string,
+	occurredAt: UnixMillis,
+	rejectionQuestions: Map<string, QuestionAuditMeta>,
+): AuditEvent {
+	switch (item.kind) {
+		case "question":
+			return {
+				eventType: "question_delivered",
+				occurredAt,
+				fromAgentId: item.fromAgentId,
+				toAgentId: receiverAgentId,
+				categoryId: item.categoryId,
+				messageId: item.id,
+			};
+		case "answer":
+			return {
+				eventType: "reply_delivered",
+				occurredAt,
+				fromAgentId: receiverAgentId,
+				toAgentId: item.fromAgentId,
+				categoryId: item.categoryId,
+				messageId: item.inReplyTo,
+			};
+		case "rejection": {
+			const question = rejectionQuestions.get(item.inReplyTo);
+			return {
+				eventType: "reply_delivered",
+				occurredAt,
+				fromAgentId: receiverAgentId,
+				toAgentId: question?.toAgentId ?? null,
+				categoryId: question?.categoryId ?? null,
+				messageId: item.inReplyTo,
+			};
+		}
+	}
+}
+
 const checkInbox = defineTool({
 	name: "check_inbox",
 	description:
@@ -223,7 +296,8 @@ const checkInbox = defineTool({
 	async run(ctx) {
 		const items = await fetchInbox(ctx.db, ctx.agent.id, ctx.now);
 		const named = items.filter((item) => item.kind !== "rejection");
-		const [agentNames, categoryNames] = await Promise.all([
+		const rejections = items.filter((item) => item.kind === "rejection");
+		const [agentNames, categoryNames, rejectionQuestions] = await Promise.all([
 			namesById(
 				ctx.db,
 				"agents",
@@ -234,23 +308,20 @@ const checkInbox = defineTool({
 				"categories",
 				named.map((item) => item.categoryId),
 			),
+			questionMetadataById(
+				ctx.db,
+				rejections.map((item) => item.inReplyTo),
+			),
 		]);
 
-		// One batched write for every delivery, not one statement per
-		// question: D1 caps the statements a Worker invocation may run.
+		// One batched write for every delivery, not one statement per item:
+		// D1 caps the statements a Worker invocation may run.
 		await recordAuditEvents(
 			ctx.db,
 			ctx.audit,
-			items
-				.filter((item) => item.kind === "question")
-				.map((item) => ({
-					eventType: "question_delivered" as const,
-					occurredAt: ctx.now,
-					fromAgentId: item.fromAgentId,
-					toAgentId: ctx.agent.id,
-					categoryId: item.categoryId,
-					messageId: item.id,
-				})),
+			items.map((item) =>
+				deliveryAuditEvent(item, ctx.agent.id, ctx.now, rejectionQuestions),
+			),
 		);
 
 		if (items.length === 0) {
@@ -277,6 +348,25 @@ const ANSWER_FAILURES: Record<AnswerFailureReason, string> = {
 	already_replied: "that question was already answered or declined",
 	expired: "that question has expired and can no longer be answered",
 };
+
+const ANSWER_FAILURE_REASON_CODES: Record<AnswerFailureReason, ReasonCode> = {
+	not_found: "question_not_found",
+	not_recipient: "not_recipient",
+	already_replied: "question_already_replied",
+	expired: "question_expired",
+};
+
+const MAX_AUDIT_MESSAGE_ID_LENGTH = 128;
+
+function auditMessageId(raw: string): string | null {
+	const trimmed = raw.trim();
+	if (trimmed.length === 0 || trimmed.includes("\0")) {
+		return null;
+	}
+	return trimmed.length <= MAX_AUDIT_MESSAGE_ID_LENGTH
+		? trimmed
+		: trimmed.slice(0, MAX_AUDIT_MESSAGE_ID_LENGTH);
+}
 
 function parseReply(
 	action: "answer" | "decline",
@@ -324,6 +414,15 @@ const answer = defineTool({
 			now: ctx.now,
 		});
 		if (!result.ok) {
+			if (allowAnswerFailedAudit(ctx.agent.id, ctx.now)) {
+				await recordAuditEvent(ctx.db, ctx.audit, {
+					eventType: "answer_failed",
+					occurredAt: ctx.now,
+					fromAgentId: ctx.agent.id,
+					reasonCode: ANSWER_FAILURE_REASON_CODES[result.reason],
+					messageId: auditMessageId(question_id),
+				});
+			}
 			return fail(ANSWER_FAILURES[result.reason]);
 		}
 		await recordAuditEvent(ctx.db, ctx.audit, {
@@ -352,7 +451,6 @@ const answer = defineTool({
 	},
 });
 
-// No audit event: the audit log has no event type for listing recipients.
 const listAgents = defineTool({
 	name: "list_agents",
 	description:

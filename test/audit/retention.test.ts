@@ -88,4 +88,27 @@ describe("purgeExpiredAuditBodies", () => {
 		).toBe(2);
 		expect(await bodies()).toEqual({ q1: null, q2: null });
 	});
+
+	it("purges bodies recorded on question_blocked entries on the same schedule", async () => {
+		await recordAuditEvent(db, RECORDING, {
+			occurredAt: T0,
+			eventType: "question_blocked",
+			fromAgentId: "agent-a",
+			toAgentId: "agent-b",
+			categoryId: "category-1",
+			reasonCode: "no_allow_rule",
+			messageId: "blocked-1",
+			body: "blocked secret question",
+		});
+
+		expect(
+			await purgeExpiredAuditBodies(db, RECORDING, T0 + 30 * DAY_MS - 1),
+		).toBe(0);
+		expect(await bodies()).toEqual({ "blocked-1": "blocked secret question" });
+
+		expect(await purgeExpiredAuditBodies(db, RECORDING, T0 + 30 * DAY_MS)).toBe(
+			1,
+		);
+		expect(await bodies()).toEqual({ "blocked-1": null });
+	});
 });

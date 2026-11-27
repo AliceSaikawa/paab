@@ -89,6 +89,7 @@ describe("ask", () => {
 		});
 		expect(refused.isError).toBe(true);
 		expect(await messageCount()).toBe(0);
+		expect(await queryAuditLog(world.db)).toEqual([]);
 	});
 });
 

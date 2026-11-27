@@ -99,12 +99,42 @@ describe("recordAuditEvent", () => {
 			},
 			{
 				event: {
+					...question,
 					occurredAt: T0 + 6,
+					eventType: "reply_delivered",
+				},
+				outcome: "ok",
+				reason: null,
+			},
+			{
+				event: {
+					occurredAt: T0 + 7,
+					eventType: "answer_failed",
+					fromAgentId: "agent-b",
+					messageId: "question-1",
+					reasonCode: "not_recipient",
+				},
+				outcome: "denied",
+				reason: "not_recipient",
+			},
+			{
+				event: {
+					occurredAt: T0 + 8,
 					eventType: "auth_failed",
 					reasonCode: "token_unknown",
 				},
 				outcome: "denied",
 				reason: "token_unknown",
+			},
+			{
+				event: {
+					occurredAt: T0 + 9,
+					eventType: "agent_suspended_rejected",
+					fromAgentId: "agent-a",
+					reasonCode: "sender_suspended",
+				},
+				outcome: "denied",
+				reason: "sender_suspended",
 			},
 			{
 				event: {

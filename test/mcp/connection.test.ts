@@ -138,7 +138,12 @@ describe("authentication", () => {
 		const response = await handleMcpRequest(post(`Bearer ${token}`), env, T0);
 		expect(response.status).toBe(403);
 		await expect(connect(token)).rejects.toThrow();
-		expect((await authFailures())[0]).toEqual({
+		expect(await authFailures()).toEqual([]);
+		const rejected = (await queryAuditLog(world.db)).filter(
+			(row) => row.eventType === "agent_suspended_rejected",
+		);
+		expect(rejected[0]).toMatchObject({
+			eventType: "agent_suspended_rejected",
 			fromAgentId: suspended.id,
 			reasonCode: "sender_suspended",
 			outcome: "denied",

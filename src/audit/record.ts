@@ -13,7 +13,9 @@ import { type AuditBodyConfig, isBodyRecordingEnabled } from "./config";
 /** Event types that record a denial by the bridge and so carry a reason. */
 export type DeniedByBridgeEventType =
 	| "question_blocked"
+	| "answer_failed"
 	| "auth_failed"
+	| "agent_suspended_rejected"
 	| "admin_tool_denied"
 	| "webhook_abandoned";
 
@@ -21,13 +23,15 @@ interface AuditEventBase {
 	/** When the event happened. The caller passes the time in. */
 	occurredAt: UnixMillis;
 	/**
-	 * The agent that asked the question, for every event type. On
-	 * `question_answered` and `question_declined` this is still the asker,
-	 * not the agent that replied, so that one filter by sender returns the
-	 * whole history of a question.
+	 * The agent that asked the question on question-lifecycle events
+	 * (`question_*` and `reply_delivered`), even when the responder or inbox
+	 * fetch triggered the event, so one filter by sender returns the whole
+	 * history of a question. On caller-level events (`answer_failed`,
+	 * `auth_failed`, `agent_suspended_rejected`, `admin_*`,
+	 * `description_submitted`), the acting agent.
 	 */
 	fromAgentId?: string | null;
-	/** The agent the question was addressed to, for every event type. */
+	/** The agent the question was addressed to, for question-lifecycle events. */
 	toAgentId?: string | null;
 	categoryId?: string | null;
 	/** The ID of the question the event is about. */
@@ -60,7 +64,10 @@ const OUTCOMES: Record<AuditEventType, AuditOutcome> = {
 	question_answered: "ok",
 	question_declined: "denied",
 	question_expired: "expired",
+	reply_delivered: "ok",
+	answer_failed: "denied",
 	auth_failed: "denied",
+	agent_suspended_rejected: "denied",
 	admin_tool_called: "ok",
 	admin_tool_denied: "denied",
 	admin_body_read: "ok",

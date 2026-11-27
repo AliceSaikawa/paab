@@ -349,7 +349,7 @@ export function renderAuditPage(options: {
 		<div class="stack">
 			<div>
 				<h1>監査ログ</h1>
-				<p class="muted">質問・配信・回答・拒否・期限切れ・認証失敗の記録を絞り込んで確認します。</p>
+				<p class="muted">質問・配信・回答・拒否・期限切れ・停止中拒否・認証失敗などの記録を絞り込んで確認します。</p>
 			</div>
 			${bodyDisabledNotice}
 			${renderFilterForm(raw, bodyRecordingEnabled)}
